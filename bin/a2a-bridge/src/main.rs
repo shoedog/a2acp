@@ -11003,7 +11003,7 @@ mod cli_tests {
         bridge_observ::init_stderr();
         let dir = PathBuf::from(std::env::var_os("RUNTIME_CONTROL_DIR").unwrap());
         let runtime = dir.join("runtime").to_string_lossy().into_owned();
-        if mode.starts_with("cleanup") {
+        if mode.contains("cleanup") {
             drop(RunEndGuard {
                 runtimes: vec![runtime],
                 instance_id: "test-run".into(),
@@ -11038,7 +11038,9 @@ mod cli_tests {
                 lease.exists(),
                 "failed sweep lost the shared recovery lease"
             );
-            assert_runtime_group_settled(&dir.join("started"));
+            if !mode.starts_with("f169_") {
+                assert_runtime_group_settled(&dir.join("started"));
+            }
             std::fs::write(dir.join("healthy"), "").unwrap();
             recover_orphans(&snapshot, &config, "host", Some((&runtime, "verify-owner")));
             assert!(
@@ -11143,6 +11145,162 @@ exit 0
     #[test]
     fn recovery_removal_timeout_preserves_shared_lease_and_reports_failure() {
         sweep_timeout_case("recovery-removal");
+    }
+
+    /// Exercise the ordinary nonzero-status branch without waiting for a runtime timeout. The
+    /// fixture records actual runtime calls and filesystem effects, so it guards status rejection,
+    /// diagnostics, recovery lease retention, and continuation after an individual removal error.
+    #[cfg(unix)]
+    fn f169_sweep_failure_case(mode: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        if mode == "f169_cleanup_removal" {
+            for name in ["failed-id", "later-id"] {
+                std::fs::write(dir.path().join(name), "").unwrap();
+            }
+        } else if mode.starts_with("f169_recovery") {
+            for name in ["first-container", "second-container"] {
+                std::fs::write(dir.path().join(name), "").unwrap();
+            }
+        }
+        let body = format!(
+            r#"
+trace="$root/calls"
+if [ "$1" = ps ]; then
+    printf 'ps:%s\n' "$*" >> "$trace"
+    if [ "{mode}" = f169_cleanup_inventory ]; then
+        exit 7
+    fi
+    if [ "{mode}" = f169_cleanup_removal ]; then
+        printf 'failed-id\n'
+        printf 'later-id\n'
+        exit 0
+    fi
+    case "$*" in
+        *"$(cat "$root/second-owner")"*) id=second-container ;;
+        *) id=first-container ;;
+    esac
+    if [ "$id" = second-container ] && [ ! -f "$root/healthy" ] && [ "{mode}" = f169_recovery_inventory ]; then
+        exit 7
+    fi
+    [ ! -f "$root/$id" ] || printf '%s\thost\t%s/shared.lock\n' "$id" "$root"
+    exit 0
+fi
+if [ "$1" = rm ]; then
+    printf 'rm:%s %s %s\n' "$1" "$2" "$3" >> "$trace"
+    if [ "$3" = failed-id ] && [ "{mode}" = f169_cleanup_removal ]; then
+        [ "$#" -eq 3 ] && [ "$2" = -f ] || exit 97
+        exit 7
+    fi
+    if [ "{mode}" = f169_cleanup_removal ]; then
+        [ "$#" -eq 3 ] && [ "$2" = -f ] || exit 97
+        case "$3" in
+            failed-id|later-id) ;;
+            *) exit 97 ;;
+        esac
+    fi
+    if [ "$3" = second-container ] && [ ! -f "$root/healthy" ] && [ "{mode}" = f169_recovery_removal ]; then
+        exit 7
+    fi
+    rm -f "$root/$3"
+    exit 0
+fi
+exit 7
+"#
+        );
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nroot='{}'\n{body}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm_up_script(&runtime);
+        let out = supervise_runtime_child(mode, dir.path());
+        assert!(out.status.success(), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        let diagnostic = if mode.contains("cleanup") {
+            "run-end container cleanup failed:"
+        } else {
+            "orphan recovery failed for owner"
+        };
+        let failed_call = match mode {
+            "f169_cleanup_inventory" => "ps -aq --filter label=a2a.run=test-run".to_string(),
+            "f169_cleanup_removal" => "rm -f failed-id".to_string(),
+            "f169_recovery_inventory" => format!(
+                "ps -a --filter label=a2a.owner={}",
+                std::fs::read_to_string(dir.path().join("second-owner"))
+                    .unwrap()
+                    .trim()
+            ),
+            "f169_recovery_removal" => "rm -f second-container".to_string(),
+            _ => unreachable!("unknown #169 sweep fixture mode"),
+        };
+        assert!(
+            stderr.contains(diagnostic)
+                && stderr.contains(runtime.to_string_lossy().as_ref())
+                && stderr.contains(&failed_call)
+                && stderr.contains("exit status: 7"),
+            "nonzero runtime status must be reported with its sweep diagnostic: {out:?}"
+        );
+        assert!(
+            calls.contains("ps:"),
+            "inventory was not attempted: {calls:?}"
+        );
+
+        match mode {
+            "f169_cleanup_inventory" => {
+                assert!(
+                    !calls.contains("rm:"),
+                    "a failed cleanup inventory must not start removals: {calls:?}"
+                );
+            }
+            "f169_cleanup_removal" => {
+                assert!(
+                    calls
+                        == "ps:ps -aq --filter label=a2a.run=test-run\nrm:rm -f failed-id\nrm:rm -f later-id\n",
+                    "cleanup must remove only the two inventory IDs in order: {calls:?}"
+                );
+                assert!(dir.path().join("failed-id").exists());
+                assert!(!dir.path().join("later-id").exists());
+            }
+            "f169_recovery_inventory" | "f169_recovery_removal" => {
+                assert!(
+                    calls.contains("rm:rm -f first-container\n")
+                        && calls.contains("rm:rm -f second-container\n"),
+                    "the healthy recovery pass must remove the retained survivor: {calls:?}"
+                );
+            }
+            _ => unreachable!("unknown #169 sweep fixture mode"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f169_cleanup_inventory_nonzero_is_visible_and_stops_removal() {
+        f169_sweep_failure_case("f169_cleanup_inventory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f169_cleanup_removal_nonzero_continues_to_later_ids() {
+        f169_sweep_failure_case("f169_cleanup_removal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f169_recovery_inventory_nonzero_preserves_then_recovers_lease() {
+        f169_sweep_failure_case("f169_recovery_inventory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f169_recovery_removal_nonzero_preserves_then_recovers_lease() {
+        f169_sweep_failure_case("f169_recovery_removal");
     }
 
     #[cfg(unix)]

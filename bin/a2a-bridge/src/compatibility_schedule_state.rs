@@ -157,6 +157,10 @@ pub(super) struct OwnerAdmissionLock {
     inner: Arc<StateRootInner>,
     file: File,
     authority_file: Option<File>,
+    /// `false` while `try_owner_admission_inner` is still acquiring its nested authority lock.
+    /// An unpublished guard owns descriptors but must not amend the process-local holder count
+    /// when its refused path drops it.
+    admission_published: bool,
 }
 
 pub(super) struct AdmissionAuthorityLocks {
@@ -738,16 +742,18 @@ impl SchedulerStateRoot {
         &self,
         holder: &str,
     ) -> Result<OwnerAdmissionLock, SchedulerStateError> {
-        self.try_owner_admission_inner(holder, || {})
+        self.try_owner_admission_inner(holder, || {}, || {})
     }
 
-    fn try_owner_admission_inner<F>(
+    fn try_owner_admission_inner<F, G>(
         &self,
         holder: &str,
-        before_counter_publication: F,
+        after_owner_acquired: F,
+        before_counter_publication: G,
     ) -> Result<OwnerAdmissionLock, SchedulerStateError>
     where
         F: FnOnce(),
+        G: FnOnce(),
     {
         let mut process_state = try_process_lock_state(&self.inner)?;
         if process_state.authority_only_holders != 0 {
@@ -759,12 +765,24 @@ impl SchedulerStateRoot {
             "owner-wide compatibility admission lock",
             holder,
         )?;
-        let authority_file = try_lock(
+        // Construct the owner guard as soon as its descriptor is acquired. A concurrent fork can
+        // duplicate that descriptor before the nested authority acquisition returns. If the nested
+        // acquisition refuses, ordinary `File` destruction would only close the parent descriptor;
+        // an inherited duplicate could then prolong the owner lock. The unpublished guard's Drop
+        // explicitly unlocks the shared open-file description on every such refused path.
+        let mut owner = OwnerAdmissionLock {
+            inner: Arc::clone(&self.inner),
+            file,
+            authority_file: None,
+            admission_published: false,
+        };
+        after_owner_acquired();
+        owner.authority_file = Some(try_lock(
             &self.inner.locks,
             "authority-state.lock",
             "authority-state lock",
             holder,
-        )?;
+        )?);
         before_counter_publication();
         process_state.admission_holders = process_state
             .admission_holders
@@ -774,11 +792,8 @@ impl SchedulerStateRoot {
                     "scheduler owner-admission holder count overflowed".into(),
                 )
             })?;
-        Ok(OwnerAdmissionLock {
-            inner: Arc::clone(&self.inner),
-            file,
-            authority_file: Some(authority_file),
-        })
+        owner.admission_published = true;
+        Ok(owner)
     }
 
     #[cfg(test)]
@@ -790,7 +805,19 @@ impl SchedulerStateRoot {
     where
         F: FnOnce(),
     {
-        self.try_owner_admission_inner(holder, before_counter_publication)
+        self.try_owner_admission_inner(holder, || {}, before_counter_publication)
+    }
+
+    #[cfg(test)]
+    fn try_owner_admission_with_acquired_owner_hook<F>(
+        &self,
+        holder: &str,
+        after_owner_acquired: F,
+    ) -> Result<OwnerAdmissionLock, SchedulerStateError>
+    where
+        F: FnOnce(),
+    {
+        self.try_owner_admission_inner(holder, after_owner_acquired, || {})
     }
 
     pub(super) fn try_authority_mutation(
@@ -944,7 +971,7 @@ impl Drop for OwnerAdmissionLock {
         // refusing every later `try_authority_mutation` on it (LockOrder) forever. Doing the
         // bookkeeping first, in its own scope, makes it unconditional regardless of what the
         // fallible releases below do.
-        {
+        if self.admission_published {
             let mut state = process_lock_state_after_drop(&self.inner);
             debug_assert!(state.admission_holders > 0);
             state.admission_holders = state.admission_holders.saturating_sub(1);
@@ -1382,6 +1409,92 @@ mod tests {
         authority_root
             .try_authority_mutation("independent:authority:after-drop")
             .unwrap();
+    }
+
+    /// Bounded same-environment probe for #132, run with one test thread. Prediction: an owner
+    /// descriptor inherited by a child while the nested authority acquisition is refused will
+    /// keep the owner lock live on the old path, because that path only closes its parent `File`.
+    /// Result after the repair: the contender acquires after the refused admission even while the
+    /// child remains blocked. A genuinely returned owner capability still excludes both owner and
+    /// authority contenders. An alternative explanation would be a live authority capability;
+    /// this probe drops that capability before the contender attempt and retains only the child.
+    #[cfg(unix)]
+    #[test]
+    fn refused_owner_admission_explicitly_unlocks_a_fork_inherited_descriptor() {
+        let root = root();
+        let authority_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let refused_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let contender_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let held_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+
+        let authority = authority_root
+            .try_authority_mutation("forked-refusal:authority")
+            .unwrap();
+        let mut release_child = [-1; 2];
+        // SAFETY: the test owns this short-lived pipe and closes both ends after its child exits.
+        assert_eq!(unsafe { libc::pipe(release_child.as_mut_ptr()) }, 0);
+        let mut child_pid = -1;
+        let refused = refused_root.try_owner_admission_with_acquired_owner_hook(
+            "forked-refusal:owner",
+            || {
+                // SAFETY: the child only blocks in `read` then calls `_exit`; it does not invoke
+                // Rust destructors or touch the inherited scheduler mutex.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    unsafe {
+                        libc::close(release_child[1]);
+                        let mut byte = 0_u8;
+                        let _ = libc::read(
+                            release_child[0],
+                            &mut byte as *mut u8 as *mut libc::c_void,
+                            1,
+                        );
+                        libc::_exit(0);
+                    }
+                }
+                assert!(pid > 0, "fork the inherited-descriptor holder");
+                child_pid = pid;
+                // SAFETY: the parent no longer reads this pipe end.
+                assert_eq!(unsafe { libc::close(release_child[0]) }, 0);
+            },
+        );
+
+        drop(authority);
+        let contender = contender_root.try_owner_admission("forked-refusal:contender");
+        let held_owner_excludes = contender.is_ok()
+            && held_root
+                .try_owner_admission("forked-refusal:held-owner")
+                .is_err();
+        let held_authority_excludes = contender.is_ok()
+            && held_root
+                .try_authority_mutation("forked-refusal:held-authority")
+                .is_err();
+        drop(contender);
+        let admits_after_release = held_root
+            .try_owner_admission("forked-refusal:after-release")
+            .is_ok();
+
+        // SAFETY: release the only child created by this test and reap it before asserting.
+        assert_eq!(
+            unsafe { libc::write(release_child[1], b"x".as_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(unsafe { libc::close(release_child[1]) }, 0);
+        let mut child_status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child_pid, &mut child_status, 0) },
+            child_pid
+        );
+
+        assert!(matches!(refused, Err(SchedulerStateError::LockBusy(_))));
+        assert!(
+            held_owner_excludes && held_authority_excludes,
+            "a genuinely held owner capability must still exclude every contender"
+        );
+        assert!(
+            admits_after_release,
+            "a fork-inherited descriptor from a refused admission must not prolong the owner lock"
+        );
     }
 
     #[test]
