@@ -1094,13 +1094,21 @@ fn recover_orphans(
     // at the end. A crashed run's containers span multiple owners but share one lease — deleting it per-owner
     // would blind the later owners' sweeps (absent lease → Unknown → spared → leak; live-gate finding).
     let mut dead_leases: Vec<String> = Vec::new();
+    let mut failed = false;
     for (runtime, owner) in owners {
-        dead_leases.extend(bridge_core::reaper::classify_sweep(
-            &runtime,
-            &owner,
-            host,
-            &FsLeaseProbe,
-        ));
+        match bridge_core::reaper::classify_sweep(&runtime, &owner, host, &FsLeaseProbe) {
+            Ok(leases) => dead_leases.extend(leases),
+            Err(error) => {
+                eprintln!(
+                    "orphan recovery failed for owner {owner}: {error}; retaining recovery leases"
+                );
+                failed = true;
+            }
+        }
+    }
+    // A failed owner may still have containers referencing any successful owner's leases.
+    if failed {
+        return;
     }
     dead_leases.sort();
     dead_leases.dedup();
@@ -1170,24 +1178,24 @@ async fn confirm_container_filter_absent(
     filter: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(), BoxError> {
-    let output = tokio::time::timeout_at(
-        deadline,
-        tokio::process::Command::new(runtime)
-            .kill_on_drop(true)
-            .args([
-                "ps",
-                "-aq",
-                "--filter",
-                "label=a2a.managed=1",
-                "--filter",
-                filter,
-            ])
-            .output(),
+    let mut command = std::process::Command::new(runtime);
+    command.args([
+        "ps",
+        "-aq",
+        "--filter",
+        "label=a2a.managed=1",
+        "--filter",
+        filter,
+    ]);
+    let output = bridge_core::control_command::output_async(
+        command,
+        deadline.into_std(),
+        Default::default(),
     )
     .await;
     match output {
-        Ok(Ok(out)) if out.status.success() && out.stdout.iter().all(u8::is_ascii_whitespace) => Ok(()),
-        Ok(Ok(out)) if out.status.success() => Err(format!(
+        Ok(out) if out.status.success() && out.stdout.iter().all(u8::is_ascii_whitespace) => Ok(()),
+        Ok(out) if out.status.success() => Err(format!(
             "implement: container for this run still present or running in {runtime}; stopping before host git (clone kept)"
         ).into()),
         _ => Err(format!(
@@ -1243,7 +1251,9 @@ struct RunEndGuard {
 impl Drop for RunEndGuard {
     fn drop(&mut self) {
         for runtime in &self.runtimes {
-            bridge_core::reaper::run_scoped_reap(runtime, &self.instance_id);
+            if let Err(error) = bridge_core::reaper::run_scoped_reap(runtime, &self.instance_id) {
+                eprintln!("run-end container cleanup failed: {error}");
+            }
         }
     }
 }
@@ -2521,30 +2531,12 @@ fn missing_runtimes(
 /// not enforcement). Only ever invoked on an ALLOWLISTED runtime (see `preflight_runtimes`), never on a
 /// config-named binary the allowlist would reject.
 fn runtime_responds(runtime: &str) -> bool {
-    let mut child = match std::process::Command::new(runtime)
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => return false,
-        }
-    }
+    bridge_core::control_command::output_until(
+        std::process::Command::new(runtime).arg("info"),
+        std::time::Instant::now() + Duration::from_secs(5),
+        bridge_core::control_command::OutputPolicy::DISCARD,
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 /// Warn-level preflight (NOT enforcement — the allowlist/S3 + the verify gate are the hard gates). Collects
@@ -7533,17 +7525,16 @@ fn operator_observe_container_identity(
     runtime: &str,
     selector: &str,
 ) -> OperatorIdentityObservationV1 {
-    let inspected = std::process::Command::new(runtime)
-        .args([
+    let inspected = bridge_core::control_command::output_with_policy(
+        std::process::Command::new(runtime).args([
             "container",
             "inspect",
             "--format",
             bridge_core::reaper::CONTAINER_IDENTITY_FORMAT,
             selector,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
+        ]),
+        bridge_core::control_command::OutputPolicy::STDOUT,
+    );
     match inspected {
         Ok(output) if output.status.success() => {
             return bridge_core::reaper::parse_container_identity(&output.stdout)
@@ -7554,18 +7545,17 @@ fn operator_observe_container_identity(
         Err(_) => return OperatorIdentityObservationV1::Unknown,
     }
 
-    let inventory = std::process::Command::new(runtime)
-        .args([
+    let inventory = bridge_core::control_command::output_with_policy(
+        std::process::Command::new(runtime).args([
             "container",
             "ps",
             "--all",
             "--no-trunc",
             "--format",
             bridge_core::reaper::CONTAINER_INVENTORY_FORMAT,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
+        ]),
+        bridge_core::control_command::OutputPolicy::STDOUT,
+    );
     match inventory {
         Ok(output) if output.status.success() => {
             match bridge_core::reaper::parse_container_inventory_contains(&output.stdout, selector)
@@ -7631,12 +7621,15 @@ fn operator_remove_container(authority: &OperatorContainerAuthorityV1) -> bool {
     if !operator_identity_matches(authority, &current) {
         return false;
     }
-    std::process::Command::new(&authority.runtime)
-        .args(["rm", "-f", &authority.identity.immutable_container_id])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|output| output.status.success())
+    bridge_core::control_command::output_with_policy(
+        std::process::Command::new(&authority.runtime).args([
+            "rm",
+            "-f",
+            &authority.identity.immutable_container_id,
+        ]),
+        bridge_core::control_command::OutputPolicy::STDOUT,
+    )
+    .is_ok_and(|output| output.status.success())
 }
 
 /// Execute `a2a-bridge containers <list|reap>` — the operator view/cleanup over Increment A's managed
@@ -7748,17 +7741,17 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut classified: Vec<containers::ClassifiedRecord> = Vec::new();
     let mut managed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for runtime in &runtimes {
-        let Ok(out) = std::process::Command::new(runtime)
-            .args([
+        let Ok(out) =
+            bridge_core::control_command::output(std::process::Command::new(runtime).args([
                 "ps",
                 "-a",
                 "--filter",
                 "label=a2a.managed=1",
                 "--format",
                 containers::LIST_FORMAT,
-            ])
-            .output()
+            ]))
         else {
+            eprintln!("containers: runtime {runtime} unavailable");
             continue;
         };
         for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -7805,16 +7798,22 @@ fn containers_cmd(args: &[String]) -> Result<(), BoxError> {
             // Legacy pass: pre-Increment-A unlabeled `a2a-(ro|rw)-*` names (no `a2a.managed`), list-only.
             let mut legacy: Vec<String> = Vec::new();
             for runtime in &runtimes {
-                if let Ok(out) = std::process::Command::new(runtime)
-                    .args(["ps", "-a", "--format", "{{.Names}}"])
-                    .output()
-                {
+                if let Ok(out) = bridge_core::control_command::output(
+                    std::process::Command::new(runtime).args([
+                        "ps",
+                        "-a",
+                        "--format",
+                        "{{.Names}}",
+                    ]),
+                ) {
                     for name in String::from_utf8_lossy(&out.stdout).lines() {
                         let name = name.trim();
                         if containers::is_legacy_name(name) && !managed_names.contains(name) {
                             legacy.push(name.to_string());
                         }
                     }
+                } else {
+                    eprintln!("containers: runtime {runtime} unavailable during legacy listing");
                 }
             }
             legacy.sort();
@@ -8089,15 +8088,14 @@ fn storage_runtime_pass(
         Some((sr::display_path(Path::new(&rec.repo)), lease))
     };
     for runtime in &runtimes {
-        let stdout = std::process::Command::new(runtime)
-            .args([
+        let stdout =
+            bridge_core::control_command::output(std::process::Command::new(runtime).args([
                 "ps",
                 "--filter",
                 "label=a2a.managed=1",
                 "--format",
                 containers::LIST_FORMAT,
-            ])
-            .output()
+            ]))
             .ok()
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
@@ -8137,9 +8135,13 @@ fn storage_runtime_pass(
     let mut volumes_answered = false;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for runtime in &runtimes {
-        let Ok(out) = std::process::Command::new(runtime)
-            .args(["volume", "ls", "--format", "{{.Name}}"])
-            .output()
+        let Ok(out) =
+            bridge_core::control_command::output(std::process::Command::new(runtime).args([
+                "volume",
+                "ls",
+                "--format",
+                "{{.Name}}",
+            ]))
         else {
             continue;
         };
@@ -10893,6 +10895,362 @@ mod cli_tests {
     use super::*;
     use crate::turn::TurnRunner;
     use bridge_core::ports::RichEventSinkFactory as _;
+
+    /// Supervise the real synchronous callers in a fresh process, so a regression cannot wedge
+    /// the test runner and logging starts exactly as it does for a one-shot CLI.
+    #[cfg(unix)]
+    fn supervise_runtime_child(mode: &str, dir: &Path) -> std::process::Output {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli_tests::runtime_control_child", "--nocapture"])
+            .env("RUNTIME_CONTROL_CHILD", mode)
+            .env("RUNTIME_CONTROL_DIR", dir)
+            .env_remove("RUST_LOG")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if started.elapsed() > Duration::from_secs(38) {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                // The runtime owns a separate process group. Settle it too on a failed test.
+                if let Ok(pids) = std::fs::read_to_string(dir.join("started")) {
+                    for pid in pids
+                        .split_whitespace()
+                        .filter_map(|p| p.parse::<i32>().ok())
+                    {
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    }
+                }
+                panic!("{mode} exceeded the supervised runtime budget");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn assert_runtime_group_settled(marker: &Path) {
+        let pids: Vec<i32> = std::fs::read_to_string(marker)
+            .expect("runtime started")
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        let leader = pids[0];
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // A container init may defer reaping orphan zombies; they have already terminated.
+            let terminated = |pid: i32| {
+                let zombie =
+                    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                        stat.split_once(") ")
+                            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                    });
+                zombie || unsafe { libc::kill(pid, 0) } != 0
+            };
+            #[cfg(target_os = "linux")]
+            let group_settled = std::fs::read_dir("/proc")
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                        return true;
+                    };
+                    let Some((_, rest)) = stat.rsplit_once(") ") else {
+                        return true;
+                    };
+                    let fields: Vec<_> = rest.split_whitespace().collect();
+                    fields.get(2).and_then(|id| id.parse::<i32>().ok()) != Some(leader)
+                        || fields.first() == Some(&"Z")
+                });
+            #[cfg(not(target_os = "linux"))]
+            let group_settled = unsafe { libc::kill(-leader, 0) } != 0;
+            if group_settled
+                && pids.iter().all(|pid| terminated(*pid))
+                && unsafe { libc::kill(leader, 0) } != 0
+            {
+                return;
+            }
+            if std::time::Instant::now() >= until {
+                unsafe {
+                    libc::kill(-leader, libc::SIGKILL);
+                    for pid in &pids {
+                        libc::kill(*pid, libc::SIGKILL);
+                    }
+                }
+                panic!("runtime group {leader} survived or its leader was not reaped: {pids:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_control_child() {
+        let Ok(mode) = std::env::var("RUNTIME_CONTROL_CHILD") else {
+            return;
+        };
+        bridge_observ::init_stderr();
+        let dir = PathBuf::from(std::env::var_os("RUNTIME_CONTROL_DIR").unwrap());
+        let runtime = dir.join("runtime").to_string_lossy().into_owned();
+        if mode.starts_with("cleanup") {
+            drop(RunEndGuard {
+                runtimes: vec![runtime],
+                instance_id: "test-run".into(),
+            });
+        } else if mode == "operator" {
+            assert!(matches!(
+                operator_observe_container_identity(&runtime, "exact-id"),
+                OperatorIdentityObservationV1::Unknown
+            ));
+        } else {
+            let config = dir.join("bridge.toml");
+            let mut entry = cr_entry("impl", dir.to_str().unwrap());
+            entry.sandbox.as_mut().unwrap().runtime = Some(runtime.clone());
+            let snapshot = snap(vec![entry]);
+            let owners = recovery_owners(&snapshot, &config, Some((&runtime, "verify-owner")));
+            assert_eq!(owners.len(), 2);
+            // The runtime fixture keys on the sorted second owner, proving A succeeds before B fails.
+            std::fs::write(dir.join("second-owner"), &owners[1].1).unwrap();
+            let lease = dir.join("shared.lock");
+            // A real unlocked lease file is exactly what a crashed lease holder leaves behind.
+            std::fs::File::create(&lease).unwrap();
+            recover_orphans(&snapshot, &config, "host", Some((&runtime, "verify-owner")));
+            assert!(
+                !dir.join("first-container").exists(),
+                "first owner must have reaped"
+            );
+            assert!(
+                dir.join("second-container").exists(),
+                "timed-out owner must survive"
+            );
+            assert!(
+                lease.exists(),
+                "failed sweep lost the shared recovery lease"
+            );
+            assert_runtime_group_settled(&dir.join("started"));
+            std::fs::write(dir.join("healthy"), "").unwrap();
+            recover_orphans(&snapshot, &config, "host", Some((&runtime, "verify-owner")));
+            assert!(
+                !dir.join("second-container").exists(),
+                "healthy recovery must reap survivor"
+            );
+            assert!(
+                !lease.exists(),
+                "healthy recovery must remove the shared lease"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn sweep_timeout_case(mode: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let hang = "sleep 120 & echo \"$$ $!\" > \"$root/started\"; wait";
+        let body = if mode == "cleanup-inventory" {
+            hang.to_string()
+        } else if mode == "cleanup-removal" {
+            format!("[ \"$1\" != rm ] && {{ echo exact-id; exit 0; }}\n{hang}")
+        } else {
+            for name in ["first-container", "second-container"] {
+                std::fs::write(dir.path().join(name), "").unwrap();
+            }
+            // Inventories are stateful: once removed, a container is absent on the next pass.
+            format!(
+                r#"
+if [ "$1" = rm ]; then
+    if [ "$3" = second-container ] && [ ! -f "$root/healthy" ] && [ "{mode}" = recovery-removal ]; then
+        {hang}
+    fi
+    rm -f "$root/$3"
+    exit 0
+fi
+case "$*" in
+    *"$(cat "$root/second-owner")"*) id=second-container ;;
+    *) id=first-container ;;
+esac
+if [ "$id" = second-container ] && [ ! -f "$root/healthy" ] && [ "{mode}" = recovery-inventory ]; then
+    {hang}
+fi
+[ ! -f "$root/$id" ] || printf '%s\thost\t%s/shared.lock\n' "$id" "$root"
+exit 0
+"#
+            )
+        };
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nroot='{}'\n{body}\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm_up_script(&runtime);
+        let out = supervise_runtime_child(mode, dir.path());
+        assert!(out.status.success(), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let diagnostic = if mode.starts_with("cleanup") {
+            "run-end container cleanup failed:"
+        } else {
+            "orphan recovery failed for owner"
+        };
+        assert!(
+            stderr.contains(diagnostic) && stderr.contains("timed out"),
+            "{out:?}"
+        );
+        assert!(
+            stderr.contains(if mode.ends_with("inventory") {
+                "ps "
+            } else {
+                "rm -f"
+            }),
+            "missing failed call: {out:?}"
+        );
+        assert_runtime_group_settled(&dir.path().join("started"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_inventory_timeout_is_visible_with_default_logging() {
+        sweep_timeout_case("cleanup-inventory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removal_timeout_is_visible_with_default_logging() {
+        sweep_timeout_case("cleanup-removal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_inventory_timeout_preserves_shared_lease_and_reports_failure() {
+        sweep_timeout_case("recovery-inventory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_removal_timeout_preserves_shared_lease_and_reports_failure() {
+        sweep_timeout_case("recovery-removal");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn clone_entry_timeout_kills_runtime_descendants_and_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let marker = dir.path().join("started");
+        std::fs::write(
+            &runtime,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nsleep 120 &\necho \"$$ $!\" > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The no-argument warm-up exits at once; it absorbs first-exec latency (macOS scan, ETXTBSY) so a
+        // loaded full-suite run still records the marker before the deadline.
+        warm_up_script(&runtime);
+        let started = std::time::Instant::now();
+        let error = confirm_container_filter_absent(
+            runtime.to_str().unwrap(),
+            "label=a2a.cwd=test",
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot query container runtime"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        for pid in std::fs::read_to_string(marker)
+            .unwrap()
+            .split_whitespace()
+            .map(|p| p.parse::<i32>().unwrap())
+        {
+            let settled_by = std::time::Instant::now() + Duration::from_secs(2);
+            let alive = loop {
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    s.split_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+                let alive = !zombie && unsafe { libc::kill(pid, 0) } == 0;
+                if !alive || std::time::Instant::now() >= settled_by {
+                    break alive;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            if alive {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(!alive, "runtime descendant {pid} survived entry timeout");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_identity_discarded_stderr_is_not_an_eof_dependency() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let marker = dir.path().join("child");
+        std::fs::write(&runtime, format!(
+            "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nsleep 60 >&2 &\necho $! > '{}'\nprintf 'exact-id\\t{{\"a2a.managed\":\"1\"}}\\n'\n", marker.display()
+        )).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm_up_script(&runtime);
+        let started = std::time::Instant::now();
+        let observation =
+            operator_observe_container_identity(runtime.to_str().unwrap(), "exact-id");
+        // Settle the intentionally independent helper before any assertion can unwind this test.
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(
+            matches!(observation, OperatorIdentityObservationV1::Found(_)),
+            "{observation:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "discarded stderr delayed identity discovery"
+        );
+
+        // A successful fast probe alone passed before runtime calls were bounded. Exercise a
+        // hung client and its descendant in a supervised subprocess as well.
+        let hanging_dir = tempfile::tempdir().unwrap();
+        let hanging = hanging_dir.path().join("runtime");
+        std::fs::write(
+            &hanging,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nsleep 120 &\necho \"$$ $!\" > '{}'\nwait\n",
+                hanging_dir.path().join("started").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm_up_script(&hanging);
+        let out = supervise_runtime_child("operator", hanging_dir.path());
+        assert!(out.status.success(), "{out:?}");
+        assert_runtime_group_settled(&hanging_dir.path().join("started"));
+    }
 
     /// Retry `operation` while it fails with `ETXTBSY`, up to 50 attempts 10 ms apart; any other
     /// outcome, or the last `ETXTBSY`, is returned unchanged. A test-only copy of `bridge-core`'s

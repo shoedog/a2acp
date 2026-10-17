@@ -1,13 +1,12 @@
 //! Host-only custody transport. URLs and Git diagnostics never leave memory.
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 unsafe extern "C" {
     #[link_name = "kill"]
     fn signal_process(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
@@ -105,78 +104,19 @@ fn git() -> Command {
 // Do not retain or render Git's opaque diagnostics: they can contain credentials,
 // helper output, rewritten URLs, and server-supplied secrets.
 fn bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|_| "custody git spawn failed")?;
-    let started = Instant::now();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    for (is_stdout, mut stream) in [
-        (true, Box::new(stdout) as Box<dyn Read + Send>),
-        (false, Box::new(stderr) as Box<dyn Read + Send>),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut buf = [0; 4096];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                if is_stdout {
-                    let take = n.min(65536usize.saturating_sub(kept.len()));
-                    kept.extend_from_slice(&buf[..take]);
-                }
-            }
-            let _ = tx.send((is_stdout, kept));
-        });
-    }
-    drop(tx);
-    let mut stdout = None;
-    let mut stderr_done = false;
-    loop {
-        while let Ok((is_stdout, bytes)) = rx.try_recv() {
-            if is_stdout {
-                stdout = Some(bytes);
-            } else {
-                stderr_done = true;
-            }
-        }
-        if let (Some(bytes), true) = (stdout.as_ref(), stderr_done) {
-            if let Ok(Some(status)) = child.try_wait() {
-                return Ok(Output {
-                    status,
-                    stdout: bytes.clone(),
-                    stderr: Vec::new(),
-                });
-            }
-        }
-        if started.elapsed() >= timeout {
-            #[cfg(unix)]
-            {
-                if let Ok(pid) = std::ffi::c_int::try_from(child.id()) {
-                    // SAFETY: this still-owned, unreaped child was spawned with
-                    // process_group(0), so -pid identifies its process group.
-                    // SIGKILL is 9 on supported Unix targets. No external kill
-                    // utility is required in minimal verification containers.
-                    unsafe {
-                        signal_process(-pid, 9);
-                    }
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("custody git timeout".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    use bridge_core::control_command::{output_until, ControlError, OutputPolicy, StreamPolicy};
+    output_until(
+        &mut cmd,
+        Instant::now() + timeout,
+        OutputPolicy {
+            stdout: StreamPolicy::Capture(Some(65536)),
+            stderr: StreamPolicy::Capture(Some(0)),
+        },
+    )
+    .map_err(|error| match error {
+        ControlError::Timeout => "custody git timeout".into(),
+        ControlError::Io(_) | ControlError::Output(_) => "custody git spawn failed".into(),
+    })
 }
 
 // Read ref storage directly: asking Git inside the clone would apply its
@@ -789,6 +729,8 @@ mod tests {
     use crate::implement_resume::{
         load_checkpoint, reconcile_head, save_checkpoint, validate_resumable, ImplementCheckpoint,
     };
+    use std::io::Read;
+    use std::process::Stdio;
 
     fn run(repo: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -1757,7 +1699,13 @@ mod tests {
                         .1
                         .trim_start()
                         .starts_with('Z'),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    // procfs can report ESRCH when the process disappears during the read.
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(3) =>
+                    {
+                        false
+                    }
                     Err(error) => panic!("process inspection failed: {error}"),
                 };
                 #[cfg(not(target_os = "linux"))]
