@@ -48,7 +48,7 @@ Configuration (`[custody]`):
 | `push` | `true` | Push the run branch at stable points |
 | `remote` | `origin` | Remote to push to; may name a private mirror |
 | `ref_prefix` | `wip/` | Branch prefix; the run branch is `<prefix><run-id>` |
-| `delete_remote_on_merge` | `false` | Delete the run branch after a successful merge |
+| `delete_remote_on_merge` | `true` | Delete the run branch after a successful merge |
 
 The pushed branch keeps the original commits. That is what makes `merge`'s re-authored commits safe: the originals
 remain on the remote.
@@ -79,7 +79,7 @@ committed to source.
 
 ### 3. A clone is deleted only when nothing would be lost
 
-`merge` and a future `clean` command delete a clone only when, under the run's operation lock:
+`merge` and confirmed merged `storage reap --clones` delete a clone only when, under the run's operation lock:
 
 1. the clone's exact `HEAD` is on the configured remote (checked with `git ls-remote`, not with a local tracking
    ref);
@@ -92,6 +92,51 @@ If check 4 fails, the clone is kept and reported, not deleted. These states are 
 the bridge will not destroy them silently. The user can resolve them or delete the clone deliberately.
 
 Ignored files, such as `target/`, are treated as rebuildable and are not preserved.
+
+### 4. Landing provenance and parked-clone decisions
+
+New landing commits contain exactly one canonical `A2A-Run`/`A2A-Original` trailer pair. Supplied
+conflicts are removed. Already-integrated no-ops add no empty commit. Automatic merged reap requires the
+exact pair reachable from source `main`; another branch, wrong run or original SHA does not qualify.
+Stable patch IDs identify high-confidence patch equivalence; all changed paths matching together in a
+single main commit within 14 days after the clone's last commit identify low-confidence content
+equivalence. These are adjudication evidence, never proven run provenance. Probe failures are unknown.
+
+Reap reports run, path, source, confidence, matched commit/reason and deletion blockers. It reads the run's
+recorded configuration; unavailable/invalid metadata or configuration retains the clone. The shared gate
+checks configuration, remote HEAD, cleanliness, configured archive, refs and repository shape, including
+index flags, nested repositories and linked worktrees. It accepts ordinary ignored build output. Receipts
+remain, but no duplicate evidence copy is required. The run's recorded runtimes must affirm the absence
+of containers for its clone and run generations; unavailable runtimes retain the clone, including under
+explicit remove. Chained-origin provenance uses the terminal root, separately from immediate-source custody.
+
+Owner decision files use `run_ids` for explicit remove and optional `keep_run_ids` for keep, with
+`authorized_by` and `reason`. Contradictions refuse. Keep or no decision preserves parked clones and refs.
+Explicit remove is an owner-authorized discard, waiving merged classification and Git-state custody checks
+(on-remote, clean, archive, refs and shape allowlists). It retains every live-use, operation-lock,
+protected-root, path-identity and container safeguard. Its archive retains the actual terminal phase.
+Source resolution is best-effort for authorized discard: a missing source permits local removal and leaves
+a receipt reporting remote cleanup unavailable; existing sources retain their containment and identity checks.
+
+After successful local removal, recorded normal and dirty remote refs are deleted with existing leases.
+Gate failure or local-removal failure leaves remote refs untouched. A changed foreign ref is retained and
+reported. Remote rejection reports incomplete cleanup and remaining refs; successful landing stays exit 0.
+`delete_remote_on_merge = true` is the default; operators may explicitly opt out for merged cleanup.
+
+### 5. Bounded archive memory
+
+All selected sources are opened and validated before any publication side effect, and their handles are
+retained for streaming. Payloads and compressed archives stream through fixed-size buffers to a staging
+file created with mode `0600` on Unix, regardless of umask. Only file names, sizes, SHA-256 digests and the manifest scale with file count. Verification streams tar entries and
+drains gzip EOF to check compressed checksums. Compressed-size dropping, protected evidence, retention
+and atomic publication behavior remain intact. At fixed file counts, the declared regression bound is
+less than 16 MiB additional peak RSS for 16 MiB versus 256 MiB payloads, including a single large file.
+Linux regression tests measure fresh child processes at one and four files.
+The Linux arm64 / Rust 1.94 control measured peak RSS at 6,956 / 6,948 KiB for one payload file
+(16 / 256 MiB) and 6,976 / 6,972 KiB for four payload files, plus a fixed small spec. The isolated
+unchanged-base control measured 72,188 / 793,152 KiB for one file and failed the same growth bound.
+The test covers both archive creation and complete digest/checksum verification in each child.
+
 
 ### How this meets ADR-0041 §2
 

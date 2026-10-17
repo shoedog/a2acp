@@ -5,7 +5,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -113,7 +113,17 @@ pub fn verify_merged_archive(
     head: &str,
     cfg: &EvidenceConfig,
 ) -> io::Result<()> {
-    use std::io::Read;
+    verify_archive(clone, ck, head, cfg, "merged")
+}
+
+/// Parked runs retain their actual terminal phase; callers choose the expected phase explicitly.
+pub fn verify_archive(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    head: &str,
+    cfg: &EvidenceConfig,
+    phase: &str,
+) -> io::Result<()> {
     cfg.validate().map_err(|e| invalid(&e))?;
     let root = match &cfg.path {
         Some(path) => path.clone(),
@@ -128,33 +138,53 @@ pub fn verify_merged_archive(
     if path.starts_with(clone.canonicalize()?) {
         return Err(invalid("archive inside clone"));
     }
-    let mut bytes = Vec::new();
-    // Read through gzip EOF as well as tar EOF, checking the compressed stream's checksum.
-    flate2::read::MultiGzDecoder::new(fs::File::open(path)?).read_to_end(&mut bytes)?;
-    let manifest = archive_manifest(&mut tar::Archive::new(bytes.as_slice()))?;
-    let mut archive = tar::Archive::new(bytes.as_slice());
+    // One streaming pass: only names, sizes and digests survive each entry.
+    // Memory is O(file count + manifest size), independent of selected payload bytes.
+    let mut archive = tar::Archive::new(flate2::read::MultiGzDecoder::new(fs::File::open(path)?));
     let mut files = std::collections::HashMap::new();
+    let mut manifest = None;
     for entry in archive.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
             return Err(invalid("non-file archive entry"));
         }
         let path = entry.path()?.to_string_lossy().into_owned();
-        let mut body = Vec::new();
-        entry.read_to_end(&mut body)?;
-        if files.insert(path, body).is_some() {
+        let (bytes, sha256) = if path == "manifest.json" {
+            let mut reader = HashReader {
+                inner: &mut entry,
+                hash: ring::digest::Context::new(&ring::digest::SHA256),
+                bytes: 0,
+            };
+            manifest = Some(serde_json::from_reader::<_, Manifest>(&mut reader)?);
+            (
+                reader.bytes,
+                reader
+                    .hash
+                    .finish()
+                    .as_ref()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            )
+        } else {
+            stream_digest(&mut entry)?
+        };
+        if files.insert(path, (bytes, sha256)).is_some() {
             return Err(invalid("duplicate archive entry"));
         }
     }
+    // Tar EOF is earlier than gzip EOF: drain and check every gzip checksum too.
+    io::copy(&mut archive.into_inner(), &mut io::sink())?;
+    let manifest = manifest.ok_or_else(|| invalid("no evidence manifest"))?;
     if manifest.schema != "a2a-evidence.v1"
         || manifest.task_id != ck.task_id
         || manifest.source_repo != ck.source_repo.canonicalize()?
         || manifest.branch != ck.branch
         || manifest.final_commit.as_deref() != Some(head)
-        || manifest.terminal_phase != "merged"
+        || manifest.terminal_phase != phase
     {
         return Err(invalid(
-            "archive manifest identity or merged phase mismatch",
+            "archive manifest identity or terminal phase mismatch",
         ));
     }
     if manifest
@@ -171,10 +201,10 @@ pub fn verify_merged_archive(
         ));
     }
     for item in &manifest.included {
-        let body = files
+        let (bytes, sha256) = files
             .get(&item.path)
             .ok_or_else(|| invalid("listed evidence missing"))?;
-        if body.len() as u64 != item.bytes || digest(body) != item.sha256 {
+        if *bytes != item.bytes || *sha256 != item.sha256 {
             return Err(invalid("archive size or digest mismatch"));
         }
     }
@@ -238,7 +268,7 @@ pub fn complete_review(
 struct Source {
     kind: String,
     path: String,
-    body: Vec<u8>,
+    file: fs::File,
 }
 fn collect(root: &Path, path: &Path, kind: &str, out: &mut Vec<Source>) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
@@ -256,6 +286,12 @@ fn collect(root: &Path, path: &Path, kind: &str, out: &mut Vec<Source>) -> io::R
             }
         }
     } else if meta.is_file() {
+        // Open and validate all selected files before publication creates any destination.
+        // Retain these exact handles through every encoding pass.
+        let file = fs::File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid("evidence source is not regular"));
+        }
         out.push(Source {
             kind: kind.into(),
             path: path
@@ -263,42 +299,99 @@ fn collect(root: &Path, path: &Path, kind: &str, out: &mut Vec<Source>) -> io::R
                 .map_err(|_| invalid("source outside clone"))?
                 .to_string_lossy()
                 .into_owned(),
-            body: fs::read(path)?,
+            file,
         });
     } else {
         return Err(invalid("selected evidence is not a regular file"));
     }
     Ok(())
 }
-fn encode(manifest: &mut Manifest, sources: &[Source]) -> io::Result<Vec<u8>> {
-    manifest.included = sources
-        .iter()
-        .map(|s| Included {
-            kind: s.kind.clone(),
-            path: s.path.clone(),
-            bytes: s.body.len() as u64,
-            sha256: digest(&s.body),
-        })
-        .collect();
-    let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
-    let mut written = std::collections::HashSet::new();
-    for (path, bytes) in sources
-        .iter()
-        .map(|s| (s.path.as_str(), s.body.clone()))
-        .chain(std::iter::once((
-            "manifest.json",
-            serde_json::to_vec_pretty(manifest)?,
-        )))
-    {
-        if !written.insert(path) {
-            continue;
+/// Fixed 64 KiB payload buffer, plus gzip/tar state and per-file manifest metadata.
+fn stream_digest(reader: &mut impl Read) -> io::Result<(u64, String)> {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut size = 0;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o600);
-        header.set_cksum();
-        tar.append_data(&mut header, path, bytes.as_slice())?;
+        ctx.update(&buffer[..n]);
+        size += n as u64;
     }
+    Ok((
+        size,
+        ctx.finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    ))
+}
+struct HashReader<R> {
+    inner: R,
+    hash: ring::digest::Context,
+    bytes: u64,
+}
+impl<R: Read> Read for HashReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash.update(&buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+fn encode<W: Write>(manifest: &mut Manifest, sources: &mut [Source], output: W) -> io::Result<W> {
+    manifest.included.clear();
+    let mut tar = tar::Builder::new(GzEncoder::new(output, Compression::default()));
+    let mut written = std::collections::HashMap::new();
+    for source in sources {
+        let (bytes, sha256) = if let Some(value) = written.get(&source.path) {
+            let (bytes, sha256): &(u64, String) = value;
+            (*bytes, sha256.clone())
+        } else {
+            let file = &mut source.file;
+            file.rewind()?;
+            let meta = file.metadata()?;
+            if !meta.is_file() {
+                return Err(invalid("evidence source is not regular"));
+            }
+            let mut reader = HashReader {
+                inner: file,
+                hash: ring::digest::Context::new(&ring::digest::SHA256),
+                bytes: 0,
+            };
+            let mut header = tar::Header::new_gnu();
+            header.set_size(meta.len());
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append_data(&mut header, &source.path, &mut reader)?;
+            if reader.bytes != meta.len() {
+                return Err(invalid("evidence source size changed"));
+            }
+            let sha256: String = reader
+                .hash
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            written.insert(source.path.clone(), (reader.bytes, sha256.clone()));
+            (reader.bytes, sha256)
+        };
+        manifest.included.push(Included {
+            kind: source.kind.clone(),
+            path: source.path.clone(),
+            bytes,
+            sha256,
+        });
+    }
+    let body = serde_json::to_vec_pretty(manifest)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(body.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.json", body.as_slice())?;
     tar.into_inner()?.finish()
 }
 /// Resolve even a not-yet-created destination through its nearest existing ancestor.
@@ -409,24 +502,6 @@ pub fn write_run_archive(
             });
         }
     }
-    // Summary and reviews can name the same member. Preserve kind accounting but write one tar entry.
-    let mut bytes = encode(&mut manifest, &sources)?;
-    for kind in KINDS[2..].iter().rev() {
-        if bytes.len() as u64 <= cfg.max_bytes_per_repo {
-            break;
-        }
-        if sources.iter().any(|s| s.kind == *kind) {
-            sources.retain(|s| s.kind != *kind);
-            manifest.dropped.push(Dropped {
-                kind: (*kind).into(),
-                reason: "over_cap".into(),
-            });
-            bytes = encode(&mut manifest, &sources)?;
-        }
-    }
-    if bytes.len() as u64 > cfg.max_bytes_per_repo {
-        eprintln!("[evidence] warning: protected evidence exceeds repository cap");
-    }
     fs::create_dir_all(&dir)?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -439,12 +514,36 @@ pub fn write_run_archive(
     remove_stale_temp(&temp, SystemTime::now())?;
     let mut temp_created = false;
     let publication = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
         temp_created = true;
-        file.write_all(&bytes)?;
+        // Re-encode to the same private file when the compressed cap drops a kind.
+        // Payloads and compressed output never accumulate in memory.
+        encode(&mut manifest, &mut sources, &mut file)?;
+        for kind in KINDS[2..].iter().rev() {
+            if file.metadata()?.len() <= cfg.max_bytes_per_repo {
+                break;
+            }
+            if sources.iter().any(|s| s.kind == *kind) {
+                sources.retain(|s| s.kind != *kind);
+                manifest.dropped.push(Dropped {
+                    kind: (*kind).into(),
+                    reason: "over_cap".into(),
+                });
+                file.set_len(0)?;
+                file.rewind()?;
+                encode(&mut manifest, &mut sources, &mut file)?;
+            }
+        }
+        if file.metadata()?.len() > cfg.max_bytes_per_repo {
+            eprintln!("[evidence] warning: protected evidence exceeds repository cap");
+        }
         file.sync_all()?;
         fs::rename(&temp, &destination)?;
         fs::File::open(&dir)?.sync_all()?;
@@ -810,15 +909,19 @@ mod tests {
             included: vec![],
             dropped: vec![],
         };
+        let payload = dir.join("payload.tmp");
+        fs::write(&payload, noise(size)).unwrap();
         let bytes = encode(
             &mut m,
-            &[Source {
+            &mut [Source {
                 kind: "spec".into(),
                 path: "spec.md".into(),
-                body: noise(size),
+                file: fs::File::open(&payload).unwrap(),
             }],
+            Vec::new(),
         )
         .unwrap();
+        fs::remove_file(payload).unwrap();
         let path = dir.join(format!("{name}.tar.gz"));
         fs::write(&path, bytes).unwrap();
         path
@@ -1052,7 +1155,7 @@ mod tests {
             return;
         }
         let f = fixture();
-        fs::set_permissions(f._temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(f._temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
         fs::set_permissions(
             f.clone.join(".git/A2A_TASK.md"),
             fs::Permissions::from_mode(0o0),
@@ -1075,5 +1178,192 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_source_preserves_existing_publication_even_as_root() {
+        use std::os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::CommandExt,
+        };
+        if let Some(root) = std::env::var_os("A2A_EVIDENCE_EXISTING_PERMISSION_TEST") {
+            let clone = PathBuf::from(root).join("clone");
+            let ck = load_checkpoint(&clone).unwrap();
+            let cfg = EvidenceConfig {
+                path: Some(clone.parent().unwrap().join("evidence")),
+                ..Default::default()
+            };
+            let dir = cfg
+                .path
+                .as_ref()
+                .unwrap()
+                .join(repo_key(&ck.source_repo).unwrap());
+            assert_eq!(
+                write_run_archive(&clone, &ck, "approved", &cfg)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                fs::read(dir.join("impl-test.tar.gz")).unwrap(),
+                b"previous archive"
+            );
+            assert!(!dir.join(".lock").exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            return;
+        }
+        let f = fixture();
+        let dir = f
+            .cfg
+            .path
+            .as_ref()
+            .unwrap()
+            .join(repo_key(&f.ck.source_repo).unwrap());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("impl-test.tar.gz"), b"previous archive").unwrap();
+        fs::set_permissions(f._temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(
+            f.clone.join(".git/A2A_TASK.md"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "evidence::tests::unreadable_source_preserves_existing_publication_even_as_root",
+        ])
+        .env("A2A_EVIDENCE_EXISTING_PERMISSION_TEST", f._temp.path());
+        if fs::metadata(f._temp.path()).unwrap().uid() == 0 {
+            cmd.uid(65534).gid(65534);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("A2A_EVIDENCE_UMASK_TEST").is_some() {
+            let f = fixture();
+            let path = archive(&f);
+            // rename preserves the staging inode's mode.
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            return;
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-c", "umask 000; exec \"$1\" --exact evidence::tests::archive_is_private_under_permissive_umask", "sh"])
+            .arg(std::env::current_exe().unwrap()).env("A2A_EVIDENCE_UMASK_TEST", "1").output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Isolated child processes make peak RSS comparable without allocator/test-order effects.
+    /// Bound: at fixed file counts, growing selected bytes 16 -> 256 MiB adds <16 MiB RSS.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_payload_memory_is_bounded() {
+        for files in [1, 4] {
+            let mut peaks = Vec::new();
+            for mib in [16, 256] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "evidence::tests::archive_memory_child",
+                        "--nocapture",
+                    ])
+                    .env("A2A_ARCHIVE_MEMORY_MIB", mib.to_string())
+                    .env("A2A_ARCHIVE_MEMORY_FILES", files.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stdout = String::from_utf8(out.stdout).unwrap();
+                let peak: u64 = stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ARCHIVE_PEAK_KIB="))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                peaks.push(peak);
+            }
+            eprintln!("archive RSS, {files} file(s), 16/256 MiB payload: {peaks:?} KiB; permitted growth <16384 KiB");
+            assert!(
+                peaks[1].saturating_sub(peaks[0]) < 16 * 1024,
+                "payload memory grew: {peaks:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_memory_child() {
+        let Ok(mib) = std::env::var("A2A_ARCHIVE_MEMORY_MIB") else {
+            return;
+        };
+        let mib: usize = mib.parse().unwrap();
+        let files: usize = std::env::var("A2A_ARCHIVE_MEMORY_FILES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut f = fixture();
+        f.cfg.include = vec!["spec".into(), "transcripts".into()];
+        f.cfg.max_bytes_per_repo = 1024 * 1024 * 1024;
+        // One 64 KiB incompressible block, emitted repeatedly without buffering payloads.
+        let block = noise(64 * 1024);
+        for index in 0..files {
+            let path = f
+                .clone
+                .join(format!(".git/a2a-bridge/codex-sessions/{index}"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = fs::File::create(path).unwrap();
+            for _ in 0..mib * 16 / files {
+                file.write_all(&block).unwrap();
+            }
+        }
+        archive(&f);
+        verify_archive(&f.clone, &f.ck, "head", &f.cfg, "approved").unwrap();
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find(|l| l.starts_with("VmHWM:"))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        println!("ARCHIVE_PEAK_KIB={peak}");
+    }
+    #[test]
+    fn parked_phase_and_stream_checksum_are_verified() {
+        let f = fixture();
+        let path = archive(&f);
+        verify_archive(&f.clone, &f.ck, "head", &f.cfg, "approved").unwrap();
+        assert!(verify_merged_archive(&f.clone, &f.ck, "head", &f.cfg).is_err());
+        assert!(verify_archive(&f.clone, &f.ck, "head", &f.cfg, "loopstopped").is_err());
+        let bytes = fs::read(&path).unwrap();
+        let mut corrupt = bytes.clone();
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(verify_archive(&f.clone, &f.ck, "head", &f.cfg, "approved").is_err());
+        fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(verify_archive(&f.clone, &f.ck, "head", &f.cfg, "approved").is_err());
     }
 }

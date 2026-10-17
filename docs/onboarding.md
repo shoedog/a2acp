@@ -400,7 +400,7 @@ push = true
 remote = "origin"
 ref_prefix = "wip/"
 push_timeout_secs = 120
-delete_remote_on_merge = false
+delete_remote_on_merge = true
 
 [evidence]
 store = "local"
@@ -413,6 +413,11 @@ max_bytes_per_repo = 10485760
 Other evidence kinds are `reviews`, `transcripts`, `checkpoint`, and `review_slices`. Archives contain a
 manifest with file sizes and SHA-256 digests; permitted drops are `not_produced`, `absent`, and `over_cap`.
 Archive publication is best effort. Choose a destination outside the clone, including through symlinks.
+Creation and verification stream payloads through fixed-size buffers and retain only per-file metadata;
+compressed output is staged on disk. Cap decisions still use compressed size, drop optional kinds in the
+same order, and protect the spec and final review summary. At fixed file counts, the regression bound is
+less than 16 MiB additional peak RSS when selected payloads grow from 16 MiB to 256 MiB (one and four
+files); Linux tests measure each size in a fresh process. Retention and atomic publication remain unchanged.
 
 After normal or already-integrated landing, the host checks the push record and rewrites the archive
 with phase `merged`, while retaining the run operation lock. Merge deletes a clone only when all six
@@ -432,7 +437,42 @@ merge: landed; check 1: push disabled; clone kept at /path/to/impl-123-abcd
 Landing still exits 0; inspect that clone before attempting cleanup. A clone dirty at initial preflight
 continues to exit 1. With `delete_remote_on_merge = true`, leased deletion of the normal and dirty run
 refs happens only after the clone was removed; failure is a warning and does not undo landing.
-`storage reap --clones` keeps its independent gates; adding the remote-custody check there is a follow-up.
+`storage reap --clones` uses that same Git custody/archive/ref/shape gate with each run's recorded
+configuration. Missing or invalid checkpoint/configuration retains the clone. Ordinary ignored build output
+follows the shared gate; a second evidence-directory copy is no longer required. Container absence is
+queried from the run's recorded runtimes, including stopped containers; an unavailable runtime retains the
+clone even under explicit remove. For chained origins, landing provenance is checked at the terminal root,
+while custody uses the recorded immediate source.
+
+Automatic merged reap requires an exact, unique `A2A-Run: <task_id>` / `A2A-Original: <clone HEAD>`
+trailer pair reachable from source `main`. New exact-base and integrate-current landings normalize those
+trailers, including conflicting supplied messages. An already-integrated no-op creates no empty commit.
+Without trailers, equal stable patch IDs report high-confidence patch equivalence; otherwise all changed
+paths (including deletions) matching together in one main commit within 14 days after the clone's last
+commit report low-confidence content equivalence. Neither establishes run provenance. Reports give run,
+path, source, confidence, matched commit/reason and deletion blockers; weaker/absent/unknown evidence
+awaits a per-clone owner decision.
+
+After inspecting the report, write an owner decision file and pass `--disposition-list /path/decisions.json`:
+
+```json
+{
+  "authorized_by": "operator",
+  "reason": "reviewed the parked clone report",
+  "run_ids": ["impl-123-abcd"],
+  "keep_run_ids": ["impl-456-ef01"]
+}
+```
+
+`run_ids` explicitly removes named parked clones and their recorded owned normal/dirty remote `wip/`
+refs. This is an authorized discard: merged classification and Git-state custody checks (remote, clean,
+archive, refs and shape allowlists) are waived. Every live-use, operation-lock, protected-root, path-identity
+and container safeguard still applies. Explicit keep and unspecified decisions preserve parked clones and
+refs; contradictory keep/remove decisions refuse. Discard archives keep the actual terminal phase.
+A missing source repository permits authorized local discard; the receipt reports remote cleanup as
+unavailable. Existing source paths still receive the source containment and identity safeguards.
+Fold receipts record deletion intent and outcome. Remote cleanup runs only after successful local removal,
+uses the existing leases, and leaves a changed foreign ref alone with an incomplete-cleanup report.
 The `[implement] clone_config_guard` policy described above applies to merge and its gate too.
 
 ### Parallel implementation flights

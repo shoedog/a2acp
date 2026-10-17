@@ -1,124 +1,12 @@
-//! `a2a-bridge storage reap --clones` — the SECOND destructive authority in the storage system
-//! (R2f1b pre-slice-2 custody plan §3 S4, §5, §7), and the only one whose mistake destroys bytes that
-//! exist nowhere else.
-//!
-//! S3 deletes regenerable payloads: a wrongly-reaped build target costs a rebuild. This command deletes
-//! a `.a2a-implement` quarantine clone — a working checkout with its own `--no-hardlinks` object store,
-//! carrying commits that may exist on no other disk. So the licensing evidence is strictly larger than
-//! S3's: everything S3 requires, PLUS proof that the content is already somewhere it will survive.
-//!
-//! Owner ruling **D-1**: pre-squash bot commits need not survive; content verifiably on the SOURCE
-//! repository's `main` suffices. That ruling is what makes this command legal at all, and it is also
-//! exactly what the gates must prove — not assume.
-//!
-//! The gates, in refusal order, every one re-derived AT THE DESTRUCTIVE BOUNDARY under the run's HELD
-//! operation lock (an S2 report is an observation, never a warrant):
-//!
-//! 1. **everything S3 gates on** — D-2 protected roots by canonical identity, the typed
-//!    [`sr::ItemSource`] (a volume name is not a path; a `[worktrees]` payload is not this command's
-//!    custody), a descriptor-pinned scan root re-verified before and after, the `impl-<pid>-<nonce>`
-//!    run-owner liveness park, the operation lock HELD across probe→delete, one `lsof` consumer probe
-//!    per run directory, and an affirmative container answer whenever a runtime is configured. HERE the
-//!    operation lock is genuinely discriminating: `implement_resume` and `merge` both take it, and both
-//!    would be operating on the very directory this command removes;
-//! 2. **shape** — `git_shape` must prove standalone-clone `.git` DIRECTORY semantics. A linked worktree
-//!    shares its source repository's object store and is removed with `git worktree remove`; an
-//!    ambiguous `.git` proves nothing. Both park (worktree checkouts remain under the existing ADR-0025
-//!    sidecar sweep authority, not this command's);
-//! 3. **git state** — `git status --porcelain` must be CLEAN, and the things porcelain CANNOT see are
-//!    checked separately, because each of them is silent by design: `ls-files -v` for
-//!    `--assume-unchanged` / `--skip-worktree` / sparse entries (which suppress the porcelain line for
-//!    modified tracked bytes), and the submodule gate for initialized submodules (a CLEAN submodule
-//!    emits no entry at all while its object store sits in `.git/modules`). An ignored entry is
-//!    disposable only if S3's own on-disk provenance says so. An unborn HEAD parks;
-//! 4. **content on main** — [`sr::on_source_main_with_lookback`] must answer `yes(head)` (HEAD is an
-//!    ancestor of source main) or `yes(tree)` (HEAD's exact tree is on source main under a different
-//!    commit — the squash landing). `no` parks and `unknown` parks: one means demonstrably not landed,
-//!    the other means the probe could not tell, and neither is a warrant. The source repository is
-//!    found through the clone's own `origin` URL and only when that URL is a LOCAL PATH — a hosted
-//!    origin parks, because the containment query must be asked of a local repository's live refs and
-//!    this command contacts no network — and, when the run's checkpoint records one, `origin` must
-//!    AGREE with it: `origin` lives inside the `:rw` mount, so an agent can repoint the proof.
-//!
-//!    **S4b/F1 — CHAINED ORIGINS.** An `implement` run may be started from another run's clone (a
-//!    `--repo` pointed at a quarantine directory), so `origin` can name a SIBLING clone under the same
-//!    `.a2a-implement` scan root rather than the repository the work is meant to land in. Asking the
-//!    D-1 question of a sibling answers it about the wrong repository — a forensic pass over this
-//!    host's 81 parked clones found 68 in exactly that shape. So when the resolved origin is itself
-//!    inside the pinned scan root, [`resolve_origin_root`] FOLLOWS the chain, hop by hop, until it
-//!    reaches a repository OUTSIDE the root: that is the true source, and containment (and the ref
-//!    sweep's "independently on source main" test) is asked of it. Every hop is bounded and proved —
-//!    at most [`MAX_ORIGIN_HOPS`] edges, no repeated path (a cycle parks), each hop must exist, be a
-//!    local path, be a real git repository, and agree with its OWN run checkpoint. Anything else parks
-//!    with verdict `unknown` and the chain walked so far recorded on the refusal. The full chain is
-//!    written to the fold receipt;
-//!
-//!    **S4b/F2 — the OWNER DISPOSITION LICENSE.** Plan §3 S4 always licensed two things: content
-//!    verifiably on main, "or whose run the owner has dispositioned as abandoned". `--disposition-list
-//!    <file>` supplies the second. For a run id named in that owner-authored file, the content-on-main
-//!    gate above — and only that gate, including its source resolution, its ref sweep and its
-//!    moving-history recheck — is REPLACED by the license. EVERY other gate still runs and still
-//!    refuses: a dispositioned clone that is DIRTY, whose owning pid is alive, whose operation lock is
-//!    held, whose container axis is unanswered or whose consumers probe is not FREE parks exactly as
-//!    it would without the license, with the conflict named. An owner can disposition a RUN; nobody
-//!    dispositions bytes that are on no commit and that no one has read. The receipt records the
-//!    license — who authorized it, why, which file, and that file's sha256 — under the verdict
-//!    `owner-disposition`, and NEVER claims the content is on main;
-//! 5. **every other ref** — containment proves HEAD, but the deletion takes the WHOLE object store.
-//!    `refs/heads/*`, `refs/tags/*` and `refs/stash` are swept, and each tip must be HEAD, an ancestor
-//!    of HEAD, or independently on source main. This is not hypothetical: `head_guard` deliberately
-//!    LEAVES a clone whose agent committed or switched branch, and `restore_branch` puts HEAD back
-//!    without deleting the branch the agent made.
-//!
-//!    Objects reachable from NO ref (the re-authored commit an `Unlanded` merge leaves behind) are out
-//!    of scope by design: they are deterministic recomputations of inputs this command preserves, not
-//!    unique custody, and `git gc` would drop them in the source repository too;
-//! 6. **the fold receipt, BEFORE the deletion**, in a SIBLING namespace that outlives the clone
-//!    (`<root>/.receipts/<run id>-fold.json`, fsync'd), plus the clone's `.git/a2a-bridge/` evidence
-//!    AND its `.git/A2A_TASK.md` / `.git/A2A_COMMIT_MSG` copied to `<root>/.receipts/<run id>-evidence/`.
-//!    Evidence has its own retention (plan §5) and never dies with the parent it describes. A
-//!    structural preflight runs first and refuses AMBIGUITY on either side (a symlinked sidecar, a
-//!    non-regular entry within it, a symlinked or misplaced `.receipts`) while letting genuine ABSENCE
-//!    through — the two were once the same `Ok(empty)`, which let a clone be deleted with "evidence
-//!    preserved" on its receipt. Every durability barrier is propagated, and the namespace is fsync'd
-//!    before the first removal. Any of these failing PARKS the clone — a deletion whose record could
-//!    not be established does not happen;
-//! 7. **exact-mechanism removal** — the `merge::reap_clone` guard shape (canonical path equal to
-//!    `<root>/<run id>`, has a real `.git`, is not and does not contain the source repository) plus
-//!    S3's dev/ino rechecks immediately before the unlink. Never a broad prefix, never a follow.
-//!
-//! The fold receipt is written twice on purpose: once as the crash-durable INTENT (`disposition:
-//! planned_delete`) before the first removal, once with the outcome before the operation lock is
-//! released. A record written only afterwards describes an end state a crash may have prevented from
-//! ever existing.
-//!
-//! Fail-closed by design, and deliberately so: a retained clone costs 20–180 MiB of disk; a wrongly
-//! reaped one costs work that exists nowhere else. A squash that REWROTE the tree therefore reads `no`
-//! and the clone is kept.
-//!
-//! # S4b residuals, disclosed rather than discovered
-//!
-//! - **A chain hop with no checkpoint contributes no cross-check of its own.** Each hop is bound to
-//!   its own run's `implement-checkpoint.json`, which the bridge writes before the agent runs; a hop
-//!   with no readable checkpoint (a legacy run, a hand-made repository) is followed on its
-//!   `remote.origin.url` alone. What closes the gap is not the per-hop check but
-//!   [`corroborate_terminal_root`]: whatever chain of URLs was followed, the repository it lands on
-//!   must contain this clone's own lineage root (and its checkpoint's base commit, when that resolves
-//!   in the clone) before any containment verdict is asked of it. A rewritten `origin` can therefore
-//!   point the walk somewhere; it cannot make a repository the clone never came from answer for it.
-//! - **A chain broken by a PRIOR invocation does not self-heal.** Within one invocation, deletion
-//!   order is irrelevant: every candidate's chain is resolved during admission, before the first
-//!   removal, and every terminal root is outside the scan root and so survives sibling deletions. But
-//!   if an earlier run reaped a parent clone, the child's `origin` names a directory that is simply
-//!   gone, and nothing ever rewrites it — the child parks `unknown` forever. No bytes are lost, and
-//!   the designed recovery is the F2 license, which needs no source repository at all. (An earlier
-//!   draft of this note claimed a second invocation would resolve it. That was false, and the test
-//!   that would have caught it had been narrowed to a single row.)
+//! Clone adjudication and deletion. Only exact landing trailers on source main license automatic
+//! merged cleanup. Owner remove decisions waive Git custody, while every live-use, operation-lock,
+//! protected-root, path-identity and container safeguard remains mandatory. The configured archive
+//! owns evidence retention; fold receipts record deletion intent and outcome independently.
 
 use crate::storage_reap as rp;
 use crate::storage_report as sr;
 use bridge_core::fs_custody;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// How far back along source main the exact-tree (squash-landing) search looks, when the operator has
@@ -146,10 +34,12 @@ pub const DISPOSITION_ABORTED: &str = "aborted_before_removal";
 /// [`sr::PayloadClass::DependencyCache`]). Every OTHER ignored entry blocks — an ignored file is
 /// invisible to `git`, so it is invisible to the containment proof, and this list is the whole of what
 /// this command is willing to assume about invisible bytes.
+#[cfg(test)]
 pub const DISPOSABLE_IGNORED: [&str; 3] = ["target", "node_modules", ".venv"];
 
 /// How many offending `git status` entries a refusal quotes before it stops. Bounded so a clone with a
 /// hundred thousand untracked files cannot turn one park reason into a memory-sized string.
+#[cfg(test)]
 const MAX_QUOTED_STATUS_ENTRIES: usize = 5;
 
 // ---------------------------------------------------------------------------------------------
@@ -299,11 +189,6 @@ pub fn fold_receipt_name(run_id: &str) -> String {
     format!("{run_id}-fold.json")
 }
 
-/// `<root>/.receipts/<run id>-evidence/`.
-pub fn evidence_dir_name(run_id: &str) -> String {
-    format!("{run_id}-evidence")
-}
-
 pub fn receipts_dir(root: &Path) -> PathBuf {
     root.join(sr::RECEIPTS_DIR)
 }
@@ -322,6 +207,7 @@ pub fn receipts_dir(root: &Path) -> PathBuf {
 /// Quoted paths (git's `core.quotePath` escaping, used for non-ASCII and control characters) are never
 /// unquoted here and never read as disposable — matching S2's disclosed non-UTF-8 posture, where
 /// ambiguity is refused rather than resolved by guesswork.
+#[cfg(test)]
 pub fn status_disposition(stdout: &str, clone: &Path) -> Result<String, String> {
     let mut blocking: Vec<String> = Vec::new();
     let mut blocking_total = 0usize;
@@ -374,6 +260,7 @@ pub fn status_disposition(stdout: &str, clone: &Path) -> Result<String, String> 
 /// - and the S3 markers must hold: cargo's own artifacts for `target`, the `package.json` sibling for
 ///   `node_modules`, `pyvenv.cfg` inside `.venv`. A directory called `target` holding a user's data is
 ///   not regenerable, and it is invisible to the containment proof precisely because it is ignored.
+#[cfg(test)]
 fn ignored_entry_is_disposable(path: &str, clone: &Path) -> bool {
     let p = path.trim().trim_end_matches('/');
     if p.starts_with('"') || p.is_empty() {
@@ -482,7 +369,10 @@ pub struct DispositionDocument {
     /// Free text: why. Never parsed, only recorded.
     pub reason: String,
     /// The `impl-<pid>-<nonce>` run ids the owner is dispositioning as abandoned.
+    #[serde(default)]
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub keep_run_ids: Vec<String>,
 }
 
 /// A validated license plus the identity of the file it came from.
@@ -491,6 +381,7 @@ pub struct DispositionList {
     pub authorized_by: String,
     pub reason: String,
     pub run_ids: BTreeSet<String>,
+    pub keep_run_ids: BTreeSet<String>,
     /// The canonical path of the list file.
     pub list_file: String,
     /// sha256 of the file's exact bytes.
@@ -501,7 +392,7 @@ impl DispositionList {
     /// Does this license name `run_id`? Exact match on the run directory name — never a prefix, never
     /// a pattern. A license is an enumeration of runs, not a rule that could match one nobody meant.
     pub fn licenses(&self, run_id: &str) -> bool {
-        self.run_ids.contains(run_id)
+        self.run_ids.contains(run_id) && !self.keep_run_ids.contains(run_id)
     }
 
     /// The receipt evidence for a licensed deletion. Says what happened (an owner licensed it) and,
@@ -519,7 +410,7 @@ impl DispositionList {
                 "the owner dispositioned run {run_id} as ABANDONED in {} (sha256 {}), authorized by \
                  {:?}: {:?}. This is a LICENSE, NOT a containment proof: nothing here establishes \
                  that this clone's content is on the source repository's main, and the D-1 \
-                 content-on-main gate did not pass for it. Every other gate did.",
+                 content-on-main gate did not pass for it. Every required live-use and path safeguard passed.",
                 self.list_file, self.list_sha256, self.authorized_by, self.reason
             ),
         }
@@ -559,14 +450,17 @@ pub fn parse_disposition_document(raw: &str) -> Result<DispositionDocument, Stri
     if doc.reason.trim().is_empty() {
         return Err("`reason` is empty — a deletion license must say why".into());
     }
-    if doc.run_ids.is_empty() {
+    if doc.run_ids.is_empty() && doc.keep_run_ids.is_empty() {
         return Err(
             "`run_ids` is empty — a list that authorizes no run is refused rather than run as a \
              no-op (it is far more likely truncated than intentional)"
                 .into(),
         );
     }
-    for id in &doc.run_ids {
+    if doc.run_ids.iter().any(|id| doc.keep_run_ids.contains(id)) {
+        return Err("contradictory keep and remove decisions for the same run".into());
+    }
+    for id in doc.run_ids.iter().chain(&doc.keep_run_ids) {
         let bad = id.trim().is_empty()
             || id.contains('/')
             || id.contains('\\')
@@ -641,6 +535,7 @@ pub fn load_disposition_list(path: &Path) -> Result<DispositionList, String> {
         authorized_by: doc.authorized_by,
         reason: doc.reason,
         run_ids: doc.run_ids.into_iter().collect(),
+        keep_run_ids: doc.keep_run_ids.into_iter().collect(),
         list_file: canonical.to_string_lossy().into_owned(),
         list_sha256: bridge_core::execution_policy::Sha256HexV1::digest(&bytes)
             .as_str()
@@ -950,10 +845,9 @@ fn corroborate_terminal_root(
 ///
 /// The chain is walked during ADMISSION, not at the boundary, and that ordering is the whole point: a
 /// parent clone and the child whose `origin` names it can both be candidates in one invocation, and
-/// removing the parent first used to leave the child unable to resolve anything — permanently, since
-/// nothing ever rewrites a dead `origin`. Resolving first makes deletion order irrelevant, because the
-/// terminal root is OUTSIDE the scan root by construction and therefore survives every sibling
-/// removal. The boundary re-verifies the root's identity before trusting the cached answer.
+/// removing the parent first would strand the child. Resolution precedes dependency ordering, and
+/// children must finish deletion before their sources can be removed: immediate-source custody is
+/// still checked at the boundary, separately from terminal-root landing provenance.
 #[derive(Clone, Debug)]
 pub struct OriginResolution {
     /// The walk's outcome, cached from admission.
@@ -963,6 +857,8 @@ pub struct OriginResolution {
     /// inside it" clause, and it is `None` only when that directory is genuinely absent — the
     /// parent-already-reaped case, where there is no source for a removal to endanger.
     pub immediate: Option<PathBuf>,
+    /// Admission identity of the immediate source, distinct from the terminal root.
+    pub immediate_identity: Option<(u64, u64)>,
     /// dev/ino of the terminal root when it was resolved, so the boundary can prove it is the same
     /// directory.
     pub root_identity: Option<(u64, u64)>,
@@ -980,6 +876,9 @@ pub fn resolve_origin(clone: &Path, scan_root: &Path) -> OriginResolution {
         .ok()
         .and_then(|c| fs_custody::directory_dev_ino(&c.root).ok());
     OriginResolution {
+        immediate_identity: immediate
+            .as_deref()
+            .and_then(|p| fs_custody::directory_dev_ino(p).ok()),
         first_hop: immediate.clone(),
         chain,
         immediate,
@@ -1024,33 +923,45 @@ pub struct CloneFacts {
     pub gates: Vec<String>,
 }
 
-/// A refusal detail, annotated when the run carries an owner disposition license (F2).
-///
-/// The license replaces the CONTENT-ON-MAIN proof and nothing else, and the gate that just refused is
-/// something else. Saying so on the refusal itself is the difference between an operator concluding
-/// "my list did not work" and reading what actually happened.
-fn licensed_conflict(licensed: Option<&DispositionList>, detail: String) -> String {
-    match licensed {
-        None => detail,
-        Some(d) => format!(
-            "{detail} — NOTE: this run IS on the owner disposition list {} (authorized by {:?}), but \
-             that license replaces the content-on-main proof ONLY. It says the RUN is abandoned; it \
-             cannot say that bytes on no commit are recoverable, and nobody has read them. \
-             Fail-closed: the clone is kept.",
-            d.list_file, d.authorized_by
-        ),
+/// Read the configuration recorded by this run, never the reaper invocation's config.
+fn recorded_config(
+    clone: &Path,
+    run_id: &str,
+) -> Result<
+    (
+        bridge_controller::implement_resume::ImplementCheckpoint,
+        crate::config::RegistryConfig,
+    ),
+    rp::ParkReason,
+> {
+    let unknown = |detail| rp::ParkReason::GitStateUnknown { detail };
+    let ck = bridge_controller::implement_resume::load_checkpoint(clone).map_err(&unknown)?;
+    if ck.schema_version != bridge_controller::implement_resume::SCHEMA_VERSION
+        || !ck.source_repo.is_absolute()
+        || !ck.clone_path.is_absolute()
+        || ck.task_id != run_id
+        || ck.resume_id != run_id
+        || ck.clone_path.canonicalize().ok().as_deref() != Some(clone)
+        || !ck.config_path.is_absolute()
+    {
+        return Err(unknown(
+            "checkpoint identity or absolute recorded configuration path invalid".into(),
+        ));
     }
+    let raw = std::fs::read_to_string(&ck.config_path).map_err(|e| {
+        unknown(format!(
+            "recorded configuration {} unavailable: {e}",
+            ck.config_path.display()
+        ))
+    })?;
+    let cfg = crate::config::RegistryConfig::parse(&raw)
+        .map_err(|e| unknown(format!("recorded configuration invalid: {e}")))?;
+    cfg.custody.validate().map_err(&unknown)?;
+    Ok((ck, cfg))
 }
 
-/// Re-derive shape, git state and containment for `clone`, refusing with a typed park reason.
-///
-/// The whole derivation is bracketed by a `.git` [`sr::ShapeFingerprint`] check on BOTH sides: shape
-/// alone is not identity, and one `.git` directory swapped for another mid-probe would have every
-/// answer below describing a different repository.
-///
-/// `disposition` is the F2 license, if the operator supplied one. When it names this `run_id`, the
-/// content-on-main block (source resolution, containment, the ref sweep, the moving-history recheck)
-/// is REPLACED by the license — and nothing else is. Every gate before it still runs and still refuses.
+/// Derive adjudication and custody from one run under the caller's held operation lock.
+#[allow(dead_code)] // retained for callers deriving a single clone outside the reaper
 pub fn derive_clone_facts(
     clone: &Path,
     run_id: &str,
@@ -1058,510 +969,217 @@ pub fn derive_clone_facts(
     lookback: u32,
     disposition: Option<&DispositionList>,
 ) -> Result<CloneFacts, rp::ParkReason> {
-    let mut gates: Vec<String> = Vec::new();
-    let licensed = disposition.filter(|d| d.licenses(run_id));
-
-    // 1. Shape: standalone-clone `.git` DIRECTORY semantics, proved on disk.
-    let before = sr::shape_fingerprint(clone);
-    let (class, kind, note) =
-        sr::classify_checkout(&before.shape, sr::CheckoutKind::StandaloneClone);
-    if class != sr::PayloadClass::SourceCheckout || kind != Some(sr::CheckoutKind::StandaloneClone)
-    {
-        return Err(rp::ParkReason::NotAStandaloneClone {
-            detail: licensed_conflict(
-                licensed,
-                note.unwrap_or_else(|| format!("unrecognized `.git` shape: {:?}", before.shape)),
-            ),
-        });
-    }
-    gates.push(format!(
-        "shape: `.git` is a real DIRECTORY (standalone clone with its own object store), identity {}",
-        match before.dev_ino {
-            Some((d, i)) => format!("dev {d} / ino {i}"),
-            None => "unavailable".to_string(),
-        }
-    ));
-
-    // 2. HEAD. `symbolic-ref` first: it resolves on an unborn HEAD, which `rev-parse HEAD` cannot.
-    let branch = sr::git_str(clone, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
-    let unborn = || rp::ParkReason::UnbornHead {
-        detail: licensed
-            .map(|_| licensed_conflict(licensed, "HEAD is unborn".to_string()))
-            .map(|d| d.trim_start_matches("HEAD is unborn — ").to_string()),
-    };
-    let head = match sr::git_str(clone, &["rev-parse", "HEAD"]) {
-        Ok(h) if !h.is_empty() => h,
-        Ok(_) => return Err(unborn()),
-        Err(e) => {
-            if branch.is_some() {
-                return Err(unborn());
-            }
-            return Err(rp::ParkReason::GitStateUnknown {
-                detail: licensed_conflict(licensed, format!("HEAD unresolvable: {e}")),
-            });
-        }
-    };
-
-    // 3. Git state. `--ignored=traditional` collapses ignored DIRECTORIES to one entry (a `-uall`
-    //    expansion over a cargo target is millions of lines); `--ignore-submodules=none` is explicit so
-    //    a dirty submodule cannot hide behind a default.
-    let status = match sr::git_ro(
-        clone,
-        &[
-            "status",
-            "--porcelain",
-            "--ignored=traditional",
-            "--ignore-submodules=none",
-        ],
-    ) {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Ok(out) => {
-            return Err(rp::ParkReason::GitStateUnknown {
-                detail: licensed_conflict(
-                    licensed,
-                    format!(
-                        "`git status` exited {:?}: {}",
-                        out.status.code(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                ),
-            })
-        }
-        Err(e) => {
-            return Err(rp::ParkReason::GitStateUnknown {
-                detail: licensed_conflict(licensed, format!("`git status` could not run: {e}")),
-            })
-        }
-    };
-    match status_disposition(&status, clone) {
-        Ok(summary) => gates.push(format!("git state: {summary}")),
-        Err(detail) => {
-            return Err(rp::ParkReason::GitStateNotClean {
-                detail: licensed_conflict(licensed, detail),
-            })
-        }
-    }
-
-    // 3b. What `git status` CANNOT see. `--assume-unchanged` and `--skip-worktree` tell git to stop
-    //     consulting the worktree for those paths, so modified tracked bytes produce no porcelain line
-    //     at all; a sparse checkout does the same wholesale. `ls-files -v` is the only view that shows
-    //     the flags themselves.
-    match sr::git_str(clone, &["ls-files", "-v"]) {
-        Ok(listing) => match index_flags_disposition(&listing) {
-            Ok(summary) => gates.push(format!("index flags: {summary}")),
-            Err(detail) => {
-                return Err(rp::ParkReason::IndexFlagsHideState {
-                    detail: licensed_conflict(licensed, detail),
-                })
-            }
-        },
-        Err(e) => {
-            return Err(rp::ParkReason::GitStateUnknown {
-                detail: licensed_conflict(
-                    licensed,
-                    format!("`git ls-files -v` could not answer: {e}"),
-                ),
-            })
-        }
-    }
-    if let Some(detail) = sparse_checkout_indicator(clone) {
-        return Err(rp::ParkReason::IndexFlagsHideState {
-            detail: licensed_conflict(licensed, detail),
-        });
-    }
-
-    // 3c. Submodules. A CLEAN submodule emits no porcelain entry, yet its object store lives in
-    //     `<clone>/.git/modules/<name>` and dies with the clone — and the superproject's gitlink is a
-    //     SHA, which says where the bytes should be, never that they are anywhere else. Fail-closed:
-    //     any initialized submodule parks. (This workspace has none, so the rule costs nothing here.)
-    match submodule_state(clone) {
-        Ok(summary) => gates.push(format!("submodules: {summary}")),
-        Err(detail) => {
-            return Err(rp::ParkReason::InitializedSubmodule {
-                detail: licensed_conflict(licensed, detail),
-            })
-        }
-    }
-
-    // The clone's own tree id, needed by both paths below (it is the pre-squash identity the fold
-    // receipt exists to preserve, whether or not anyone proved where it landed).
-    let tree = sr::git_str(clone, &["rev-parse", &format!("{head}^{{tree}}")]).ok();
-
-    // 4–5c. THE CONTENT-ON-MAIN GATE — or, for a run the owner has dispositioned (F2), the license
-    //       that REPLACES it. Everything in this block, and only this block, is what the license
-    //       stands in for: resolving the source repository, the D-1 verdict, the ref sweep, and the
-    //       moving-history recheck. Every gate above already ran unconditionally, and every gate in
-    //       `reap_one` below still runs.
-    let source_repo: Option<PathBuf>;
-    let origin_chain: Vec<String>;
-    let mut main_full_ref: Option<String> = None;
-    let mut main_oid_before: Option<String> = None;
-    let mut ref_facts: Vec<RefFact> = Vec::new();
-    let containment: ContainmentEvidence;
-
-    if let Some(d) = licensed {
-        containment = d.evidence(run_id);
-        // R5. The chain is cached from admission and is BEST-EFFORT here: it is recorded and, when it
-        // resolved, handed to the removal guard — but it can never park a licensed clone. A chained
-        // clone whose parent was reaped by an EARLIER invocation has a dead `origin` by construction
-        // and nothing will ever rewrite it; that population is exactly what a disposition clears.
-        //
-        // When the walk failed but the clone's own `origin` still names an existing directory, the
-        // guard gets THAT: dropping its "the source is neither the clone nor inside it" clause is
-        // only honest when there is no source directory at all.
-        match &resolution.chain {
-            Ok(chain) => {
-                source_repo = Some(chain.root.clone());
-                origin_chain = chain.hops.clone();
-            }
-            Err(reason) => {
-                source_repo = resolution.immediate.clone();
-                origin_chain = vec![format!(
-                    "origin chain UNRESOLVED and not required: {} (recorded, not refused — the \
-                     license does not rest on a source repository){}",
-                    reason.summary(),
-                    match &resolution.immediate {
-                        Some(p) => format!(
-                            ". The clone's own `origin` still names the existing directory {}, which \
-                             the removal guard was given",
-                            sr::display_path(p)
-                        ),
-                        None => ". The clone's own `origin` names no existing directory either, so \
-                                 the removal guard has no source to protect"
-                            .to_string(),
-                    }
-                )];
-            }
-        }
-        gates.push(format!(
-            "content on main (D-1): NOT PROVED AND NOT CLAIMED. Replaced by the OWNER DISPOSITION \
-             LICENSE — {}",
-            containment.detail
-        ));
-        // R2. The gating sweep is replaced; the INVENTORY is not. What the deletion takes has to stay
-        // enumerable from the receipt once the object store is gone.
-        let (facts, note) = ref_inventory(clone, &head);
-        gates.push(ref_inventory_summary(&facts, note.as_deref()));
-        ref_facts = facts;
-        gates.push(format!(
-            "source-main identity: not read — it is part of the content-on-main proof this license \
-             replaces. Origin chain: [{}]",
-            origin_chain.join(" | ")
-        ));
-    } else {
-        // 4. The local source repository, RESOLVED BEFORE ANY DELETION (R6) and re-verified here. S4
-        //    read the clone's OWN `origin` and stopped there; S4b/F1 follows the chain out of the
-        //    scan root, because an `origin` that names a SIBLING clone would have the D-1 question
-        //    asked of a quarantine directory. Hosted or absent origin on the clone itself still
-        //    parks: no network is ever contacted.
-        let chain = match &resolution.chain {
-            Ok(c) => c.clone(),
-            Err(reason) => return Err(reason.clone()),
-        };
-        let resolved = chain.root.clone();
-
-        // 4a. The cached answer must still describe the repository now on disk. The walk ran during
-        //     admission, before this run's operation lock was held, and `origin` lives inside the
-        //     `:rw` mount — so both ends are re-checked: the clone's first hop, and the terminal
-        //     root's directory identity.
-        match (
-            resolution.root_identity,
-            fs_custody::directory_dev_ino(&resolved),
-        ) {
-            (Some(before), Ok(now)) if before == now => {}
-            (Some(before), Ok(now)) => {
-                return Err(rp::ParkReason::SourceRootIdentityChanged {
-                    detail: format!(
-                    "{} was dev/ino {}/{} when the chain was resolved and {}/{} at the boundary",
-                    sr::display_path(&resolved),
-                    before.0,
-                    before.1,
-                    now.0,
-                    now.1
-                ),
-                })
-            }
-            (_, Err(e)) => {
-                return Err(rp::ParkReason::SourceRootIdentityChanged {
-                    detail: format!(
-                        "{} is no longer a readable directory: {e}",
-                        resolved.display()
-                    ),
-                })
-            }
-            (None, _) => {
-                return Err(rp::ParkReason::SourceRootIdentityChanged {
-                    detail: format!(
-                        "{} had no readable identity when the chain was resolved",
-                        resolved.display()
-                    ),
-                })
-            }
-        }
-        // The first hop is re-read, but only a hop that now names a DIFFERENT EXISTING directory is a
-        // refusal. A hop that resolves to NOTHING is the ordinary R6 case — this invocation just
-        // reaped the parent clone — and it cannot redirect anything: the verdict is computed against
-        // the cached terminal root, whose own identity was proved immediately above. Parking on it
-        // would reinstate exactly the stranding R6 exists to remove.
-        let now_first = immediate_origin(clone);
-        match (&now_first, &resolution.first_hop) {
-            (Some(now), Some(before)) if now != before => {
-                return Err(rp::ParkReason::SourceRootIdentityChanged {
-                    detail: format!(
-                        "the clone's `remote.origin.url` resolved to {} when the chain was walked \
-                         and {} at the boundary",
-                        sr::display_path(before),
-                        sr::display_path(now)
-                    ),
-                })
-            }
-            (Some(_), None) => {
-                return Err(rp::ParkReason::SourceRootIdentityChanged {
-                    detail: format!(
-                    "the clone's `remote.origin.url` named no existing directory when the chain \
-                         was walked and names {} at the boundary",
-                    sr::display_path(now_first.as_deref().unwrap_or(Path::new("?")))
-                ),
-                })
-            }
-            _ => {}
-        }
-
-        // 4b. R4 — corroborate the terminal root against the clone's OWN history before asking it
-        //     anything. A chain hop whose run has no checkpoint contributes no cross-check, so this
-        //     is what stands between a rewritten `origin` and a verdict from a foreign repository.
-        let corroboration = corroborate_terminal_root(clone, &head, &resolved, &chain)?;
-        gates.push(format!(
-            "origin chain (F1): {} hop(s) followed to the source repository {}, which is OUTSIDE the \
-             pinned scan root — [{}]. Every hop was a local directory and a real git repository, each \
-             agreed with its own run's checkpoint where one exists, the chain was resolved BEFORE any \
-             deletion in this run and the terminal root re-verified unchanged at this boundary{}, \
-             and {corroboration}",
-            chain.hops.len(),
-            sr::display_path(&resolved),
-            chain.hops.join(" | "),
-            if now_first.is_none() && resolution.first_hop.is_some() {
-                " (the first hop no longer exists — a sibling clone this same invocation reaped; the \
-                 verdict rests on the terminal root, which is outside the scan root and therefore \
-                 untouched)"
-            } else {
-                ""
-            }
-        ));
-
-        // 5. Containment — the D-1 gate, asked of the TRUE source. `no` and `unknown` BOTH park. The
-        //    main ref is resolved as a FULLY QUALIFIED branch and its OID is read before AND after the
-        //    probes: a verdict computed while main moved underneath is a verdict about no single
-        //    history.
-        let full_ref = sr::resolve_source_main(&resolved).map_err(|reason| {
-            rp::ParkReason::NotOnSourceMain {
-                verdict: "unknown".into(),
-                detail: format!("source main unresolvable: {reason}"),
-            }
-        })?;
-        let oid_before =
-            sr::ref_oid(&resolved, &full_ref).map_err(|e| rp::ParkReason::NotOnSourceMain {
-                verdict: "unknown".into(),
-                detail: format!("source main {full_ref} has no readable commit: {e}"),
-            })?;
-        let (main_ref, verdict) =
-            sr::on_source_main_with_lookback(&resolved, clone, &head, lookback);
-        containment = match &verdict {
-            sr::OnSourceMain::YesHead => ContainmentEvidence::proved(
-                verdict.label(),
-                main_ref.clone(),
-                Some(head.clone()),
-                format!(
-                    "HEAD {head} is an ancestor of {}'s {}",
-                    sr::display_path(&resolved),
-                    main_ref.clone().unwrap_or_else(|| "main".into()),
-                ),
-            ),
-            sr::OnSourceMain::YesTree { commit } => ContainmentEvidence::proved(
-                verdict.label(),
-                main_ref.clone(),
-                Some(commit.clone()),
-                format!(
-                    "HEAD's exact tree is the tree of {commit} on {}'s {} (squash landing; the \
-                     commit id differs, the content is byte-identical)",
-                    sr::display_path(&resolved),
-                    main_ref.clone().unwrap_or_else(|| "main".into())
-                ),
-            ),
-            sr::OnSourceMain::No => {
-                return Err(rp::ParkReason::NotOnSourceMain {
-                    verdict: verdict.label(),
-                    detail: format!(
-                        "neither HEAD nor its exact tree is on {}'s {} within the {lookback}-commit \
-                         lookback, and that history is EXHAUSTED (so the search was complete). This \
-                         covers both never-landed work and a squash that REWROTE the tree; either \
-                         way the clone is kept (fail-closed by design)",
-                        sr::display_path(&resolved),
-                        main_ref.clone().unwrap_or_else(|| "main".into())
-                    ),
-                })
-            }
-            sr::OnSourceMain::Unknown { reason } => {
-                return Err(rp::ParkReason::NotOnSourceMain {
-                    verdict: verdict.label(),
-                    detail: reason.clone(),
-                })
-            }
-        };
-        gates.push(format!(
-            "content on main (D-1): {} — {}",
-            containment.verdict, containment.detail
-        ));
-
-        // 5b. EVERY OTHER REF, against the SAME true source. Containment above proves HEAD; the
-        //     removal takes the whole object store. Production leaves exactly these shapes behind:
-        //     `head_guard` refuses to advance and LEAVES the clone when an agent commits or switches
-        //     branch, and `restore_branch` puts HEAD back without deleting the branch the agent made.
-        //     A stash is constructible in any `:rw` clone and hangs off `refs/stash` alone.
-        let refs_summary = refs_disposition(clone, &head, &resolved, lookback)?;
-        gates.push(format!("refs: {refs_summary}"));
-
-        // 5c. Source main must not have moved under the probes.
-        let oid_after =
-            sr::ref_oid(&resolved, &full_ref).map_err(|e| rp::ParkReason::SourceMainMoved {
-                detail: format!("{full_ref} became unreadable during the probes: {e}"),
-            })?;
-        if oid_after != oid_before {
-            return Err(rp::ParkReason::SourceMainMoved {
-                detail: format!(
-                    "{full_ref} was {oid_before} when the containment search began and {oid_after} \
-                     when it ended"
-                ),
-            });
-        }
-        gates.push(format!(
-            "source main identity: {full_ref} @ {oid_before}, unchanged across every containment \
-             probe"
-        ));
-        main_full_ref = Some(full_ref);
-        main_oid_before = Some(oid_before);
-        source_repo = Some(resolved);
-        origin_chain = chain.hops;
-    }
-
-    // 6. Re-confirm `.git` identity: the swap could have landed while git was running, and every answer
-    //    above would then describe a different repository.
-    let after = sr::shape_fingerprint(clone);
-    if after != before {
-        return Err(rp::ParkReason::GitIdentityChanged {
-            detail: format!(
-                "expected {:?}/{:?}, saw {:?}/{:?}",
-                before.shape, before.dev_ino, after.shape, after.dev_ino
-            ),
-        });
-    }
-    gates.push("`.git` identity: re-verified unchanged across every git probe".to_string());
-
-    Ok(CloneFacts {
-        branch,
-        head,
-        tree,
-        source_repo,
-        origin_chain,
-        main_ref_full: main_full_ref,
-        main_oid: main_oid_before,
-        containment,
-        ref_inventory: ref_facts,
-        gates,
-    })
+    let (ck, cfg) = recorded_config(clone, run_id)?;
+    let _policy = recorded_policy(clone, &cfg)?;
+    derive_with_config(clone, run_id, resolution, lookback, disposition, &ck, &cfg)
 }
 
-/// F1. Every ref of the clone must be accounted for before its object store is destroyed.
-///
-/// `refs/heads/*`, `refs/tags/*` and `refs/stash` are swept. A tip passes when it IS `head`, is an
-/// ANCESTOR of `head` (its commits are inside the history containment already proved), or is
-/// INDEPENDENTLY on source main by the same head/tree test. Anything else parks, naming the ref.
-///
-/// `refs/remotes/*` are deliberately not swept: they are the frozen snapshot of what `origin` handed
-/// this clone at clone time, so their objects came FROM the source repository rather than being unique
-/// to the clone.
-///
-/// Out of scope, by design: objects reachable from NO ref (e.g. the re-authored commit an `Unlanded`
-/// merge leaves dangling). Those are deterministic recomputations of inputs this command preserves —
-/// the clone's HEAD, its branch and its checkpoint — not unique custody, and `git gc` would drop them
-/// in the source repository too.
-fn refs_disposition(
+fn recorded_policy(
     clone: &Path,
-    head: &str,
-    source_repo: &Path,
-    lookback: u32,
-) -> Result<String, rp::ParkReason> {
-    let listing = sr::git_str(
-        clone,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads/",
-            "refs/tags/",
-            "refs/stash",
-        ],
-    )
-    .map_err(|e| rp::ParkReason::GitStateUnknown {
-        detail: format!("`git for-each-ref` could not enumerate this clone's refs: {e}"),
-    })?;
+    cfg: &crate::config::RegistryConfig,
+) -> Result<bridge_controller::clone_config::ClonePolicyScope, rp::ParkReason> {
+    let policy = cfg
+        .implement
+        .as_ref()
+        .map(|i| i.to_config())
+        .transpose()
+        .map_err(|e| rp::ParkReason::GitStateUnknown {
+            detail: format!("recorded implement policy invalid: {e}"),
+        })?
+        .unwrap_or_default()
+        .clone_config;
+    bridge_controller::clone_config::ClonePolicyScope::install(clone, policy)
+        .map_err(|detail| rp::ParkReason::GitStateUnknown { detail })
+}
 
-    let mut checked = 0usize;
-    let mut via_head = 0usize;
-    let mut via_ancestry = 0usize;
-    let mut via_main = 0usize;
-    for refname in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        checked += 1;
-        // Peel to a commit. A tag on a blob or tree cannot be judged by a commit-containment test at
-        // all, so it parks rather than being waved through.
-        let oid = sr::git_str(
-            clone,
-            &["rev-parse", "--verify", &format!("{refname}^{{commit}}")],
-        )
-        .map_err(|e| rp::ParkReason::RefsNotContained {
-            detail: format!("{refname} does not resolve to a commit ({e}) — it cannot be judged"),
-        })?;
-        if oid == head {
-            via_head += 1;
-            continue;
-        }
-        match sr::git_ro(clone, &["merge-base", "--is-ancestor", &oid, head]) {
-            Ok(out) if out.status.code() == Some(0) => {
-                via_ancestry += 1;
-                continue;
-            }
-            Ok(out) if out.status.code() == Some(1) => {}
-            Ok(out) => {
-                return Err(rp::ParkReason::RefsNotContained {
-                    detail: format!(
-                        "{refname} ({oid}): ancestry test exited {:?} — not interpretable",
-                        out.status.code()
-                    ),
-                })
-            }
-            Err(e) => {
-                return Err(rp::ParkReason::RefsNotContained {
-                    detail: format!("{refname} ({oid}): ancestry test could not run: {e}"),
-                })
-            }
-        }
-        // Not inside HEAD's history: ask the D-1 question of this tip on its own.
-        let (_, verdict) = sr::on_source_main_with_lookback(source_repo, clone, &oid, lookback);
-        if verdict.is_landed() {
-            via_main += 1;
-            continue;
-        }
-        return Err(rp::ParkReason::RefsNotContained {
-            detail: format!(
-                "{refname} ({oid}) is neither HEAD, nor an ancestor of HEAD, nor on source main \
-                 (verdict {}) — deleting the clone would destroy the only copy of its commits",
-                verdict.label()
-            ),
+#[allow(clippy::too_many_arguments)]
+fn derive_with_config(
+    clone: &Path,
+    run_id: &str,
+    resolution: &OriginResolution,
+    lookback: u32,
+    disposition: Option<&DispositionList>,
+    ck: &bridge_controller::implement_resume::ImplementCheckpoint,
+    cfg: &crate::config::RegistryConfig,
+) -> Result<CloneFacts, rp::ParkReason> {
+    let before = sr::shape_fingerprint(clone);
+    if !sr::real_dir(&clone.join(".git")) {
+        return Err(rp::ParkReason::NotAStandaloneClone {
+            detail: "real standalone .git directory required".into(),
         });
     }
-    Ok(format!(
-        "{checked} ref(s) swept (refs/heads/*, refs/tags/*, refs/stash): {via_head} is HEAD, \
-         {via_ancestry} ancestor(s) of HEAD, {via_main} independently on source main"
-    ))
+    let licensed = disposition.filter(|d| d.licenses(run_id));
+    if disposition.is_some_and(|d| d.keep_run_ids.contains(run_id)) {
+        return Err(rp::ParkReason::NotOnSourceMain {
+            verdict: "explicit-keep".into(),
+            detail: "owner chose keep; clone and remote refs preserved".into(),
+        });
+    }
+    let mut gates = vec![format!(
+        "recorded configuration: {}",
+        ck.config_path.display()
+    )];
+    // On discard, Git facts are only a best-effort inventory. Never execute unadmitted clone config.
+    let admitted = bridge_controller::clone_config::check_clone_with_policy(clone);
+    if licensed.is_none() {
+        admitted
+            .as_ref()
+            .map_err(|e| rp::ParkReason::GitStateUnknown {
+                detail: format!("clone configuration not admitted: {e}"),
+            })?;
+    }
+    let actual_head = if admitted.is_ok() {
+        sr::git_str(clone, &["rev-parse", "HEAD"]).ok()
+    } else {
+        None
+    };
+    if licensed.is_none() && actual_head.is_none() {
+        return Err(rp::ParkReason::UnbornHead {
+            detail: Some("HEAD unavailable".into()),
+        });
+    }
+    let head = actual_head
+        .or_else(|| ck.current_commit.clone())
+        .unwrap_or_default();
+    let tree = if admitted.is_ok() {
+        sr::git_str(clone, &["rev-parse", &format!("{head}^{{tree}}")]).ok()
+    } else {
+        None
+    };
+    let immediate = match ck.source_repo.canonicalize() {
+        Ok(source) => Some(source),
+        Err(e) if licensed.is_some() && e.kind() == std::io::ErrorKind::NotFound => {
+            gates.push("recorded source gone: remote cleanup unavailable".into());
+            None
+        }
+        Err(e) => {
+            return Err(rp::ParkReason::GitStateUnknown {
+                detail: format!("recorded source unavailable: {e}"),
+            })
+        }
+    };
+    if let Some(source) = &immediate {
+        // Source containment remains mandatory even on the authorized discard path.
+        if source == clone || source.starts_with(clone) {
+            return Err(rp::ParkReason::RemovalGuardRefused {
+                detail: "recorded source is the clone or inside it".into(),
+            });
+        }
+        if resolution.first_hop.as_ref().is_some_and(|p| p != source)
+            || resolution.immediate_identity.is_some_and(|expected| {
+                fs_custody::directory_dev_ino(source).ok() != Some(expected)
+            })
+        {
+            return Err(rp::ParkReason::SourceRootIdentityChanged {
+                detail: "recorded immediate source identity changed".into(),
+            });
+        }
+    }
+    let containment;
+    let main_oid;
+    let source;
+    if let Some(d) = licensed {
+        source = resolution
+            .chain
+            .as_ref()
+            .ok()
+            .map(|c| c.root.clone())
+            .or(immediate);
+        containment = d.evidence(run_id);
+        main_oid = None;
+        gates.push("owner remove: merged classification and Git custody checks waived; live-use, locks, root, path and container safeguards retained".into());
+    } else {
+        let chain = resolution.chain.as_ref().map_err(Clone::clone)?;
+        let terminal = &chain.root;
+        if resolution.first_hop.as_ref() != immediate.as_ref()
+            || immediate_origin(clone).as_ref() != immediate.as_ref()
+        {
+            return Err(rp::ParkReason::SourceRootIdentityChanged {
+                detail: "origin disagrees with recorded immediate source".into(),
+            });
+        }
+        gates.push(corroborate_terminal_root(clone, &head, terminal, chain)?);
+        if resolution.root_identity.is_none()
+            || fs_custody::directory_dev_ino(terminal).ok() != resolution.root_identity
+        {
+            return Err(rp::ParkReason::SourceRootIdentityChanged {
+                detail: "terminal source identity changed".into(),
+            });
+        }
+        // Landing provenance belongs to the terminal repository. Transport and archive
+        // custody below still use the checkpoint's immediate source.
+        let mut landing_ck = ck.clone();
+        landing_ck.source_repo = terminal.clone();
+        source = Some(terminal.clone());
+        let evidence =
+            bridge_controller::merge::classify_landing(clone, &landing_ck, &head, lookback);
+        let blockers = bridge_controller::clone_deletion::failures_for_phase(
+            clone,
+            ck,
+            &cfg.custody,
+            &cfg.evidence,
+            &format!("{:?}", ck.phase).to_ascii_lowercase(),
+        );
+        let detail = format!("run {run_id}; path {}; source {}; confidence {}; matched {:?}; {}; deletion blockers: {}", clone.display(), terminal.display(), evidence.confidence, evidence.matched_commit, evidence.reason, if blockers.is_empty() { "none".into() } else { blockers.join(" | ") });
+        if evidence.confirmed() && !blockers.is_empty() {
+            let first = &blockers[0];
+            return Err(if first.starts_with("check 2:") {
+                rp::ParkReason::GitStateNotClean { detail }
+            } else if first.starts_with("check 4:") {
+                rp::ParkReason::RefsNotContained { detail }
+            } else if first.contains("gitlink") || first.contains("modules") {
+                rp::ParkReason::InitializedSubmodule { detail }
+            } else if first.contains("index") {
+                rp::ParkReason::IndexFlagsHideState { detail }
+            } else {
+                rp::ParkReason::GitStateUnknown { detail }
+            });
+        }
+        if !evidence.confirmed() {
+            return Err(rp::ParkReason::NotOnSourceMain {
+                verdict: evidence.confidence.into(),
+                detail,
+            });
+        }
+        gates.push(detail.clone());
+        containment = ContainmentEvidence::proved(
+            evidence.confidence.into(),
+            Some("main".into()),
+            evidence.matched_commit,
+            detail,
+        );
+        main_oid = evidence.main_oid;
+    }
+    let (inventory, note) = if admitted.is_ok() {
+        ref_inventory(clone, &head)
+    } else {
+        (
+            vec![],
+            Some("unadmitted configuration; Git inventory skipped".into()),
+        )
+    };
+    gates.push(ref_inventory_summary(&inventory, note.as_deref()));
+    if sr::shape_fingerprint(clone) != before {
+        return Err(rp::ParkReason::GitIdentityChanged {
+            detail: "clone .git identity changed during probes".into(),
+        });
+    }
+    Ok(CloneFacts {
+        branch: Some(ck.branch.clone()),
+        head,
+        tree,
+        source_repo: source,
+        origin_chain: resolution
+            .chain
+            .as_ref()
+            .map(|c| c.hops.clone())
+            .unwrap_or_default(),
+        main_ref_full: main_oid.as_ref().map(|_| "refs/heads/main".into()),
+        main_oid,
+        containment,
+        ref_inventory: inventory,
+        gates,
+    })
 }
 
 /// R2. Enumerate every ref of `clone` WITHOUT judging any of them.
@@ -1670,33 +1288,13 @@ fn ref_inventory_summary(facts: &[RefFact], note: Option<&str>) -> String {
 /// state. A LOWERCASE letter means `--assume-unchanged` and `S` means `--skip-worktree` — both tell git
 /// to stop consulting the worktree for that path, so modified bytes there produce NO porcelain line.
 /// Anything that is not `H` therefore parks, including letters this parser does not recognize.
+#[cfg(test)]
 pub use bridge_controller::clone_deletion::index_flags_disposition;
-
-/// Is this clone sparse? A sparse checkout is a whole-tree version of the same blindness: paths outside
-/// the cone are simply not in the worktree, and `git status` reports nothing about them.
-fn sparse_checkout_indicator(clone: &Path) -> Option<String> {
-    for key in ["core.sparseCheckout", "index.sparse"] {
-        if let Ok(v) = sr::git_str(clone, &["config", "--get", key]) {
-            if v.trim().eq_ignore_ascii_case("true") {
-                return Some(format!(
-                    "`{key}` is true — this is a sparse checkout, and `git status` says nothing about \
-                     paths outside the cone"
-                ));
-            }
-        }
-    }
-    let file = clone.join(".git").join("info").join("sparse-checkout");
-    sr::real_file(&file).then(|| {
-        format!(
-            "{} exists — this clone has a sparse-checkout pattern set",
-            file.display()
-        )
-    })
-}
 
 /// PURE. `git submodule status` marks each submodule: `-` = NOT initialized (no object store here),
 /// anything else (` `, `+`, `U`) = initialized. Fail-closed: an unparseable line is treated as
 /// initialized, because "I could not tell" is not "there is nothing there".
+#[cfg(test)]
 pub fn submodule_disposition(status: &str) -> Result<String, String> {
     let mut initialized: Vec<String> = Vec::new();
     let mut uninitialized = 0usize;
@@ -1727,29 +1325,6 @@ pub fn submodule_disposition(status: &str) -> Result<String, String> {
     ))
 }
 
-/// FS + git. The submodule gate: a non-empty `.git/modules` is decisive on its own (those ARE the
-/// object stores), and a declared `.gitmodules` is checked with `git submodule status`.
-fn submodule_state(clone: &Path) -> Result<String, String> {
-    let modules = clone.join(".git").join("modules");
-    if sr::real_dir(&modules) {
-        let empty = std::fs::read_dir(&modules)
-            .map(|mut d| d.next().is_none())
-            .map_err(|e| format!("{} is unreadable: {e}", modules.display()))?;
-        if !empty {
-            return Err(format!(
-                "{} holds submodule object stores that exist nowhere else",
-                modules.display()
-            ));
-        }
-    }
-    if !sr::real_file(&clone.join(".gitmodules")) {
-        return Ok("no `.gitmodules`, no `.git/modules` content".to_string());
-    }
-    let status = sr::git_str(clone, &["submodule", "status"])
-        .map_err(|e| format!("`.gitmodules` is present and `git submodule status` failed: {e}"))?;
-    submodule_disposition(&status)
-}
-
 // ---------------------------------------------------------------------------------------------
 // Evidence preservation: the structural preflight
 // ---------------------------------------------------------------------------------------------
@@ -1758,194 +1333,6 @@ fn submodule_state(clone: &Path) -> Result<String, String> {
 /// the sidecar directory plus the two `.git`-scoped files the implement loop writes.
 /// `.git/A2A_TASK.md` is the out-of-band task the fix loop re-reads (tweak.rs) and
 /// `.git/A2A_COMMIT_MSG` is the agent-written hand-off message (implement.rs).
-pub const GIT_SCOPED_EVIDENCE: [&str; 2] = ["A2A_TASK.md", "A2A_COMMIT_MSG"];
-
-/// What the preflight found: exactly which paths will be preserved, and a human summary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvidencePlan {
-    pub sources: Vec<PathBuf>,
-    pub summary: String,
-}
-
-/// PURE-ish (FS reads only), NON-MUTATING. Establish that this run's Evidence can be preserved
-/// safely — before any deletion, and cheaply enough to run in a `--dry-run` plan.
-///
-/// It exists because "no evidence to copy" and "evidence I cannot interpret" are different facts with
-/// opposite consequences, and the earlier shape returned `Ok(empty)` for both. Every refusal here is
-/// AMBIGUITY, never absence:
-///
-/// - the receipt namespace `<root>/.receipts`, if it exists, must be a real directory whose canonical
-///   parent IS the pinned scan root — a symlinked `.receipts` would put the record somewhere the
-///   deletion destroys, or somewhere it does not belong;
-/// - the sidecar `<clone>/.git/a2a-bridge`, if present, must be a real directory containing only real
-///   files and directories. A symlink is ambiguous on both sides (following it copies whatever a `:rw`
-///   container aimed it at; skipping it deletes the clone while claiming preservation), and a FIFO or
-///   socket would block a copy that tried to open it;
-/// - the `.git`-scoped evidence files, if present, must be regular files.
-///
-/// A genuinely ABSENT sidecar is fine and says so in the summary.
-pub fn evidence_preflight(clone: &Path, root: &Path) -> Result<EvidencePlan, rp::ParkReason> {
-    let ambiguous = |detail: String| rp::ParkReason::EvidencePreservationFailed { detail };
-
-    // 1. The destination namespace.
-    let receipts = receipts_dir(root);
-    match std::fs::symlink_metadata(&receipts) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(ambiguous(format!(
-                "{} is unreadable: {e}",
-                receipts.display()
-            )))
-        }
-        Ok(md) if md.file_type().is_symlink() => {
-            return Err(ambiguous(format!(
-            "{} is a SYMLINK — the receipt namespace must be a real directory directly under the \
-                 pinned scan root, or a receipt could be written into the very tree being deleted",
-            receipts.display()
-        )))
-        }
-        Ok(md) if !md.is_dir() => {
-            return Err(ambiguous(format!(
-                "{} exists and is not a directory",
-                receipts.display()
-            )))
-        }
-        Ok(_) => {
-            let canon = std::fs::canonicalize(&receipts).map_err(|e| {
-                ambiguous(format!("{} has no canonical path: {e}", receipts.display()))
-            })?;
-            let root_canon = std::fs::canonicalize(root)
-                .map_err(|e| ambiguous(format!("{} has no canonical path: {e}", root.display())))?;
-            if canon.parent() != Some(root_canon.as_path()) {
-                return Err(ambiguous(format!(
-                    "{} resolves to {}, which is not directly under the pinned scan root {}",
-                    receipts.display(),
-                    canon.display(),
-                    root_canon.display()
-                )));
-            }
-        }
-    }
-
-    // 2. The sidecar.
-    let mut sources = Vec::new();
-    let sidecar = sr::evidence_dir(clone);
-    let mut sidecar_note = format!("no `{}` sidecar (nothing to preserve)", sidecar.display());
-    match std::fs::symlink_metadata(&sidecar) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(ambiguous(format!(
-                "{} is unreadable: {e}",
-                sidecar.display()
-            )))
-        }
-        Ok(md) if md.file_type().is_symlink() => {
-            return Err(ambiguous(format!(
-                "{} is a SYMLINK — a link here is ambiguous in both directions (following it would \
-                 preserve whatever it points at as this run's evidence; skipping it would delete the \
-                 clone while reporting evidence preserved)",
-                sidecar.display()
-            )))
-        }
-        Ok(md) if !md.is_dir() => {
-            return Err(ambiguous(format!(
-                "{} is not a directory",
-                sidecar.display()
-            )))
-        }
-        Ok(_) => {
-            let count = check_evidence_tree(&sidecar)?;
-            sidecar_note = format!("sidecar {} ({count} entr(y/ies))", sidecar.display());
-            sources.push(sidecar);
-        }
-    }
-
-    // 3. The `.git`-scoped evidence files.
-    let mut extras = Vec::new();
-    for name in GIT_SCOPED_EVIDENCE {
-        let p = clone.join(".git").join(name);
-        match std::fs::symlink_metadata(&p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ambiguous(format!("{} is unreadable: {e}", p.display()))),
-            Ok(md) if md.is_file() && !md.file_type().is_symlink() => {
-                extras.push(name);
-                sources.push(p);
-            }
-            Ok(_) => {
-                return Err(ambiguous(format!(
-                    "{} exists but is not a regular file",
-                    p.display()
-                )))
-            }
-        }
-    }
-
-    Ok(EvidencePlan {
-        summary: format!(
-            "{sidecar_note}; `.git`-scoped evidence: {}",
-            if extras.is_empty() {
-                "none".to_string()
-            } else {
-                extras.join(", ")
-            }
-        ),
-        sources,
-    })
-}
-
-/// Every entry under an evidence tree must be a real file or a real directory. Returns how many were
-/// seen; refuses anything it cannot copy safely.
-fn check_evidence_tree(dir: &Path) -> Result<usize, rp::ParkReason> {
-    let ambiguous = |detail: String| rp::ParkReason::EvidencePreservationFailed { detail };
-    let mut seen = 0usize;
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| ambiguous(format!("{} is unreadable: {e}", dir.display())))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| ambiguous(format!("{} is unreadable: {e}", dir.display())))?;
-        let p = entry.path();
-        if entry.file_name().to_str().is_none() {
-            return Err(ambiguous(format!(
-                "{} has a non-UTF-8 name — refusing to preserve it under a guessed name",
-                p.to_string_lossy()
-            )));
-        }
-        let md = std::fs::symlink_metadata(&p)
-            .map_err(|e| ambiguous(format!("{} is unreadable: {e}", p.display())))?;
-        if md.file_type().is_symlink() {
-            return Err(ambiguous(format!(
-                "{} is a symlink — never followed, and never silently skipped",
-                p.display()
-            )));
-        }
-        if md.is_dir() {
-            seen += check_evidence_tree(&p)?;
-            continue;
-        }
-        if !md.is_file() {
-            return Err(ambiguous(format!(
-                "{} is neither a regular file nor a directory (FIFO, socket or device) — it cannot be \
-                 preserved, and skipping it would delete the clone while claiming it was",
-                p.display()
-            )));
-        }
-        seen += 1;
-    }
-    Ok(seen)
-}
-
-// ---------------------------------------------------------------------------------------------
-// The exact-mechanism removal guard
-// ---------------------------------------------------------------------------------------------
-
-/// The `merge::reap_clone` guard, re-stated where the removal happens: a clone may be removed only when
-/// its canonical path is EXACTLY `<root>/<run id>`, it holds a real `.git`, and it neither is nor
-/// contains the source repository. Never a broad prefix; never an inferred parent.
-///
-/// `source` is `None` only on the F2 licensed path when the origin chain did not resolve. There is then
-/// no source repository to protect from this removal — and, precisely because none resolved, none can
-/// be at risk of it. The path and `.git` checks are unchanged, and the evidence string says which of
-/// the two shapes was proved rather than implying the stronger one.
 pub fn removal_guard(
     clone: &Path,
     root: &Path,
@@ -2007,8 +1394,8 @@ pub struct ClonesRequest<'a> {
     pub items: &'a [sr::ReportItem],
     pub protected: &'a rp::ProtectedRoots,
     pub dry_run: bool,
-    /// Non-zero means an affirmative container answer is REQUIRED (the host probe cannot see inside a
-    /// container VM); zero means the axis is disclosed as uncovered.
+    /// Invocation scan count, disclosed as supplemental evidence. Container absence must
+    /// independently be established from each run's recorded runtimes.
     pub runtimes_configured: usize,
     /// `[storage] clone_reap_lookback`.
     pub lookback: u32,
@@ -2022,7 +1409,7 @@ pub struct ClonesRequest<'a> {
 /// A run refused at admission — or by the whole-root refusal above it — never reaches `reap_one`'s
 /// own disclosure, so without this it is the one licensed park with no explanation anywhere, and an
 /// operator is left reading "parked" against a run they authorized in writing. None of these refusals
-/// is something the license could waive: it replaces the content-on-main proof and nothing else.
+/// is something an owner discard can waive: they establish operational and path authority.
 fn disclose_early_park(
     notes: &mut Vec<String>,
     disposition: Option<&DispositionList>,
@@ -2037,8 +1424,7 @@ fn disclose_early_park(
     }
     notes.push(format!(
         "run {id} is on the owner disposition list and was PARKED before the boundary gates ran: {}. \
-         The license replaces the content-on-main proof ONLY; it grants no authority over any other \
-         refusal.",
+         Owner remove waives Git custody; this admission/live-use/path refusal remains mandatory.",
         reason.summary()
     ));
 }
@@ -2072,12 +1458,7 @@ pub fn reap_clones<E: rp::ReapEnv>(req: ClonesRequest<'_>, env: &E) -> rp::ReapR
     // for named runs, without inferring it from the rows.
     if let Some(d) = req.disposition {
         report.notes.push(format!(
-            "OWNER DISPOSITION LICENSE IN FORCE: {} (sha256 {}), authorized by {:?} — {:?}. For its \
-             {} named run(s) the CONTENT-ON-MAIN gate is replaced by this license and nothing else \
-             is: the pid-alive, operation-lock, container-axis, consumer-probe, shape, git-state, \
-             index-flag and submodule gates all still refuse, and evidence preservation, the fold \
-             receipt and the durability barriers are unchanged. Their receipts record verdict \
-             `{VERDICT_OWNER_DISPOSITION}` and never claim the content is on main.",
+            "OWNER DISPOSITION LICENSE IN FORCE: explicit REMOVE decisions: {} (sha256 {}), authorized by {:?} — {:?}. {} named run(s) waive merged classification and Git-state custody. Live-use, operation lock, protected roots, path identity and container safeguards remain mandatory. Receipts record `{VERDICT_OWNER_DISPOSITION}`.",
             d.list_file,
             d.list_sha256,
             d.authorized_by,
@@ -2151,29 +1532,67 @@ pub fn reap_clones<E: rp::ReapEnv>(req: ClonesRequest<'_>, env: &E) -> rp::ReapR
         }
     }
 
-    // R6 — PHASE SEPARATION. Every candidate's `origin` chain is walked HERE, before the first
-    // removal, and cached on the candidate. Chained runs are a real shape (`implement --repo <another
-    // run's clone>`), so a parent and its child can both be candidates in one invocation; resolving at
-    // the boundary meant the parent's removal left the child unable to resolve anything, and no later
-    // invocation ever rewrites a dead `origin`, so the child was stranded PERMANENTLY. Resolving first
-    // makes deletion order irrelevant: every terminal root is outside the scan root, so it survives
-    // every sibling removal, and the boundary re-verifies its identity before trusting the answer.
-    //
-    // Read-only, no lock held, changes nothing — the verdicts themselves are still derived at the
-    // boundary under the run's own operation lock.
+    // Resolve before any removal; custody still needs the immediate source to survive until its
+    // children have been deleted. Include refused candidates in the dependency graph so a parked
+    // child (including one refused at admission) never loses its source in this invocation.
     for c in candidates.iter_mut() {
         c.origin = resolve_origin(&c.path, &root);
     }
+    let mut dependents: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
+    for it in req.items {
+        let child = PathBuf::from(&it.path);
+        if !it.source.is_filesystem_path() || child.parent() != Some(root.as_path()) {
+            continue;
+        }
+        let recorded_source = bridge_controller::implement_resume::load_checkpoint(&child)
+            .ok()
+            .map(|ck| ck.source_repo);
+        for source in recorded_source.into_iter().chain(immediate_origin(&child)) {
+            let source = source.canonicalize().unwrap_or(source);
+            dependents.entry(source).or_default().insert(child.clone());
+        }
+    }
+    let mut completed = BTreeSet::new();
 
     // `(clone path, was the removal clean)` for every clone this command actually tried to remove.
     // A PARTIAL or UNKNOWN outcome belongs here too: its descendants are exactly the rows whose
     // recorded state is now least trustworthy.
     let mut attempted: Vec<(PathBuf, bool)> = Vec::new();
-    for c in candidates {
+    while !candidates.is_empty() {
+        // Leaves first, independent of scan order. Cycles have no leaf and are retained below.
+        let next = candidates
+            .iter()
+            .position(|c| {
+                dependents.get(&c.path).is_none_or(|children| {
+                    !candidates
+                        .iter()
+                        .any(|other| children.contains(&other.path))
+                })
+            })
+            .unwrap_or(0);
+        let c = candidates.remove(next);
         let path = c.path.clone();
-        let item = reap_one(c, &pin, &req, env, &mut report);
+        let blocker = dependents
+            .get(&path)
+            .and_then(|children| children.iter().find(|child| !completed.contains(*child)));
+        let item = if let Some(child) = blocker {
+            let reason = rp::ParkReason::LiveConsumer {
+                kind: "dependent clone".into(),
+                detail: format!("{} still depends on this source clone", child.display()),
+            };
+            disclose_early_park(&mut report.notes, req.disposition, c.item, &reason);
+            rp::park(c.item, reason)
+        } else {
+            reap_one(c, &pin, &req, env, &mut report)
+        };
         match item.outcome {
-            rp::ItemOutcome::Deleted => attempted.push((path, true)),
+            rp::ItemOutcome::Deleted => {
+                completed.insert(path.clone());
+                attempted.push((path, true));
+            }
+            rp::ItemOutcome::Planned if req.dry_run => {
+                completed.insert(path);
+            }
             rp::ItemOutcome::Partial { .. } | rp::ItemOutcome::Unknown { .. } => {
                 attempted.push((path, false))
             }
@@ -2264,6 +1683,7 @@ fn admit<'a>(
                 detail: "the origin chain was never resolved".into(),
             }),
             immediate: None,
+            immediate_identity: None,
             root_identity: None,
             first_hop: None,
         },
@@ -2279,6 +1699,110 @@ fn admit<'a>(
             ),
         ],
     })
+}
+
+/// Query the run's recorded runtimes, including stopped containers and every resume generation.
+/// The invocation scan is supplemental and can never supply this proof.
+fn recorded_containers_absent(
+    clone: &Path,
+    cfg: &crate::config::RegistryConfig,
+) -> Result<String, rp::ParkReason> {
+    let runtimes: BTreeSet<String> = cfg
+        .agents
+        .iter()
+        .filter_map(|a| a.sandbox.as_ref())
+        .map(|s| {
+            s.runtime
+                .clone()
+                .unwrap_or_else(|| bridge_core::domain::DEFAULT_RUNTIME.into())
+        })
+        .chain(cfg.verify.as_ref().map(|v| {
+            v.runtime
+                .clone()
+                .unwrap_or_else(|| bridge_core::domain::DEFAULT_RUNTIME.into())
+        }))
+        .collect();
+    if runtimes.is_empty() {
+        return Err(rp::ParkReason::ContainerAxisUnanswered);
+    }
+    let path = clone
+        .to_str()
+        .ok_or(rp::ParkReason::ContainerAxisUnanswered)?;
+    // Use the backend's own display-label encoding. Task IDs are not process instance IDs and
+    // cannot substitute for a missing container-runs record.
+    let labels = bridge_core::run_identity::RunHandle {
+        instance_id: String::new(),
+        host: String::new(),
+        lease: String::new(),
+        start: String::new(),
+    }
+    .labels("rw", "warm", "", "", Some(path), Some(path));
+    let repo = labels.repo.ok_or(rp::ParkReason::ContainerAxisUnanswered)?;
+    let cwd = labels.cwd.ok_or(rp::ParkReason::ContainerAxisUnanswered)?;
+    let path_is_representable = repo == path && cwd == path;
+    let mut filters = vec![
+        format!("label=a2a.cwd={cwd}"),
+        format!("label=a2a.repo={repo}"),
+    ];
+    filters.extend(
+        bridge_controller::implement_resume::container_run_ids(clone)
+            .map_err(|detail| rp::ParkReason::GitStateUnknown { detail })?
+            .into_iter()
+            .map(|id| format!("label=a2a.run={id}")),
+    );
+    let count = runtimes.len();
+    // reap_clones is synchronous and may itself be called on an async runtime. Join a
+    // dedicated bounded query runtime rather than nesting block_on on the caller's thread.
+    let result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| rp::ParkReason::ContainerAxisUnanswered)?;
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            for runtime in runtimes {
+                for filter in &filters {
+                    let out = tokio::time::timeout_at(
+                        deadline,
+                        tokio::process::Command::new(&runtime)
+                            .kill_on_drop(true)
+                            .args([
+                                "ps",
+                                "-aq",
+                                "--filter",
+                                "label=a2a.managed=1",
+                                "--filter",
+                                filter,
+                            ])
+                            .output(),
+                    )
+                    .await;
+                    match out {
+                        Ok(Ok(out))
+                            if out.status.success()
+                                && out.stdout.iter().all(u8::is_ascii_whitespace) => {}
+                        Ok(Ok(out)) if out.status.success() => {
+                            return Err(rp::ParkReason::LiveConsumer {
+                                kind: "recorded runtime container".into(),
+                                detail: format!("{runtime}: container still exists for {filter}"),
+                            })
+                        }
+                        _ => return Err(rp::ParkReason::ContainerAxisUnanswered),
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| rp::ParkReason::ContainerAxisUnanswered)?;
+    result?;
+    // These are display labels, not mount identities. A lossy path match can establish a holder,
+    // but an empty result cannot establish absence (including for an owner-authorized discard).
+    if !path_is_representable {
+        return Err(rp::ParkReason::ContainerAxisUnanswered);
+    }
+    Ok(format!("container axis: {count} recorded runtime(s) affirm no container exists for this clone or run"))
 }
 
 /// One clone, from its run-owner gate to its receipt. Pushes evidence paths and notes into `report`;
@@ -2309,7 +1833,7 @@ fn reap_one<E: rp::ReapEnv>(
             if licensed.is_some() {
                 report.notes.push(format!(
                     "run {run_id} is on the owner disposition list and was PARKED anyway: {}. The \
-                     license replaces the content-on-main proof ONLY; every other gate still \
+                     owner remove waives Git custody only; every live-use and path safeguard still \
                      refuses, and this one did.",
                     reason.summary()
                 ));
@@ -2402,6 +1926,16 @@ fn reap_one<E: rp::ReapEnv>(
         "path identity: real directory, no symlink, {identity_label}"
     ));
 
+    if !sr::real_dir(&path.join(".git")) {
+        parked_locked!(rp::ParkReason::NotAStandaloneClone {
+            detail: "real standalone .git directory required".into()
+        });
+    }
+    let (recorded, cfg) = match recorded_config(&path, &run_id) {
+        Ok(value) => value,
+        Err(reason) => parked_locked!(reason),
+    };
+
     // GATE 5 — consumers the scan established, then the container axis.
     for (kind, state) in [
         ("run lease", item.consumers.run_lease),
@@ -2415,20 +1949,17 @@ fn reap_one<E: rp::ReapEnv>(
             })
         }
     }
-    if req.runtimes_configured == 0 {
-        gates.push(
-            "container axis: not covered - no container runtime is configured, so no container answer \
-             was sought (disclosed rather than read as `no containers`)"
-                .to_string(),
-        );
-    } else if item.consumers.container_mount == sr::HolderState::Free {
-        gates.push(format!(
-            "container axis: {} runtime(s) answered, none mounts this clone",
-            req.runtimes_configured
-        ));
-    } else {
-        parked_locked!(rp::ParkReason::ContainerAxisUnanswered)
+    if item.consumers.container_mount == sr::HolderState::Unknown {
+        parked_locked!(rp::ParkReason::ContainerAxisUnanswered);
     }
+    match recorded_containers_absent(&path, &cfg) {
+        Ok(detail) => gates.push(detail),
+        Err(reason) => parked_locked!(reason),
+    }
+    gates.push(format!(
+        "invocation scan: {} runtime(s); positive holders retained as additional evidence",
+        req.runtimes_configured
+    ));
 
     // GATE 6 — the host consumer probe over the run directory, taken UNDER the held lock.
     env.progress(&format!(
@@ -2450,18 +1981,36 @@ fn reap_one<E: rp::ReapEnv>(
             .to_string(),
     );
 
-    // GATE 7 — shape, git state, and D-1 containment (or the F2 license that replaces containment),
-    // all re-derived from the repository right now.
-    let facts = match derive_clone_facts(&path, &run_id, &origin, req.lookback, req.disposition) {
+    // GATE 7 — recorded policy and shared Git custody.
+    let _policy = match recorded_policy(&path, &cfg) {
+        Ok(policy) => policy,
+        Err(reason) => parked_locked!(reason),
+    };
+    let facts = match derive_with_config(
+        &path,
+        &run_id,
+        &origin,
+        req.lookback,
+        req.disposition,
+        &recorded,
+        &cfg,
+    ) {
         Ok(f) => f,
         Err(reason) => parked_locked!(reason),
     };
     gates.extend(facts.gates.iter().cloned());
+    gates.push(format!("origin at admission: {:?}", origin.first_hop));
 
     // GATE 8 — the exact-mechanism removal guard (the `merge::reap_clone` shape).
     match removal_guard(&path, &root, &run_id, facts.source_repo.as_deref()) {
         Ok(evidence) => gates.push(evidence),
         Err(detail) => parked_locked!(rp::ParkReason::RemovalGuardRefused { detail }),
+    }
+
+    if let Some(source) = origin.immediate.as_deref() {
+        if let Err(detail) = removal_guard(&path, &root, &run_id, Some(source)) {
+            parked_locked!(rp::ParkReason::RemovalGuardRefused { detail });
+        }
     }
 
     // Measure only now, so the recorded size is the size of the thing about to go.
@@ -2522,78 +2071,68 @@ fn reap_one<E: rp::ReapEnv>(
         gates,
     };
 
-    // GATE 9 — the Evidence STRUCTURAL PREFLIGHT. Non-mutating, and therefore run in a dry run too:
-    // the ambiguous shapes it refuses (a symlinked sidecar, a symlinked `.receipts`, a FIFO among the
-    // evidence) are exactly the ones an operator needs to see in the plan rather than discover when
-    // the real run parks.
+    // The configured archive is the evidence copy. Keep receipts, not a second payload archive.
     let receipts = receipts_dir(&root);
-    let plan = match evidence_preflight(&path, &root) {
-        Ok(p) => p,
-        Err(reason) => parked_locked!(reason),
+    if std::fs::symlink_metadata(&receipts).is_ok_and(|m| !m.is_dir() || m.file_type().is_symlink())
+    {
+        parked_locked!(rp::ParkReason::EvidencePreservationFailed {
+            detail: "receipt namespace is not a real directory".into()
+        });
+    }
+    // Prepare transport while the clone exists. No remote deletion occurs before exact local success.
+    let cleanup = if licensed.is_some() || cfg.custody.delete_remote_on_merge {
+        Some(if recorded.source_repo.canonicalize().is_err() {
+            Err("recorded source unavailable; remote cleanup unavailable".into())
+        } else {
+            bridge_controller::custody_push::RemoteCleanup::prepare(&path, &cfg.custody, &recorded)
+        })
+    } else {
+        None
     };
-    gates.push(format!(
-        "evidence preflight (structural, non-mutating): {}",
-        plan.summary
-    ));
-
     if req.dry_run {
-        // Say what was NOT done. A plan that listed only satisfied gates would imply the copy, the
-        // fsync barriers and the receipt write had all succeeded — none of which a dry run performs.
-        gates.push(
-            "evidence preservation + fold receipt + durability barriers: NOT exercised by a dry run \
-             (only the structural preflight above ran). The real run copies the evidence, fsyncs the \
-             receipt namespace, and writes the receipt BEFORE any removal — and parks if any of those \
-             fails."
-                .to_string(),
-        );
+        gates.push("configured archive checked by shared gate; receipt publication and removal not exercised by dry run".into());
         drop(guard);
         return base_item(rp::ItemOutcome::Planned, gates);
     }
-
-    // GATE 10 — Evidence preservation BEFORE the deletion. Evidence has its own retention decision
-    // (plan §5) and never dies with the parent directory it happens to live in.
-    let ev_dst = receipts.join(evidence_dir_name(&run_id));
-    if plan.sources.is_empty() {
-        gates.push(format!(
-            "evidence preserved: nothing to preserve — {} (an ABSENT sidecar, not an unreadable one; \
-             an ambiguous one would have parked at the preflight)",
-            plan.summary
-        ));
-    } else {
-        match env.copy_evidence(&plan.sources, &ev_dst) {
-            Ok(files) => {
-                receipt.evidence_preserved_at = Some(ev_dst.to_string_lossy().into_owned());
-                receipt.evidence_files = files.clone();
-                gates.push(format!(
-                    "evidence preserved: {} file(s) copied to {} BEFORE the removal, from {}",
-                    files.len(),
-                    ev_dst.display(),
-                    plan.summary
-                ));
-            }
-            Err(detail) => parked_locked!(rp::ParkReason::EvidencePreservationFailed { detail }),
-        }
-        // The destination must still be where we meant it to be: a `.receipts` swapped for a symlink
-        // between the preflight and the copy would have landed the evidence elsewhere.
-        match (
-            std::fs::canonicalize(&ev_dst),
-            std::fs::canonicalize(&receipts),
+    if licensed.is_some() {
+        let phase = format!("{:?}", recorded.phase).to_ascii_lowercase();
+        match bridge_controller::evidence::write_run_archive(
+            &path,
+            &recorded,
+            &phase,
+            &cfg.evidence,
         ) {
-            (Ok(dst), Ok(rcp)) if dst.parent() == Some(rcp.as_path()) => {}
-            (Ok(dst), Ok(rcp)) => parked_locked!(rp::ParkReason::EvidencePreservationFailed {
-                detail: format!(
-                    "preserved evidence landed at {}, which is not directly under {}",
-                    dst.display(),
-                    rcp.display()
-                ),
-            }),
-            _ => parked_locked!(rp::ParkReason::EvidencePreservationFailed {
-                detail: format!(
-                    "the preserved-evidence path {} could not be re-resolved after the copy",
-                    ev_dst.display()
-                ),
-            }),
+            Ok(archive) => receipt.evidence_preserved_at = Some(archive.display().to_string()),
+            Err(e) => gates.push(format!(
+                "owner discard: archive unavailable ({e}); evidence custody waived"
+            )),
         }
+    }
+    let archive_location = receipt.evidence_preserved_at.clone().or_else(|| {
+        let root = cfg.evidence.path.clone().or_else(|| {
+            bridge_core::platform_state::platform_state_dir()
+                .ok()
+                .map(|p| p.join("evidence"))
+        })?;
+        Some(
+            root.join(bridge_controller::evidence::repo_key(&recorded.source_repo).ok()?)
+                .join(format!("{run_id}.tar.gz"))
+                .display()
+                .to_string(),
+        )
+    });
+    gates.push(format!(
+        "configured archive: selected kinds [{}]; location {}",
+        cfg.evidence.include.join(", "),
+        archive_location.as_deref().unwrap_or("unavailable")
+    ));
+    // Preserve the legacy adapter port for embedders without invoking it: the configured
+    // archive is the only payload copy required by this command.
+    let _legacy_copy_port = E::copy_evidence;
+    if let Err(e) = std::fs::create_dir_all(&receipts) {
+        parked_locked!(rp::ParkReason::EvidencePreservationFailed {
+            detail: e.to_string()
+        });
     }
     receipt.gates = gates.clone();
 
@@ -2636,6 +2175,17 @@ fn reap_one<E: rp::ReapEnv>(
     // the gate vocabulary below ("clone" rather than "payload") is this command's.
     let mut item_gates = gates.clone();
     let mut freed_bytes_measured = None;
+    if let (Some(source), Some(main_ref), Some(expected)) =
+        (&facts.source_repo, &facts.main_ref_full, &facts.main_oid)
+    {
+        if sr::ref_oid(source, main_ref).ok().as_ref() != Some(expected) {
+            receipt.disposition = DISPOSITION_ABORTED.into();
+            finish(&mut receipt, &receipts, &receipt_path, env, report, &run_id);
+            parked_locked!(rp::ParkReason::SourceMainMoved {
+                detail: "source main changed before removal".into()
+            });
+        }
+    }
     let verified = fs_custody::verify_then_remove(pin, &path, &identity, || {
         item_gates.push(
             "boundary recheck: root and clone identity unchanged immediately before removal"
@@ -2691,6 +2241,17 @@ fn reap_one<E: rp::ReapEnv>(
                 receipt.descendant_presence.len()
             ));
             out.gates = item_gates.clone();
+        }
+        if matches!(out.outcome, rp::ItemOutcome::Deleted) {
+            if let Some(cleanup) = cleanup {
+                if let Err(e) = cleanup.and_then(|c| c.delete()) {
+                    let detail = format!("run {run_id}: incomplete remote cleanup after local deletion: {e}; remaining/unverified refs: refs/heads/{}{}, refs/heads/{}{}-dirty", cfg.custody.ref_prefix, run_id, cfg.custody.ref_prefix, run_id);
+                    report.notes.push(detail.clone());
+                    item_gates.push(detail.clone());
+                    receipt.failure_detail = Some(detail);
+                    out.gates = item_gates.clone();
+                }
+            }
         }
         receipt.gates = item_gates.clone();
         finish(&mut receipt, &receipts, &receipt_path, env, report, &run_id);
@@ -2778,6 +2339,19 @@ fn project_rows_under_reaped_clones(report: &mut rp::ReapReport, attempted: &[(P
     if attempted.is_empty() {
         return;
     }
+    let archive_notes: Vec<_> = report
+        .items
+        .iter()
+        .map(|it| {
+            (
+                it.path.clone(),
+                it.gates
+                    .iter()
+                    .find(|g| g.starts_with("configured archive:"))
+                    .cloned(),
+            )
+        })
+        .collect();
     for it in report.items.iter_mut() {
         if !matches!(it.outcome, rp::ItemOutcome::Parked { .. }) {
             continue;
@@ -2799,12 +2373,13 @@ fn project_rows_under_reaped_clones(report: &mut rp::ReapReport, attempted: &[(P
             continue;
         }
         it.outcome = rp::ItemOutcome::Deleted;
-        it.gates.push(if *clean {
+        let detail = if *clean {
             format!(
                 "removed WITH its enclosing clone {} — this row was not independently gated; the \
-                 clone's own gates licensed it, and any Evidence it held was copied into the receipt \
-                 namespace before the removal",
-                parent.display()
+                 clone's own gates licensed it; {}",
+                parent.display(),
+                archive_notes.iter().find(|(p, _)| Path::new(p) == parent)
+                    .and_then(|(_, note)| note.as_deref()).unwrap_or("configured archive: location unavailable; only configured evidence kinds are selected")
             )
         } else {
             format!(
@@ -2812,7 +2387,10 @@ fn project_rows_under_reaped_clones(report: &mut rp::ReapReport, attempted: &[(P
                  after the attempt and this path is gone",
                 parent.display()
             )
-        });
+        };
+        // Real-run tables omit gates, so also render the descendant's actual disposition.
+        report.notes.push(format!("{}: {detail}", it.path));
+        it.gates.push(detail);
     }
 }
 
@@ -2824,152 +2402,46 @@ fn project_rows_under_reaped_clones(report: &mut rp::ReapReport, attempted: &[(P
 /// play, "content verifiably on main" would be a claim about rows for which nothing established it.
 /// Which one licensed a given deletion is on that row's receipt, where it is auditable.
 pub fn render_text(r: &rp::ReapReport) -> String {
-    rp::render_report(
-        r,
-        "--clones",
-        "DESTRUCTIVE: quarantine clones licensed for removal were REMOVED — each one either because \
-         its content is verifiably on the source repository's main (D-1) or because the owner \
-         dispositioned its run as abandoned (`--disposition-list`). WHICH of the two licensed each \
-         deletion is recorded on its fold receipt; the receipts and preserved evidence are listed \
-         below.",
-    )
+    rp::render_report(r, "--clones", "DESTRUCTIVE: clones with confirmed A2A-Run/A2A-Original provenance on source main or explicit owner remove decisions were removed. Patch/content equivalence awaits adjudication. Shared custody and every live-use/path safeguard apply as recorded in each fold receipt.")
 }
 
 pub const CLONES_USAGE: &str = "\
 usage: a2a-bridge storage reap --clones [--dry-run] [--disposition-list <f>] [--config <f>] [--json]
 
-DESTRUCTIVE, and the only reaper that can destroy unique bytes. Deletes `.a2a-implement` standalone
-quarantine clones whose content is verifiably on the SOURCE repository's main branch (owner ruling D-1:
-pre-squash commits need not survive; content on main suffices), OR whose run the owner has explicitly
-dispositioned as abandoned (`--disposition-list`, plan §3 S4). It never touches a linked worktree, a
-build target, evidence, an unclassified item, a container volume, or anything at, inside, or containing
-a D-2 protected root.
+Automatic merged reap requires an exact A2A-Run/A2A-Original trailer pair on source main,
+plus the shared custody/archive/ref/shape gate, using each run's recorded configuration.
+Patch equivalence (high confidence) and content equivalence (low confidence, all changed
+paths in one main commit within 14 days) are reports for adjudication, never provenance.
+Missing metadata, invalid configuration and unknown probes preserve the clone.
 
-  --clones            REQUIRED. Names the payload class this invocation may remove. There is no default
-                      class, and `--clones` may not be combined with `--build-targets`: they are
-                      different authorities with different gates and different receipts.
-  --dry-run           evaluate every boundary gate for real, delete nothing and write no receipt. THIS
-                      IS THE PLAN DOCUMENT: read it before authorizing a deletion.
-  --disposition-list <path>
-                      an OWNER-AUTHORED license file (see OWNER DISPOSITION below). Only valid with
-                      `--clones`: it replaces that authority's content-on-main gate, and
-                      `--build-targets` has no such gate for it to replace.
-  --config <path>     registry config (default: ./a2a-bridge.toml).
-  --json              machine-readable output instead of the table.
+Owner decisions use a strict JSON document:
+{\"authorized_by\":\"owner\",\"reason\":\"reviewed report\",\"run_ids\":[\"impl-...\"],\"keep_run_ids\":[]}
+run_ids explicitly REMOVE named clones and their recorded owned remote refs. keep_run_ids
+explicitly KEEP named clones and refs. Contradictory decisions refuse; unspecified runs
+need confirmed provenance for automatic removal. Remove waives merged classification and
+Git-state custody (remote, cleanliness, archive, refs and shape allowlists). Every live-use,
+operation-lock, protected-root, path-identity and container safeguard remains mandatory.
 
-EVERY GATE BELOW IS RE-DERIVED AT THE DESTRUCTIVE BOUNDARY under the run's HELD operation lock. A report
-is an observation, never a warrant.
+The configured archive replaces duplicate evidence copies. Discards retain the actual
+terminal phase. Durable fold receipts precede removal and record its outcome. Only exact
+successful local removal permits leased remote cleanup; changed foreign refs remain.
+A dry run probes gates without receipts, archives, removal or remote deletion; the held
+.operation-locks namespace may be created. Configured runtimes must answer the container
+axis; an unconfigured axis is disclosed. Only exact standalone clone directories under
+the pinned scan root qualify; linked worktrees and protected roots are retained.
 
-  run owner      the pid in `impl-<pid>-<nonce>` is not running (an initial `implement` holds only its
-                 ADR-0025 run lease, so the operation lock alone would not exclude it).
-  operation lock held across probe->delete. For clones this is genuinely discriminating: `resume` and
-                 `merge` take this exact lock on this exact directory.
-  pinned root    the scan root is descriptor-pinned; dev/ino re-verified before AND after the removal,
-                 and the clone's own identity immediately before the unlink.
-  shape          `.git` must be a real DIRECTORY (standalone clone). A linked worktree shares its
-                 source's object store and is removed with `git worktree remove`; an ambiguous `.git`
-                 proves nothing. Both park.
-  git state      `git status --porcelain` must be CLEAN — plus the three things porcelain cannot see:
-                 `ls-files -v` must show no `--assume-unchanged` / `--skip-worktree` / sparse entry
-                 (they suppress the status line for modified tracked bytes), the clone must not be a
-                 sparse checkout, and no submodule may be initialized (a clean submodule emits no
-                 status line at all while its object store sits in `.git/modules` and would die with
-                 the clone). An ignored entry counts as disposable only when its LAST path component
-                 is `target`/`node_modules`/`.venv` AND the on-disk markers prove it (cargo artifacts,
-                 a `package.json` sibling, `pyvenv.cfg`) — the same evidence `--build-targets` demands.
-                 Unborn HEAD parks.
-  content on main `yes(head)` (HEAD is an ancestor of source main) or `yes(tree)` (HEAD's exact tree is
-                 on main under a different commit — the squash landing). `no` parks and `unknown` parks.
-                 A squash that REWROTE the tree reads `no`: fail-closed, the clone is kept. \"main\" is
-                 resolved as a fully-qualified BRANCH (`refs/heads/main`, `master`, else the source's
-                 own HEAD branch), so a tag named `main` can never stand in for it, and its OID is
-                 re-read afterwards so a verdict is never assembled from a moving history. The source
-                 repo comes from the clone's own `origin` and ONLY when that is a local path — a hosted
-                 origin parks, because no network is ever contacted — and must agree with the source
-                 repo the run's checkpoint records. Window: `[storage] clone_reap_lookback` (default
-                 2000 commits of source main).
-  origin chain   an `implement` run started with `--repo <another run's clone>` records that SIBLING as
-                 its origin, so asking the D-1 question of `origin` asks it of a quarantine directory
-                 instead of the repository the work lands in (68 of this host's 81 parked clones were
-                 in exactly that shape). When the resolved origin is itself inside the scan root, the
-                 chain is FOLLOWED to the first repository outside it — at most 8 in-root edges, no
-                 repeated path (a cycle parks), and every hop, the terminal one included, must exist,
-                 be a local path, be a REAL git repository, and agree with its own run's checkpoint.
-                 (`git -C` walks up, so a hop naming a plain directory would otherwise be answered by
-                 whatever repository encloses it; probes are also run with GIT_CEILING_DIRECTORIES so
-                 that ascent cannot happen at all.) A chain that cannot be followed parks with verdict
-                 `unknown` and the walk recorded. The full chain is on the receipt.
-  root corrobor. before any verdict is asked of it, the repository the chain landed on must contain
-                 THIS clone's own lineage root commit — and its checkpoint's base commit, when that
-                 resolves in the clone. A hop whose run has no checkpoint contributes no cross-check,
-                 so this is what stands between a rewritten `origin` and a verdict from a repository
-                 the clone never came from. Uncorroborated parks `unknown`.
-  ordering       every candidate's chain is resolved BEFORE the first removal, so reaping a parent
-                 clone cannot strand the child whose origin names it. Terminal roots live outside the
-                 scan root and survive sibling deletions; the boundary re-verifies the root's dev/ino
-                 (and the first hop, unless this run just reaped it) before trusting the cached walk.
-                 A chain broken by an EARLIER invocation does not self-heal — nothing rewrites a dead
-                 `origin` — and the recovery for those is `--disposition-list`.
-
-  refs           EVERY ref is swept (`refs/heads/*`, `refs/tags/*`, `refs/stash`), because containment
-                 proves HEAD while the deletion takes the whole object store. Each tip must be HEAD, an
-                 ancestor of HEAD, or independently on source main. A rogue agent branch, a stash, or a
-                 tag-only commit therefore parks the clone.
-  consumers      one recursive process/open-file/cwd probe over the clone must answer FREE.
-  container axis with a runtime configured, an affirmative container answer is REQUIRED.
-
-BEFORE any removal: a structural preflight refuses AMBIGUOUS evidence shapes (a symlinked
-`.git/a2a-bridge`, a FIFO or symlink inside it, a symlinked or misplaced `.receipts`) while letting a
-genuinely ABSENT sidecar through; then the clone's `.git/a2a-bridge/` sidecar plus `.git/A2A_TASK.md`
-and `.git/A2A_COMMIT_MSG` are copied to `<root>/.receipts/<run id>-evidence/` (Evidence has its own
-retention and never dies with its parent), the namespace is fsync'd, and the fold receipt is fsync'd to
-`<root>/.receipts/<run id>-fold.json` carrying `{run id, task id, branch, HEAD, tree, base, origin
-chain, containment verdict + which ref/commit matched (or which owner license replaced it),
-disposition, timestamp}`. That first write is the crash-durable
-INTENT (`disposition: planned_delete`); the same file is rewritten with the outcome before the lock is
-released, and a removal that did not cleanly finish also records WHY plus a restat'ed presence map of
-everything underneath. Any of these failing PARKS the clone; a failure to record the OUTCOME fails the
-command.
-
-A `--dry-run` runs every gate above except the preservation and durability ones — it copies nothing and
-writes nothing — and says so on each planned row rather than implying they passed.
-
-OWNER DISPOSITION (`--disposition-list <path>`)
-
-Plan §3 S4 licenses this command over two populations: clones whose content is verifiably on main, and
-clones \"whose run the owner has dispositioned as abandoned\". This flag supplies the second. The file
-is owner-authored JSON, and exactly this:
-
-  {\"authorized_by\": \"<free text>\", \"reason\": \"<free text>\", \"run_ids\": [\"impl-<pid>-<nonce>\", ...]}
-
-It must be a REGULAR FILE (never followed through a symlink), non-empty, and parsed STRICTLY: an
-unknown field, an empty `authorized_by`/`reason`/`run_ids`, or a run id that is not a single ordinary
-path component refuses the whole command. A run id in the list that this scan does not find is a NOTE,
-never an error — a list is written by hand against an earlier report.
-
-What the license does, exactly: for a run it names, THE CONTENT-ON-MAIN GATE IS REPLACED — the source
-resolution, the D-1 verdict, the ref sweep, and the moving-history recheck. NOTHING ELSE IS. The
-run-owner pid probe, the operation lock, the pinned root, the path identity, the container axis, the
-consumer probe, the standalone-clone shape check, `git status`, the index-flag and sparse checks, the
-submodule check, the evidence preflight and copy, the durability barriers, the fold receipt and the
-exact-mechanism removal guard all still run and still refuse. A DIRTY dispositioned clone PARKS, and
-the refusal names the conflict: an owner can disposition a run, but nobody can disposition bytes that
-are on no commit and that no one has read.
-
-The ref SWEEP is part of the content-on-main proof, so the license replaces it — an abandoned run is
-abandoned tips and all. What the license does NOT excuse is losing the record of it: every licensed
-receipt carries a `ref_inventory` listing every ref that existed at removal time with `{refname, oid,
-is_head, is_ancestor_of_head}`, and the gate text names the tips that were outside HEAD's history.
-The inventory is RECORDED, never gated: a probe that cannot answer is written down as unknown, because
-the license already settled whether the run dies.
-
-Its receipts record `containment: {verdict: \"owner-disposition\", authorized_by, reason, list_file,
-list_sha256}` and `durability: OwnerDisposition{...}`. They never say `yes(head)`, `yes(tree)` or
-`OnMain{...}`: the license is auditable back to the exact bytes the owner signed, and it never claims
-a landing nobody proved.
-
-JSON: `items[].path` is always a filesystem path here; the report's `source` field
-(`implement-path` | `worktree-path` | `volume-name`) is what tells destructive code which is which.";
+Operator details: clone_reap_lookback bounds alternative equivalence probes; an exhausted
+window reports unknown. Exact trailer provenance searches all reachable main history.
+The shared clean check covers git status --porcelain. Fold receipts use <run>-fold.json
+and retain ref_inventory and owner list_sha256. OWNER DISPOSITION is an explicit discard:
+THE CONTENT-ON-MAIN GATE IS REPLACED along with Git custody by the owner's remove decision.
+The previous rule \"A DIRTY dispositioned clone PARKS\" no longer applies to an explicit
+remove; live-use and path safeguards still apply to every clone.
+Historical yes(head)/yes(tree) content on main signals are adjudication evidence only.
+The origin chain is walked BEFORE the first removal, bounded at 8 in-root edges; terminal
+root corroboration checks the lineage root when a chain resolves. GIT_CEILING_DIRECTORIES
+prevents Git discovery from escaping the selected directory.
+";
 
 #[cfg(test)]
 mod tests {
@@ -3289,7 +2761,11 @@ mod tests {
 
     /// Source repo with two commits on `main`, plus a `.a2a-implement` root holding one clone.
     fn fx() -> Fx {
-        let td = tempfile::tempdir().unwrap();
+        fx_with_prefix("clone-reap-")
+    }
+
+    fn fx_with_prefix(prefix: &str) -> Fx {
+        let td = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
         let root = std::fs::canonicalize(td.path()).unwrap();
         let source = root.join("source");
         std::fs::create_dir_all(&source).unwrap();
@@ -3313,15 +2789,73 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "clone: {:?}", out);
-        // The checkpoint evidence every implement run carries.
-        write(
-            &sr::evidence_dir(&clone).join("implement-checkpoint.json"),
-            &format!(
-                "{{\"schema_version\":1,\"task_id\":\"{run_id}\",\"resume_id\":\"{run_id}\",\
-                 \"branch\":\"feat/x\",\"base_commit\":\"deadbeef\",\"base_ref\":\"main\",\
-                 \"phase\":\"Approved\"}}"
-            ),
+        let base = sr::git_str(&clone, &["rev-parse", "HEAD^"]).unwrap();
+        let head = sr::git_str(&clone, &["rev-parse", "HEAD"]).unwrap();
+        let branch = format!("implement/{run_id}");
+        git(&clone, &["branch", "-m", &branch]);
+        git(
+            &source,
+            &[
+                "commit",
+                "--allow-empty",
+                "-qm",
+                &format!("landed\n\nA2A-Run: {run_id}\nA2A-Original: {head}"),
+            ],
         );
+        let remote = root.join("backup.git");
+        git(&source, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let runtime = root.join("recorded-runtime");
+        write(&runtime, "#!/bin/sh\nexit 0\n");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_path = root.join("recorded.toml");
+        write(&config_path, &format!("default = \"test\"\n[server]\naddr = \"127.0.0.1:0\"\n[custody]\ndelete_remote_on_merge = true\n[evidence]\npath = {:?}\n[verify]\nruntime = {:?}\nimage = \"test\"\ncache = \"test\"\negress = \"open\"\n", root.join("archives").to_str().unwrap(), runtime.to_str().unwrap()));
+        let mut ck = bridge_controller::implement_resume::ImplementCheckpoint {
+            schema_version: 1,
+            resume_id: run_id.clone(),
+            task_id: run_id.clone(),
+            task_brief: "test".into(),
+            source_repo: source.clone(),
+            clone_path: clone.clone(),
+            config_path,
+            branch,
+            base_ref: Some("main".into()),
+            base_commit: base,
+            current_commit: Some(head),
+            original_message: None,
+            edit_workflow: "edit".into(),
+            fix_workflow: "fix".into(),
+            loop_max_attempts: 3,
+            review_invocation: 0,
+            final_review: None,
+            attempt_next: 1,
+            forced_depth: None,
+            resolved_lang: None,
+            activity_tally: None,
+            terminal_evidence_counts: None,
+            phase: bridge_controller::implement_resume::ImplementPhase::Approved,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        bridge_controller::implement_resume::save_checkpoint(&clone, &ck).unwrap();
+        write(&clone.join(".git/A2A_TASK.md"), "task spec");
+        let cfg = crate::config::RegistryConfig::parse(
+            &std::fs::read_to_string(&ck.config_path).unwrap(),
+        )
+        .unwrap();
+        let sha = ck.current_commit.clone().unwrap();
+        bridge_controller::custody_push::push_before_review_or_merge(
+            &clone,
+            &cfg.custody,
+            &mut ck,
+            &sha,
+        );
+        bridge_controller::evidence::write_run_archive(&clone, &ck, "approved", &cfg.evidence)
+            .unwrap();
         Fx {
             _td: td,
             root,
@@ -3332,7 +2866,6 @@ mod tests {
         }
     }
 
-    /// Commit `body` into `file` on a new branch in the clone, returning the new HEAD.
     fn clone_commit(f: &Fx, branch: &str, file: &str, body: &str) -> String {
         git(&f.clone, &["checkout", "-q", "-b", branch]);
         write(&f.clone.join(file), body);
@@ -3341,15 +2874,15 @@ mod tests {
         sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap()
     }
 
-    fn source_commit(f: &Fx, file: &str, body: &str) {
-        write(&f.source.join(file), body);
-        git(&f.source, &["add", "-A"]);
-        git(&f.source, &["commit", "-qm", "landed"]);
-    }
-
     fn scan(implement: &Path) -> Vec<sr::ReportItem> {
         let mut notes = Vec::new();
-        sr::scan_implement_root(implement, &mut notes)
+        let mut items = sr::scan_implement_root(implement, &mut notes);
+        // The fixture runtime reports an empty, successful container scan. Tests of an unanswered
+        // invocation scan override this explicitly; the filesystem scanner alone does not probe it.
+        for item in &mut items {
+            item.consumers.container_mount = sr::HolderState::Free;
+        }
+        items
     }
 
     fn run(f: &Fx, items: &[sr::ReportItem], env: &FakeEnv, dry_run: bool) -> rp::ReapReport {
@@ -3436,336 +2969,17 @@ mod tests {
             "escaped into the source repo"
         );
         let v = fold_receipt(&f);
-        assert_eq!(v["containment"]["verdict"], "yes(head)");
+        assert_eq!(v["containment"]["verdict"], "confirmed-provenance");
         assert_eq!(v["disposition"], DISPOSITION_DELETED);
-    }
-
-    /// The squash landing that keeps the tree: a different commit id carrying byte-identical content.
-    /// Discriminates a gate that only accepts ancestry — which would park most of the real backlog,
-    /// since the bridge's own workflow squash-merges.
-    #[test]
-    fn a_squash_landed_clone_is_deleted_on_exact_tree_evidence() {
-        let f = fx();
-        let head = clone_commit(&f, "feat/x", "src/new.rs", "pub fn b() {}\n");
-        // The same content lands on source main under a DIFFERENT commit id.
-        source_commit(&f, "src/new.rs", "pub fn b() {}\n");
-        assert_ne!(
-            head,
-            sr::git_str(&f.source, &["rev-parse", "main"]).unwrap(),
-            "fixture must model a squash, not a fast-forward"
-        );
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        let v = fold_receipt(&f);
-        assert_eq!(v["containment"]["verdict"], "yes(tree)");
-        assert_eq!(
-            v["containment"]["matched_commit"],
-            sr::git_str(&f.source, &["rev-parse", "main"]).unwrap(),
-            "the receipt does not name WHICH commit matched"
-        );
-        assert_eq!(v["head"], head, "the pre-squash HEAD was not preserved");
-    }
-
-    /// Work that exists only in the clone. Discriminates a reaper that reads "reachable from some ref"
-    /// (or from the clone's own frozen `refs/remotes/origin/*`) as landed.
-    #[test]
-    fn a_branch_only_clone_is_parked_with_its_work_intact() {
-        let f = fx();
-        clone_commit(&f, "feat/x", "src/only-here.rs", "pub fn unique() {}\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "no"),
-            other => panic!("expected a containment refusal, got {other:?}"),
-        }
-        assert!(
-            f.clone.join("src/only-here.rs").exists(),
-            "unique work was destroyed"
-        );
-        assert!(env.removed().is_empty());
-    }
-
-    /// The fail-closed case the plan names explicitly: a squash that REWROTE the tree (a conflict
-    /// resolution, a rebase-with-fixups) reads `no`. Discriminates any softening toward
-    /// content-equivalence — same file, one different byte, and the clone must be kept.
-    #[test]
-    fn a_squash_that_rewrote_the_tree_is_parked_fail_closed() {
-        let f = fx();
-        clone_commit(&f, "feat/x", "src/new.rs", "pub fn b() {}\n");
-        source_commit(&f, "src/new.rs", "pub fn b() {} // reworded on landing\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "no"),
-            other => panic!("expected a containment refusal, got {other:?}"),
-        }
-        assert!(f.clone.exists());
-    }
-
-    /// Lookback exhaustion is `unknown`, not `no`. Discriminates a reaper that reads a bounded search's
-    /// silence as absence — the S2 fold review's own blocker, here at a boundary where it deletes.
-    #[test]
-    fn a_landing_beyond_the_lookback_is_parked_as_unknown_not_deleted() {
-        let f = fx();
-        clone_commit(&f, "feat/x", "src/new.rs", "pub fn b() {}\n");
-        source_commit(&f, "src/new.rs", "pub fn b() {}\n"); // the exact tree lands...
-        source_commit(&f, "src/later.rs", "pub fn c() {}\n"); // ...then main moves on
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        // A one-commit window cannot reach the matching commit, and main has more history beyond it.
-        let r = run_with(&f, &items, &env, false, 0, 1);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
-                assert_eq!(verdict, "unknown");
-                assert!(detail.contains("lookback"), "unexpected detail: {detail}");
-            }
-            other => panic!("expected an unknown-verdict refusal, got {other:?}"),
-        }
-        assert!(f.clone.exists());
-
-        // The SAME clone with the configured default window is deleted — so the park above is the
-        // window's doing, not a permanently-closed gate.
-        let r2 = run_with(
-            &f,
-            &items,
-            &FakeEnv::new(),
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-        );
-        assert_eq!(item_for(&r2, &f.clone).outcome, rp::ItemOutcome::Deleted);
-    }
-
-    /// F7. Discriminates a "main" resolved by BARE NAME. `git rev-parse main` resolves a TAG named
-    /// `main` before any branch, so a source repository whose trunk is called something else — with a
-    /// stray `main` tag anywhere in it — hands the D-1 gate the wrong history to search. Here the tag
-    /// carries the clone's exact tree and the real trunk does not: the bare-name resolution deletes
-    /// unlanded work, the qualified one parks it.
-    #[test]
-    fn a_tag_named_main_never_stands_in_for_the_source_trunk() {
-        let f = fx();
-        // The source's trunk is `trunk`; `main` exists only as a tag on a side branch.
-        git(&f.source, &["branch", "-m", "main", "trunk"]);
-        clone_commit(&f, "feat/x", "new.rs", "pub fn b() {}\n");
-        git(&f.source, &["checkout", "-q", "-b", "side"]);
-        source_commit(&f, "new.rs", "pub fn b() {}\n"); // the clone's exact tree, NOT on trunk
-        git(&f.source, &["tag", "main"]);
-        git(&f.source, &["checkout", "-q", "trunk"]);
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "no"),
-            other => panic!("a tag named `main` was read as the trunk: {other:?}"),
-        }
-        assert!(f.clone.exists(), "unlanded work was deleted");
-        // And the resolution names the branch it actually used, fully qualified.
-        let (main_ref, _) = sr::on_source_main_with_lookback(
-            &f.source,
-            &f.clone,
-            &sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap(),
-            DEFAULT_CLONE_REAP_LOOKBACK,
-        );
-        assert_eq!(main_ref.as_deref(), Some("refs/heads/trunk"));
-    }
-
-    /// Discriminates a reaper that answers containment from the clone's own refs. A hosted origin means
-    /// there is no local repository to ask, and this command contacts no network — so it parks rather
-    /// than falling back to `refs/remotes/origin/*`, which is a frozen snapshot from clone time.
-    #[test]
-    fn a_hosted_origin_parks_because_there_is_no_local_source_to_ask() {
-        let f = fx();
-        git(
-            &f.clone,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://example.invalid/repo.git",
-            ],
-        );
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::OriginNotLocal { .. }
-        ));
-        assert!(f.clone.exists());
     }
 
     // -----------------------------------------------------------------------------------------
     // F1 — every ref, not just HEAD. Containment proves HEAD; deletion takes the whole object store.
     // -----------------------------------------------------------------------------------------
 
-    /// THE structural gap. `head_guard` (implement.rs) deliberately LEAVES a clone whose agent
-    /// switched branch or committed itself — "leaving clone for the operator" — and `restore_branch`
-    /// (tweak.rs) puts HEAD back without ever deleting the branch the agent made. So a clone whose HEAD
-    /// is perfectly landed can still be the only copy of a rogue agent branch. Discriminates a gate that
-    /// asks the D-1 question of HEAD alone and then deletes the entire object store.
-    #[test]
-    fn a_landed_head_with_an_unlanded_side_branch_is_parked() {
-        let f = fx();
-        git(&f.clone, &["checkout", "-q", "-b", "agent-went-rogue"]);
-        write(
-            &f.clone.join("only-on-that-branch.rs"),
-            "pub fn unique() {}\n",
-        );
-        git(&f.clone, &["add", "-A"]);
-        git(&f.clone, &["commit", "-qm", "the agent committed itself"]);
-        // HEAD goes back to the landed branch — exactly what `restore_branch` does.
-        git(&f.clone, &["checkout", "-q", "main"]);
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::RefsNotContained { detail } => assert!(
-                detail.contains("agent-went-rogue"),
-                "the refusal does not name the ref: {detail}"
-            ),
-            other => panic!("a unique side branch was deleted with the clone: {other:?}"),
-        }
-        assert!(
-            f.clone.join(".git").exists(),
-            "the object store was destroyed"
-        );
-    }
-
-    /// `refs/stash` is constructible in a `:rw` clone and is reachable from no branch. Its commits are
-    /// the operator's uncommitted work, deliberately parked out of the way — the most surprising thing
-    /// to lose. Discriminates a ref sweep that only walks `refs/heads`.
-    #[test]
-    fn a_landed_clone_with_a_stash_is_parked() {
-        let f = fx();
-        write(
-            &f.clone.join("src/lib.rs"),
-            "pub fn a() {} // work in progress\n",
-        );
-        git(&f.clone, &["stash", "push", "-q", "-m", "wip"]);
-        // The working tree is clean again: `git status --porcelain` says nothing at all.
-        assert!(
-            sr::git_str(&f.clone, &["status", "--porcelain"])
-                .unwrap()
-                .is_empty(),
-            "fixture must model the case porcelain cannot see"
-        );
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::RefsNotContained { detail } => {
-                assert!(detail.contains("stash"), "unexpected detail: {detail}")
-            }
-            other => panic!("a stashed change was deleted with the clone: {other:?}"),
-        }
-        assert!(f.clone.exists());
-    }
-
-    /// The other half, so the gate is not "park whenever a second ref exists": a healthy clone carries
-    /// origin's default branch AND the task branch, and must still proceed. Discriminates a ref gate
-    /// that parks the entire real population it was built to clean.
-    #[test]
-    fn a_healthy_two_ref_clone_still_proceeds() {
-        let f = fx();
-        // The ordinary shape: `main` from the clone, plus the task branch that descends from it.
-        clone_commit(&f, "feat/x", "new.rs", "pub fn b() {}\n");
-        source_commit(&f, "new.rs", "pub fn b() {}\n");
-        let refs = sr::git_str(
-            &f.clone,
-            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
-        )
-        .unwrap();
-        assert_eq!(refs.lines().count(), 2, "fixture should carry two branches");
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        let gates = &item_for(&r, &f.clone).gates;
-        assert!(
-            gates.iter().any(|g| g.contains("refs:") && g.contains("2")),
-            "the ref gate left no evidence of what it checked: {gates:?}"
-        );
-    }
-
-    /// A tag reachable from nowhere else is unique custody too, and an annotated tag on a
-    /// non-commit object cannot be judged at all — both park.
-    #[test]
-    fn an_unlanded_tag_is_parked() {
-        let f = fx();
-        git(&f.clone, &["checkout", "-q", "-b", "tmp"]);
-        write(&f.clone.join("tagged.rs"), "pub fn tagged() {}\n");
-        git(&f.clone, &["add", "-A"]);
-        git(&f.clone, &["commit", "-qm", "tagged work"]);
-        git(&f.clone, &["tag", "keepsake"]);
-        // Delete the branch: the commit now hangs off the TAG alone.
-        git(&f.clone, &["checkout", "-q", "main"]);
-        git(&f.clone, &["branch", "-qD", "tmp"]);
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::RefsNotContained { detail } => {
-                assert!(detail.contains("keepsake"), "unexpected detail: {detail}")
-            }
-            other => panic!("a tag-only commit was deleted with the clone: {other:?}"),
-        }
-    }
-
     // -----------------------------------------------------------------------------------------
     // Git state
     // -----------------------------------------------------------------------------------------
-
-    /// Uncommitted bytes are BY DEFINITION not on main, however good the containment verdict is.
-    /// Discriminates a reaper that gates on containment alone — the clone's HEAD is landed here, and
-    /// deleting it would still destroy the operator's edit.
-    #[test]
-    fn a_dirty_clone_is_parked_even_though_its_head_is_landed() {
-        let f = fx();
-        write(
-            &f.clone.join("src/lib.rs"),
-            "pub fn a() {} // uncommitted\n",
-        );
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::GitStateNotClean { detail } => {
-                assert!(detail.contains("src/lib.rs"), "unexpected detail: {detail}")
-            }
-            other => panic!("expected a git-state refusal, got {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(f.clone.join("src/lib.rs")).unwrap(),
-            "pub fn a() {} // uncommitted\n"
-        );
-    }
-
-    /// Untracked files are invisible to the containment proof. Discriminates a status check that only
-    /// looks at tracked modifications.
-    #[test]
-    fn an_untracked_file_parks_the_clone() {
-        let f = fx();
-        write(&f.clone.join("scratch-notes.md"), "irreplaceable\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::GitStateNotClean { .. }
-        ));
-        assert!(f.clone.join("scratch-notes.md").exists());
-    }
 
     /// The other side of the same gate: an IGNORED build target does not park. Discriminates a status
     /// rule so strict that it parks every rust clone in the backlog (each carries an ignored `target/`),
@@ -3781,26 +2995,6 @@ mod tests {
         let r = run(&f, &items, &env, false);
         assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
         assert!(!f.clone.exists());
-    }
-
-    /// An unborn HEAD has no commit to ask about. Discriminates a reaper that treats "no HEAD" as
-    /// "nothing of value".
-    #[test]
-    fn an_unborn_head_parks() {
-        let f = fx();
-        let empty_id = format!("impl-{DEAD_PID}-bb");
-        let empty = f.implement.join(&empty_id);
-        std::fs::create_dir_all(&empty).unwrap();
-        git(&empty, &["init", "--initial-branch=main", "-q"]);
-        write(&empty.join("unsaved.txt"), "x\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(
-            parked_reason(&r, &empty),
-            rp::ParkReason::UnbornHead { detail: None }
-        );
-        assert!(empty.join("unsaved.txt").exists());
     }
 
     /// F3. Discriminates disposability decided BY NAME. An ignored entry is invisible to the
@@ -3880,77 +3074,6 @@ mod tests {
         );
     }
 
-    /// F3, end to end on a live clone: ignored bytes with no provenance are unique custody, and the
-    /// clone that holds them must survive even though its HEAD is landed and porcelain is otherwise
-    /// silent.
-    #[test]
-    fn a_landed_clone_whose_ignored_target_has_no_cargo_markers_is_parked() {
-        let f = fx();
-        write(&f.clone.join("target/unique.bin"), "irreplaceable\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::GitStateNotClean { detail } => {
-                assert!(detail.contains("target"), "unexpected detail: {detail}")
-            }
-            other => panic!("marker-less ignored bytes were deleted: {other:?}"),
-        }
-        assert!(f.clone.join("target/unique.bin").exists());
-    }
-
-    /// F2. Discriminates a git-state gate that trusts porcelain alone. `--assume-unchanged` tells git
-    /// to stop consulting the worktree for a path, so a MODIFIED tracked file produces no porcelain
-    /// line at all — the tree looks pristine while carrying bytes on no commit.
-    #[test]
-    fn an_assume_unchanged_modification_is_invisible_to_porcelain_and_parks() {
-        let f = fx();
-        git(
-            &f.clone,
-            &["update-index", "--assume-unchanged", "src/lib.rs"],
-        );
-        write(
-            &f.clone.join("src/lib.rs"),
-            "pub fn a() {} // invisible edit\n",
-        );
-        assert!(
-            sr::git_str(&f.clone, &["status", "--porcelain"])
-                .unwrap()
-                .is_empty(),
-            "fixture must model the case porcelain cannot see"
-        );
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::IndexFlagsHideState { detail } => {
-                assert!(detail.contains("lib.rs"), "unexpected detail: {detail}")
-            }
-            other => panic!("an invisible modification was deleted: {other:?}"),
-        }
-        assert_eq!(
-            std::fs::read_to_string(f.clone.join("src/lib.rs")).unwrap(),
-            "pub fn a() {} // invisible edit\n"
-        );
-    }
-
-    /// The same blindness wholesale: a sparse checkout simply has no worktree for paths outside the
-    /// cone, and `git status` reports nothing about them.
-    #[test]
-    fn a_sparse_checkout_parks() {
-        let f = fx();
-        git(&f.clone, &["config", "core.sparseCheckout", "true"]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::IndexFlagsHideState { .. }
-        ));
-        assert!(f.clone.exists());
-    }
-
     /// The pure index-flag rule, including letters this parser has no name for.
     #[test]
     fn index_flags_disposition_accepts_only_plain_cached_entries() {
@@ -3973,50 +3096,6 @@ mod tests {
         assert!(e.contains("hidden.rs"), "the refusal hides the entry: {e}");
     }
 
-    /// F4. Discriminates a clean-looking superproject. An initialized submodule emits NO porcelain
-    /// entry when clean, its object store lives in `<clone>/.git/modules/<name>` and dies with the
-    /// clone, and the gitlink SHA in the superproject says where those bytes SHOULD be — never that
-    /// they are anywhere else.
-    #[test]
-    fn an_initialized_submodule_parks_even_when_the_superproject_is_clean() {
-        let f = fx();
-        let sub = f.root.join("sub-upstream");
-        std::fs::create_dir_all(&sub).unwrap();
-        git(&sub, &["init", "--initial-branch=main", "-q"]);
-        write(&sub.join("sub.rs"), "pub fn s() {}\n");
-        git(&sub, &["add", "-A"]);
-        git(&sub, &["commit", "-qm", "sub"]);
-        git(
-            &f.clone,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "add",
-                "-q",
-                sub.to_str().unwrap(),
-                "vendor/sub",
-            ],
-        );
-        git(&f.clone, &["commit", "-qm", "add submodule"]);
-        assert!(
-            sr::real_dir(&f.clone.join(".git/modules")),
-            "fixture must have an initialized submodule store"
-        );
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::InitializedSubmodule { detail } => assert!(
-                detail.contains("modules") || detail.contains("vendor/sub"),
-                "unexpected detail: {detail}"
-            ),
-            other => panic!("an initialized submodule's store was deleted: {other:?}"),
-        }
-        assert!(f.clone.join(".git/modules").exists());
-    }
-
     /// The pure submodule rule: `-` is the only prefix that means "no object store here", and an
     /// unparseable line is treated as initialized rather than waved through.
     #[test]
@@ -4034,48 +3113,6 @@ mod tests {
                 "{line:?} was accepted as uninitialized"
             );
         }
-    }
-
-    /// F10(a). Discriminates a containment proof aimed by a value the agent can rewrite.
-    /// `remote.origin.url` lives in `<clone>/.git/config` — inside the `:rw` mount — so an agent can
-    /// repoint it at any repository that happens to carry a matching tree. The checkpoint is written
-    /// before the agent runs; a disagreement is a refusal, not a reconciliation.
-    #[test]
-    fn an_origin_repointed_away_from_the_checkpoints_source_repo_parks() {
-        let f = fx();
-        // A decoy repository that DOES contain the clone's content.
-        let decoy = f.root.join("decoy");
-        let out = Command::new("git")
-            .args(["clone", "--no-hardlinks", "-q"])
-            .arg(&f.source)
-            .arg(&decoy)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        git(
-            &f.clone,
-            &["remote", "set-url", "origin", decoy.to_str().unwrap()],
-        );
-        // The checkpoint still records the repository this run was actually cloned from.
-        write(
-            &sr::evidence_dir(&f.clone).join("implement-checkpoint.json"),
-            &format!(
-                "{{\"schema_version\":1,\"task_id\":\"{}\",\"source_repo\":{:?},\"branch\":\"main\"}}",
-                f.run_id,
-                f.source.to_string_lossy()
-            ),
-        );
-
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::OriginDisagreesWithCheckpoint { detail } => {
-                assert!(detail.contains("decoy"), "unexpected detail: {detail}")
-            }
-            other => panic!("a repointed origin aimed the D-1 proof elsewhere: {other:?}"),
-        }
-        assert!(f.clone.exists());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -4203,7 +3240,10 @@ mod tests {
                 checkout_kind: Some(sr::CheckoutKind::StandaloneClone),
                 run_id: Some(f.run_id.clone()),
                 measured: sr::Measured::default(),
-                consumers: sr::LiveConsumers::default(),
+                consumers: sr::LiveConsumers {
+                    container_mount: sr::HolderState::Free,
+                    ..Default::default()
+                },
                 git: None,
                 note: None,
             },
@@ -4397,7 +3437,8 @@ mod tests {
     #[test]
     fn an_unanswered_container_axis_parks_when_a_runtime_is_configured() {
         let f = fx();
-        let items = scan(&f.implement); // container_mount defaults to Unknown
+        let items = scan(&f.implement); // invocation scan cannot answer the recorded runtime
+        std::fs::remove_file(f.root.join("recorded-runtime")).unwrap();
         let env = FakeEnv::new();
         let r = run_with(&f, &items, &env, false, 1, DEFAULT_CLONE_REAP_LOOKBACK);
         assert_eq!(
@@ -4442,114 +3483,6 @@ mod tests {
     // Receipts + evidence preservation
     // -----------------------------------------------------------------------------------------
 
-    /// The plan §7 receipt: the durable identity of a run whose clone is gone. Discriminates a receipt
-    /// that records only a path — it must carry the run's identity, the pre-squash HEAD and tree, the
-    /// containment verdict AND which ref/commit matched, and the disposition.
-    #[test]
-    fn the_fold_receipt_carries_the_runs_durable_identity() {
-        let f = fx();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
-        let tree = sr::git_str(&f.clone, &["rev-parse", "HEAD^{tree}"]).unwrap();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-
-        let v = fold_receipt(&f);
-        assert_eq!(v["schema"], FOLD_RECEIPT_SCHEMA);
-        assert_eq!(v["run_id"], f.run_id);
-        assert_eq!(v["task_id"], f.run_id, "the checkpoint's task id was lost");
-        assert_eq!(v["branch"], "main");
-        assert_eq!(v["head"], head);
-        assert_eq!(v["tree"], tree);
-        assert_eq!(v["base"], "deadbeef");
-        assert_eq!(v["base_ref"], "main");
-        assert_eq!(v["disposition"], DISPOSITION_DELETED);
-        assert_eq!(v["at_epoch_secs"], env.now);
-        assert!(v["durability"].as_str().unwrap().starts_with("OnMain"));
-        assert!(v["containment"]["main_ref"].as_str().is_some());
-        assert!(
-            v["gates"].as_array().unwrap().len() >= 8,
-            "the gate evidence was not recorded: {:?}",
-            v["gates"]
-        );
-        // And it lives in the SIBLING namespace, which the deletion did not touch.
-        assert!(receipts_dir(&f.implement)
-            .join(fold_receipt_name(&f.run_id))
-            .exists());
-    }
-
-    /// Evidence has its own retention (plan §5) and must never die with the parent it describes.
-    /// Discriminates a reaper that deletes the clone with its checkpoint inside it.
-    #[test]
-    fn the_runs_evidence_is_copied_out_before_the_clone_is_deleted() {
-        let f = fx();
-        let original =
-            std::fs::read_to_string(sr::evidence_dir(&f.clone).join("implement-checkpoint.json"))
-                .unwrap();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        assert!(!f.clone.exists());
-
-        let preserved = receipts_dir(&f.implement)
-            .join(evidence_dir_name(&f.run_id))
-            .join("implement-checkpoint.json");
-        assert!(
-            preserved.exists(),
-            "the run's evidence died with its parent: {}",
-            preserved.display()
-        );
-        assert_eq!(std::fs::read_to_string(&preserved).unwrap(), original);
-        let v = fold_receipt(&f);
-        assert!(v["evidence_preserved_at"].as_str().is_some());
-        assert_eq!(v["evidence_files"][0], "implement-checkpoint.json");
-
-        // The copy happened BEFORE the removal, not after it (afterwards there is nothing to copy).
-        let kinds = env.j.borrow().kinds();
-        let copy = kinds.iter().position(|k| *k == "copy-evidence");
-        let remove = kinds.iter().position(|k| *k == "remove");
-        assert!(
-            copy.is_some() && copy < remove,
-            "evidence was not preserved before the removal: {kinds:?}"
-        );
-    }
-
-    /// F5. A symlinked sidecar is AMBIGUOUS, not absent: a `:rw` agent can point `.git/a2a-bridge` at a
-    /// user checkout, and the two wrong answers are symmetric — following it copies a protected tree
-    /// into the receipt namespace and calls it this run's evidence, while skipping it deletes the clone
-    /// while reporting evidence preserved. Discriminates BOTH: the only correct move is to park.
-    #[test]
-    #[cfg(unix)]
-    fn a_symlinked_evidence_sidecar_parks_rather_than_being_skipped_or_followed() {
-        let f = fx();
-        let decoy = f.root.join("user-checkout");
-        std::fs::create_dir_all(&decoy).unwrap();
-        std::fs::write(decoy.join("secret.txt"), b"private").unwrap();
-        let items = scan(&f.implement); // scan first: the sidecar is real at scan time
-        std::fs::remove_dir_all(sr::evidence_dir(&f.clone)).unwrap();
-        std::os::unix::fs::symlink(&decoy, sr::evidence_dir(&f.clone)).unwrap();
-
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert!(
-            matches!(
-                parked_reason(&r, &f.clone),
-                rp::ParkReason::EvidencePreservationFailed { .. }
-            ),
-            "a symlinked sidecar was not treated as ambiguous"
-        );
-        assert!(f.clone.exists(), "the clone was deleted anyway");
-        assert!(decoy.join("secret.txt").exists(), "followed the symlink");
-        assert!(
-            !receipts_dir(&f.implement)
-                .join(evidence_dir_name(&f.run_id))
-                .exists(),
-            "copied a symlink target into the receipt namespace as this run's evidence"
-        );
-    }
-
     /// F5. The destination side of the same hazard: `.receipts` itself is inside the scan root a `:rw`
     /// container can write. A symlinked `.receipts` (pointing back into the clone, or anywhere else)
     /// would put the receipt somewhere the deletion destroys — or somewhere it does not belong.
@@ -4569,146 +3502,6 @@ mod tests {
             ),
             "a symlinked `.receipts` was written through"
         );
-        assert!(f.clone.exists());
-        assert!(env.removed().is_empty());
-    }
-
-    /// F5. A FIFO inside the sidecar is neither a file to copy nor a directory to walk. Copying it would
-    /// BLOCK on open; skipping it would delete the clone while claiming its evidence was preserved.
-    #[test]
-    #[cfg(unix)]
-    fn a_non_regular_entry_inside_the_sidecar_parks() {
-        let f = fx();
-        let fifo = sr::evidence_dir(&f.clone).join("pipe");
-        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
-        // SAFETY: `mkfifo` only creates a filesystem node at the given path.
-        assert_eq!(
-            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
-            0,
-            "mkfifo failed"
-        );
-        let items = scan(&f.implement);
-
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert!(
-            matches!(
-                parked_reason(&r, &f.clone),
-                rp::ParkReason::EvidencePreservationFailed { .. }
-            ),
-            "a non-regular sidecar entry was silently skipped"
-        );
-        assert!(f.clone.exists());
-    }
-
-    /// The other side of F5's distinction: a run with NO sidecar at all is genuinely absent, not
-    /// ambiguous. It proceeds — and the receipt must say so rather than claiming a preservation that
-    /// never happened.
-    #[test]
-    fn an_absent_sidecar_proceeds_and_the_receipt_does_not_claim_preservation() {
-        let f = fx();
-        std::fs::remove_dir_all(sr::evidence_dir(&f.clone)).unwrap();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        let v = fold_receipt(&f);
-        assert!(
-            v["evidence_preserved_at"].is_null()
-                && v["evidence_files"].as_array().unwrap().is_empty(),
-            "the receipt claims preservation that never happened: {v}"
-        );
-        let gates: Vec<String> = v["gates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|g| g.as_str().unwrap().to_string())
-            .collect();
-        assert!(
-            gates.iter().any(|g| g.contains("no evidence")
-                || (g.contains("evidence") && g.contains("nothing to preserve"))),
-            "the receipt does not distinguish `absent` from `preserved`: {gates:?}"
-        );
-    }
-
-    /// F5. `.git/A2A_TASK.md` (the out-of-band task the fix loop re-reads) and `.git/A2A_COMMIT_MSG`
-    /// (the agent-written hand-off message) are Evidence that lives beside the sidecar, not inside it.
-    /// Discriminates a preservation set defined by one directory path.
-    #[test]
-    fn the_git_scoped_task_and_commit_message_are_preserved_too() {
-        let f = fx();
-        write(
-            &f.clone.join(".git/A2A_TASK.md"),
-            "# the task\nbuild the thing\n",
-        );
-        write(&f.clone.join(".git/A2A_COMMIT_MSG"), "feat: the thing\n");
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-
-        let kept = receipts_dir(&f.implement).join(evidence_dir_name(&f.run_id));
-        assert_eq!(
-            std::fs::read_to_string(kept.join("A2A_TASK.md")).unwrap(),
-            "# the task\nbuild the thing\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(kept.join("A2A_COMMIT_MSG")).unwrap(),
-            "feat: the thing\n"
-        );
-        assert!(kept.join("implement-checkpoint.json").exists());
-    }
-
-    /// F10(b). The dry run is the document an operator reads BEFORE authorizing a deletion, so it must
-    /// not imply that gates it never ran have passed. Discriminates a plan that lists every gate as
-    /// satisfied while the preservation and durability gates were never exercised — and pins that the
-    /// cheap structural preflight still catches the ambiguous cases the real run would park on.
-    #[test]
-    #[cfg(unix)]
-    fn a_dry_run_names_the_gates_it_did_not_exercise_and_still_catches_ambiguity() {
-        let f = fx();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, true);
-        let text = render_text(&r);
-        assert!(
-            text.contains("NOT exercised by a dry run"),
-            "the plan does not disclose which gates it skipped:\n{text}"
-        );
-        assert!(
-            text.contains("structural preflight"),
-            "the plan does not name the preflight it DID run:\n{text}"
-        );
-
-        // And the preflight is not decoration: an ambiguous sidecar parks in the PLAN, so the operator
-        // learns about it before authorizing anything.
-        let f2 = fx();
-        let items2 = scan(&f2.implement);
-        std::fs::remove_dir_all(sr::evidence_dir(&f2.clone)).unwrap();
-        std::os::unix::fs::symlink(&f2.root, sr::evidence_dir(&f2.clone)).unwrap();
-        let r2 = run(&f2, &items2, &FakeEnv::new(), true);
-        assert!(
-            matches!(
-                parked_reason(&r2, &f2.clone),
-                rp::ParkReason::EvidencePreservationFailed { .. }
-            ),
-            "the dry run planned a deletion the real run would refuse"
-        );
-    }
-
-    /// Discriminates a reaper that proceeds when Evidence could not be preserved. The clone is the only
-    /// copy; if the evidence cannot be moved to safety, the clone stays.
-    #[test]
-    fn an_evidence_copy_failure_parks_the_clone() {
-        let f = fx();
-        let items = scan(&f.implement);
-        let mut env = FakeEnv::new();
-        env.copy_error = Some("read-only filesystem".into());
-        let r = run(&f, &items, &env, false);
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::EvidencePreservationFailed { .. }
-        ));
         assert!(f.clone.exists());
         assert!(env.removed().is_empty());
     }
@@ -4841,47 +3634,6 @@ mod tests {
     // Dry run, truthfulness, reporting
     // -----------------------------------------------------------------------------------------
 
-    /// The dry run IS the plan document. Discriminates one that is only a print flag (it would delete,
-    /// copy evidence, or write a receipt) and one that hides its gate evidence in `--json`.
-    #[test]
-    fn a_dry_run_deletes_nothing_writes_no_receipt_and_shows_its_gates() {
-        let f = fx();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, true);
-
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Planned);
-        assert!(
-            f.clone.join("src/lib.rs").exists(),
-            "a dry run deleted the clone"
-        );
-        assert!(env.removed().is_empty());
-        assert!(r.receipts.is_empty() && r.intents.is_empty());
-        assert!(
-            !receipts_dir(&f.implement).exists(),
-            "a dry run created the receipt namespace"
-        );
-        let text = render_text(&r);
-        for expected in [
-            "content on main (D-1)",
-            "git state",
-            "operation lock",
-            "consumer probe",
-            "run owner",
-            "shape",
-            "removal guard",
-        ] {
-            assert!(
-                text.contains(expected),
-                "no `{expected}` gate line in:\n{text}"
-            );
-        }
-        assert!(
-            text.contains(".operation-locks"),
-            "the banner does not name its one state-visible effect:\n{text}"
-        );
-    }
-
     /// F8. A half-completed removal is the case where every OTHER row in the report becomes a lie: the
     /// clone reads `PARTIAL`, while its children still read `parked` (retained) even though some of
     /// their bytes are gone. Discriminates a projection that only runs for a fully successful removal —
@@ -5011,7 +3763,32 @@ mod tests {
     /// record of what happened.
     #[test]
     fn rows_inside_a_deleted_clone_are_recorded_as_deleted_with_it() {
+        if std::env::var_os("A2A_DEFAULT_ARCHIVE_REPORT_TEST").is_none() {
+            let state = tempfile::tempdir().unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "storage_reap_clones::tests::rows_inside_a_deleted_clone_are_recorded_as_deleted_with_it"])
+                .env("A2A_DEFAULT_ARCHIVE_REPORT_TEST", "1")
+                .env("A2A_BRIDGE_STATE_DIR", state.path())
+                .output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         let f = fx();
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let raw = std::fs::read_to_string(&ck.config_path).unwrap().replace(
+            &format!("path = {:?}\n", f.root.join("archives").to_str().unwrap()),
+            "",
+        );
+        write(&ck.config_path, &raw);
+        let (_, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        assert!(cfg.evidence.path.is_none());
+        bridge_controller::evidence::write_run_archive(&f.clone, &ck, "approved", &cfg.evidence)
+            .unwrap();
         write(&f.clone.join("target/debug/blob"), "regenerable\n");
         write(&f.clone.join("target/CACHEDIR.TAG"), "Signature: 8a477f5\n");
         let items = scan(&f.implement);
@@ -5032,6 +3809,22 @@ mod tests {
             }
         }
         assert!(!f.clone.exists());
+        let rendered = render_text(&r);
+        assert!(
+            rendered.contains("selected kinds [spec, final_review_summary]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                &bridge_core::platform_state::platform_state_dir()
+                    .unwrap()
+                    .join("evidence")
+                    .display()
+                    .to_string()
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("copied into the receipt"), "{rendered}");
     }
 
     /// Discriminates a reaper that reports the payload's own size as the space reclaimed.
@@ -5077,48 +3870,6 @@ mod tests {
     // S4b — fixtures shared by F1 (chained origins) and F2 (the owner disposition license)
     // =========================================================================================
 
-    /// `git clone --no-hardlinks <from> <root>/impl-<dead pid>-<suffix>` — the exact shape the
-    /// implement loop produces, so a chained run is built the way production builds one.
-    fn clone_into_root(f: &Fx, from: &Path, suffix: &str) -> (PathBuf, String) {
-        let run_id = format!("impl-{DEAD_PID}-{suffix}");
-        let dst = f.implement.join(&run_id);
-        let out = Command::new("git")
-            .args(["clone", "--no-hardlinks", "-q"])
-            .arg(from)
-            .arg(&dst)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "clone into root: {out:?}");
-        (dst, run_id)
-    }
-
-    /// The checkpoint the bridge writes BEFORE the agent runs — including `source_repo`, the one
-    /// statement about provenance the agent did not author.
-    fn write_checkpoint(clone: &Path, run_id: &str, source: &Path) {
-        write(
-            &sr::evidence_dir(clone).join("implement-checkpoint.json"),
-            &format!(
-                "{{\"schema_version\":1,\"task_id\":\"{run_id}\",\"branch\":\"feat/x\",\
-                 \"base_ref\":\"main\",\"source_repo\":{:?}}}",
-                source.to_string_lossy()
-            ),
-        );
-    }
-
-    /// Only the rows for `path`. A chained fixture has several clones under one root, and a test about
-    /// ONE of them must not have a sibling reaped out from under it mid-run.
-    fn items_for(items: &[sr::ReportItem], path: &Path) -> Vec<sr::ReportItem> {
-        let want = path.to_string_lossy().into_owned();
-        items.iter().filter(|i| i.path == want).cloned().collect()
-    }
-
-    fn fold_receipt_for(f: &Fx, run_id: &str) -> serde_json::Value {
-        let p = receipts_dir(&f.implement).join(fold_receipt_name(run_id));
-        let raw = std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| panic!("no fold receipt at {}: {e}", p.display()));
-        serde_json::from_str(&raw).unwrap()
-    }
-
     /// An owner-authored license file, written and loaded exactly the way the CLI loads it (so the
     /// sha256 on every receipt below is a real digest of real bytes, not a test fixture's invention).
     fn license(f: &Fx, run_ids: &[&str]) -> DispositionList {
@@ -5136,291 +3887,398 @@ mod tests {
     // F1 — chained-origin root resolution
     // -----------------------------------------------------------------------------------------
 
-    /// THE forensic defect. An `implement` run started with `--repo <another run's clone>` records
-    /// that SIBLING as its `origin`, so S4 asked the D-1 question of a quarantine directory rather
-    /// than of the repository the work lands in — 68 of this host's 81 parked clones were in that
-    /// shape, every verdict about the wrong repo.
-    ///
-    /// The fixture makes the two answers DIFFER on purpose: the work's exact tree is on the SOURCE's
-    /// main and is unknown to the sibling. Asked of the sibling the verdict is `no` (assert it, so the
-    /// discrimination is proved rather than assumed) and the clone would park forever; asked of the
-    /// true root it is `yes(tree)` and the clone is reaped. Discriminates any resolution that stops at
-    /// the first `origin`.
+    fn two_hop(f: &Fx) -> PathBuf {
+        let parent = f.implement.join(format!("impl-{DEAD_PID}-parent"));
+        git(
+            &f.source,
+            &[
+                "clone",
+                "--no-hardlinks",
+                "-q",
+                f.source.to_str().unwrap(),
+                parent.to_str().unwrap(),
+            ],
+        );
+        let (mut ck, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let raw = std::fs::read_to_string(&ck.config_path).unwrap();
+        write(
+            &ck.config_path,
+            &format!("{raw}\n[implement]\nclone_config_extra_keys = ['remote.origin.pushurl']\n"),
+        );
+        git(
+            &f.clone,
+            &["remote", "set-url", "origin", parent.to_str().unwrap()],
+        );
+        // Use a separate push URL to preserve the origin chain for resolution.
+        git(
+            &parent,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                f.root.join("backup.git").to_str().unwrap(),
+            ],
+        );
+        // The immediate source must not carry the child's landing trailer. Only the terminal
+        // root knows that landing; the parent has its own distinct implementation and trailer pair.
+        git(
+            &parent,
+            &["commit", "--amend", "--allow-empty", "-qm", "parent work"],
+        );
+        let parent_head = sr::git_str(&parent, &["rev-parse", "HEAD"]).unwrap();
+        let mut parent_ck = ck.clone();
+        parent_ck.source_repo = f.source.clone();
+        parent_ck.clone_path = parent.clone();
+        parent_ck.task_id = parent.file_name().unwrap().to_str().unwrap().into();
+        parent_ck.resume_id = parent_ck.task_id.clone();
+        parent_ck.branch = format!("implement/{}", parent_ck.task_id);
+        parent_ck.current_commit = Some(parent_head.clone());
+        git(&parent, &["branch", "-m", &parent_ck.branch]);
+        bridge_controller::implement_resume::save_checkpoint(&parent, &parent_ck).unwrap();
+        write(&parent.join(".git/A2A_TASK.md"), "parent task spec");
+        bridge_controller::custody_push::push_before_review_or_merge(
+            &parent,
+            &cfg.custody,
+            &mut parent_ck,
+            &parent_head,
+        );
+        bridge_controller::evidence::write_run_archive(
+            &parent,
+            &parent_ck,
+            "approved",
+            &cfg.evidence,
+        )
+        .unwrap();
+        git(
+            &f.source,
+            &[
+                "commit",
+                "--allow-empty",
+                "-qm",
+                &format!(
+                    "parent landed\n\nA2A-Run: {}\nA2A-Original: {parent_head}",
+                    parent_ck.task_id
+                ),
+            ],
+        );
+        ck.source_repo = parent.clone();
+        bridge_controller::implement_resume::save_checkpoint(&f.clone, &ck).unwrap();
+        bridge_controller::evidence::write_run_archive(&f.clone, &ck, "approved", &cfg.evidence)
+            .unwrap();
+        parent
+    }
+
     #[test]
-    fn a_chained_clone_is_judged_against_the_true_source_not_the_sibling_it_came_from() {
+    fn two_hop_origin_uses_terminal_provenance_and_immediate_custody() {
         let f = fx();
-        let (b, b_id) = clone_into_root(&f, &f.source, "bb");
-        write_checkpoint(&b, &b_id, &f.source);
-        let (a, a_id) = clone_into_root(&f, &b, "cc");
-        write_checkpoint(&a, &a_id, &b);
-
-        // The sibling then moves on with work of its own that never lands, so it PARKS on its own
-        // evidence — the point of this test is which repository answered for the CHAINED clone, and a
-        // sibling that got reaped alongside it would leave that unobservable.
-        write(&b.join("src/b_only.rs"), "pub fn b_only() {}\n");
-        git(&b, &["add", "-A"]);
-        git(&b, &["commit", "-qm", "work only in the sibling"]);
-
-        git(&a, &["checkout", "-q", "-b", "feat/chained"]);
-        write(&a.join("src/chained.rs"), "pub fn chained() {}\n");
-        git(&a, &["add", "-A"]);
-        git(&a, &["commit", "-qm", "chained work"]);
-        let head = sr::git_str(&a, &["rev-parse", "HEAD"]).unwrap();
-        // The same content lands on the SOURCE's main. The sibling never hears about it.
-        source_commit(&f, "src/chained.rs", "pub fn chained() {}\n");
-
-        let (_, against_sibling) =
-            sr::on_source_main_with_lookback(&b, &a, &head, DEFAULT_CLONE_REAP_LOOKBACK);
-        assert_eq!(
-            against_sibling.label(),
-            "no",
-            "the fixture must make the sibling's answer differ from the true source's"
-        );
-
-        // The PRODUCTION shape: every scanned row, siblings included. (An earlier version of this
-        // test passed only the chained clone's row, which hid the fact that reaping a sibling first
-        // used to strand it — see `a_chained_pair_is_reaped_in_one_invocation_whatever_the_order`.)
-        let items = scan(&f.implement);
+        let parent = two_hop(&f);
+        let chain = resolve_origin_root(&f.clone, &f.implement).unwrap();
+        assert_eq!(chain.hops.len(), 2);
+        assert_eq!(chain.root, f.source);
+        let (ck, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        assert_eq!(ck.source_repo, parent);
+        assert!(bridge_controller::clone_deletion::failures_for_phase(
+            &f.clone,
+            &ck,
+            &cfg.custody,
+            &cfg.evidence,
+            "approved"
+        )
+        .is_empty());
         assert!(
-            items.iter().any(|i| i.path == sr::display_path(&b)),
-            "the fixture must offer the sibling row too"
+            !landing(&f).confirmed(),
+            "immediate source must not prove child landing"
         );
+        let mut items = scan(&f.implement);
+        items.retain(|item| item.path != parent.to_str().unwrap());
         let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
+        let report = run(&f, &items, &env, false);
         assert_eq!(
-            item_for(&r, &a).outcome,
+            item_for(&report, &f.clone).outcome,
             rp::ItemOutcome::Deleted,
-            "the chained clone was judged against the wrong repository: {:?}",
-            item_for(&r, &a).outcome
+            "{report:?}"
         );
-
-        let v = fold_receipt_for(&f, &a_id);
-        assert_eq!(v["containment"]["verdict"], "yes(tree)");
-        assert_eq!(
-            v["source_repo"],
-            sr::display_path(&f.source),
-            "the receipt does not name the TRUE source"
-        );
-        let chain = v["origin_chain"]
-            .as_array()
-            .expect("no origin chain on the receipt");
-        assert_eq!(chain.len(), 2, "the full chain was not recorded: {chain:?}");
-        assert!(
-            chain[0].as_str().unwrap().contains(&sr::display_path(&b)),
-            "hop 1 does not name the sibling: {chain:?}"
-        );
-        assert!(
-            chain[1]
-                .as_str()
-                .unwrap()
-                .contains(&sr::display_path(&f.source)),
-            "hop 2 does not name the source: {chain:?}"
-        );
-        // The sibling is untouched — it carries work of its own that never landed, so the SAME
-        // invocation that reaped the chained clone kept its parent, on that parent's own evidence.
-        assert!(b.join(".git").exists(), "the chain walk deleted a hop");
-        assert!(matches!(
-            parked_reason(&r, &b),
-            rp::ParkReason::NotOnSourceMain { .. }
-        ));
-        // R4: the terminal root was not merely reached, it was corroborated against the clone's own
-        // history before any question was asked of it.
-        assert!(
-            item_for(&r, &a)
-                .gates
-                .iter()
-                .any(|g| g.contains("terminal root corroborated") && g.contains("lineage root")),
-            "the chain was accepted without corroborating the root: {:?}",
-            item_for(&r, &a).gates
-        );
+        let receipt = fold_receipt(&f);
+        assert_eq!(receipt["source_repo"], f.source.display().to_string());
+        assert_eq!(receipt["origin_chain"].as_array().unwrap().len(), 2);
+        assert_remote(&f, false);
+        assert!(parent.exists());
     }
 
-    /// The ordinary directly-cloned run must still resolve in ONE hop and record it. Discriminates a
-    /// resolver that only works for chains, or one that silently walks past the real source.
     #[test]
-    fn a_directly_cloned_run_records_a_single_hop_chain() {
-        let f = fx();
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run(&f, &items, &env, false);
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        let v = fold_receipt(&f);
-        let chain = v["origin_chain"].as_array().unwrap();
-        assert_eq!(chain.len(), 1, "unexpected chain: {chain:?}");
-        assert_eq!(v["source_repo"], sr::display_path(&f.source));
-    }
-
-    /// A chain that runs into something that is not a repository, and a chain that runs into a path
-    /// that is not there at all. Both are the SAME failure — the true source cannot be identified —
-    /// and both must park with verdict `unknown` (not `no`, which would assert the content is
-    /// demonstrably absent from a repository nobody found) with the walk recorded for the operator.
-    #[test]
-    fn a_broken_origin_chain_parks_unknown_with_the_walk_recorded() {
-        let f = fx();
-        let (b, _) = clone_into_root(&f, &f.source, "bb");
-        let (a, _) = clone_into_root(&f, &b, "cc");
-
-        // (1) the next hop EXISTS but is not a repository — a half-removed quarantine directory.
-        let stump = f.implement.join(format!("impl-{DEAD_PID}-dd"));
-        std::fs::create_dir_all(stump.join("src")).unwrap();
-        git(
-            &b,
-            &["remote", "set-url", "origin", stump.to_str().unwrap()],
-        );
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
+    fn a_chained_pair_is_reaped_in_one_invocation_whatever_the_order() {
+        for parent_first in [false, true] {
+            let f = fx();
+            let parent = two_hop(&f);
+            assert!(!landing(&f).confirmed());
+            let child_landing = sr::git_str(&f.source, &["rev-parse", "HEAD^"]).unwrap();
+            let parent_landing = sr::git_str(&f.source, &["rev-parse", "HEAD"]).unwrap();
+            assert_ne!(child_landing, parent_landing);
+            let mut items = scan(&f.implement);
+            items.sort_by_key(|item| (item.path == parent.to_str().unwrap()) != parent_first);
+            assert_eq!(items[0].path == parent.to_str().unwrap(), parent_first);
+            let env = FakeEnv::new();
+            let report = run(&f, &items, &env, false);
+            for (path, landing) in [(&f.clone, child_landing), (&parent, parent_landing)] {
                 assert_eq!(
-                    verdict, "unknown",
-                    "a broken chain read as a definite answer"
+                    item_for(&report, path).outcome,
+                    rp::ItemOutcome::Deleted,
+                    "{report:?}"
                 );
-                assert!(
-                    detail.contains("NOT a git repository"),
-                    "the refusal does not say what broke: {detail}"
-                );
-                assert!(
-                    detail.contains(&sr::display_path(&b)),
-                    "the chain walked so far is not recorded: {detail}"
-                );
+                assert!(!path.exists());
+                let receipt: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(receipts_dir(&f.implement).join(fold_receipt_name(
+                        path.file_name().unwrap().to_str().unwrap(),
+                    )))
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(receipt["containment"]["matched_commit"], landing);
+                assert_eq!(receipt["source_repo"], f.source.to_str().unwrap());
             }
-            other => panic!("expected an unknown-verdict park, got {other:?}"),
-        }
-        assert!(
-            a.join(".git").exists(),
-            "a clone with no identified source was deleted"
-        );
-
-        // (2) the next hop is simply NOT THERE.
-        let gone = f.implement.join(format!("impl-{DEAD_PID}-ee"));
-        git(&b, &["remote", "set-url", "origin", gone.to_str().unwrap()]);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
-                assert_eq!(verdict, "unknown");
-                assert!(
-                    detail.contains("not a local directory"),
-                    "unexpected detail: {detail}"
-                );
-                assert!(
-                    detail.contains("origin chain walked so far"),
-                    "no walk: {detail}"
-                );
-            }
-            other => panic!("expected an unknown-verdict park, got {other:?}"),
-        }
-        assert!(a.exists());
-    }
-
-    /// `A -> B -> A`. Without cycle detection the resolver loops until the hop limit; with neither it
-    /// never returns. Discriminates a walk that only bounds its length.
-    #[test]
-    fn an_origin_cycle_parks() {
-        let f = fx();
-        let (b, _) = clone_into_root(&f, &f.source, "bb");
-        let (a, _) = clone_into_root(&f, &b, "cc");
-        git(&b, &["remote", "set-url", "origin", a.to_str().unwrap()]);
-
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
-                assert_eq!(verdict, "unknown");
-                assert!(detail.contains("CYCLE"), "unexpected detail: {detail}");
-            }
-            other => panic!("expected an unknown-verdict park, got {other:?}"),
-        }
-        assert!(a.exists());
-    }
-
-    /// The bound itself. Nine in-root hops is not a workflow, it is a config someone wrote; the walk
-    /// stops and parks rather than continuing to trust the next `remote.origin.url`.
-    #[test]
-    fn an_origin_chain_past_the_hop_limit_parks() {
-        let f = fx();
-        // h1..h9 are bare-bones repositories inside the scan root, each pointing at the next; h9
-        // points at the real source, which is one hop too far to ever be reached.
-        let mut names: Vec<PathBuf> = Vec::new();
-        for i in 1..=MAX_ORIGIN_HOPS + 1 {
-            let p = f.implement.join(format!("impl-{DEAD_PID}-h{i}"));
-            std::fs::create_dir_all(&p).unwrap();
-            git(&p, &["init", "--initial-branch=main", "-q"]);
-            names.push(p);
-        }
-        for i in 0..names.len() {
-            let next = names
-                .get(i + 1)
-                .cloned()
-                .unwrap_or_else(|| f.source.clone());
-            git(
-                &names[i],
-                &["remote", "add", "origin", next.to_str().unwrap()],
+            assert_eq!(
+                env.removed(),
+                vec![f.clone.display().to_string(), parent.display().to_string()]
             );
+            assert!(f.source.exists());
         }
-        let (a, _) = clone_into_root(&f, &f.source, "cc");
-        git(
-            &a,
-            &["remote", "set-url", "origin", names[0].to_str().unwrap()],
-        );
-
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
-                assert_eq!(verdict, "unknown");
-                // The message must describe what actually happened: the walk stayed INSIDE the root
-                // for the whole bound. (An earlier wording claimed that unconditionally, including
-                // when the last edge did leave the root — a false statement on a refusal.)
-                assert!(
-                    detail.contains(&format!(
-                        "has followed {} edges without leaving the scan root",
-                        MAX_ORIGIN_HOPS + 1
-                    )) && detail.contains(&format!("limit {MAX_ORIGIN_HOPS}")),
-                    "unexpected detail: {detail}"
-                );
-            }
-            other => panic!("expected an unknown-verdict park, got {other:?}"),
-        }
-        assert!(a.exists());
     }
 
-    /// The per-hop checkpoint cross-check. S4 bound the clone's own `origin` to the source its
-    /// checkpoint recorded; a chain is only as trustworthy as its weakest hop, and every hop's
-    /// `origin` lives in a directory a `:rw` agent could write. Discriminates a walk that applies the
-    /// cross-check to the first edge alone.
     #[test]
-    fn a_chain_hop_that_disagrees_with_its_own_checkpoint_parks() {
-        let f = fx();
-        let (b, b_id) = clone_into_root(&f, &f.source, "bb");
-        // B's checkpoint says it was cloned from the source; its `origin` now says otherwise.
-        write_checkpoint(&b, &b_id, &f.source);
-        let elsewhere = f.root.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        git(&elsewhere, &["init", "--initial-branch=main", "-q"]);
-        write(&elsewhere.join("README.md"), "one\n");
-        git(&elsewhere, &["add", "-A"]);
-        git(&elsewhere, &["commit", "-qm", "one"]);
-        git(
-            &b,
-            &["remote", "set-url", "origin", elsewhere.to_str().unwrap()],
-        );
+    fn a_parked_child_keeps_its_source_clone() {
+        for parent_first in [false, true] {
+            for explicit in [false, true] {
+                for admission_refusal in [false, true] {
+                    let f = fx();
+                    let parent = two_hop(&f);
+                    let mut items = scan(&f.implement);
+                    items.sort_by_key(|item| {
+                        (item.path == parent.to_str().unwrap()) != parent_first
+                    });
+                    let child = items
+                        .iter_mut()
+                        .find(|item| item.path == f.clone.to_str().unwrap())
+                        .unwrap();
+                    if admission_refusal {
+                        child.checkout_kind = Some(sr::CheckoutKind::LinkedWorktree);
+                    } else {
+                        child.consumers.container_mount = sr::HolderState::Unknown;
+                    }
+                    let lic = license(
+                        &f,
+                        &[&f.run_id, parent.file_name().unwrap().to_str().unwrap()],
+                    );
+                    let env = FakeEnv::new();
+                    let report =
+                        run_licensed(&f, &items, &env, false, 1, 2000, explicit.then_some(&lic));
+                    assert!(matches!(
+                        item_for(&report, &f.clone).outcome,
+                        rp::ItemOutcome::Parked { .. }
+                    ));
+                    assert!(
+                        matches!(parked_reason(&report, &parent), rp::ParkReason::LiveConsumer { kind, .. } if kind == "dependent clone")
+                    );
+                    assert!(env.removed().is_empty());
+                    assert!(f.clone.exists() && parent.exists());
+                }
+            }
+        }
+    }
 
-        let (a, a_id) = clone_into_root(&f, &b, "cc");
-        write_checkpoint(&a, &a_id, &b);
-
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::OriginDisagreesWithCheckpoint { detail } => {
-                assert!(detail.contains("hop 2"), "the hop is not named: {detail}");
-                assert!(
-                    detail.contains(&sr::display_path(&b)),
-                    "the disagreeing run is not named: {detail}"
+    #[test]
+    fn chained_origins_refuse_checkpoint_disagreement_and_cycles() {
+        for cycle in [false, true] {
+            let f = fx();
+            let parent = two_hop(&f);
+            if cycle {
+                git(
+                    &parent,
+                    &["remote", "set-url", "origin", f.clone.to_str().unwrap()],
+                );
+                let mut ck = bridge_controller::implement_resume::load_checkpoint(&parent).unwrap();
+                ck.source_repo = f.clone.clone();
+                bridge_controller::implement_resume::save_checkpoint(&parent, &ck).unwrap();
+            } else {
+                git(
+                    &parent,
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        f.root.join("backup.git").to_str().unwrap(),
+                    ],
                 );
             }
-            other => panic!("expected a checkpoint disagreement, got {other:?}"),
+            assert!(resolve_origin_root(&f.clone, &f.implement).is_err());
+            let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+            assert!(matches!(
+                item_for(&report, &f.clone).outcome,
+                rp::ItemOutcome::Parked { .. }
+            ));
+            assert_remote(&f, true);
         }
-        assert!(a.exists());
+    }
+
+    #[test]
+    fn owner_remove_deletes_clone_when_recorded_parent_is_gone() {
+        let f = fx();
+        let parent = two_hop(&f);
+        std::fs::remove_dir_all(parent).unwrap();
+        let lic = license(&f, &[&f.run_id]);
+        let report = run_licensed(
+            &f,
+            &scan(&f.implement),
+            &FakeEnv::new(),
+            false,
+            0,
+            2000,
+            Some(&lic),
+        );
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted,
+            "{report:?}"
+        );
+        assert!(!f.clone.exists());
+        assert!(fold_receipt(&f)["failure_detail"]
+            .as_str()
+            .unwrap()
+            .contains("remote cleanup unavailable"));
+        assert_remote(&f, true);
+    }
+
+    #[test]
+    fn encoded_path_holders_without_process_records_keep_clones() {
+        let long_prefix = "long-path-".repeat(20);
+        for prefix in ["ordinary-", "nonascii-é-", long_prefix.as_str()] {
+            for holder_label in [None, Some("cwd"), Some("repo")] {
+                for explicit in [false, true] {
+                    let f = fx_with_prefix(prefix);
+                    assert!(!f.clone.join(".git/a2a-bridge/container-runs.json").exists());
+                    let path = f.clone.to_str().unwrap();
+                    // Independent expectation of the backend's printable ASCII, 200-char label.
+                    let encoded: String = path
+                        .chars()
+                        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                        .take(200)
+                        .collect();
+                    let queries = f.root.join("runtime-queries");
+                    let response = holder_label
+                        .map(|key| {
+                            format!(
+                        "if [ \"$arg\" = 'label=a2a.{key}={encoded}' ]; then printf 'holder\\n'; fi"
+                    )
+                        })
+                        .unwrap_or_default();
+                    write(&f.root.join("recorded-runtime"), &format!(
+                        "#!/bin/sh\nfor arg in \"$@\"; do\nprintf '%s\\n' \"$arg\" >> '{}'\n{response}\ndone\n", queries.display()
+                    ));
+                    let lic = license(&f, &[&f.run_id]);
+                    let env = FakeEnv::new();
+                    let report = run_licensed(
+                        &f,
+                        &scan(&f.implement),
+                        &env,
+                        false,
+                        1,
+                        2000,
+                        explicit.then_some(&lic),
+                    );
+                    let queried = std::fs::read_to_string(queries).unwrap();
+                    assert!(queried.contains(&format!("label=a2a.cwd={encoded}")));
+                    assert!(!queried.contains(&format!("label=a2a.run={}", f.run_id)));
+                    if holder_label.is_some() {
+                        assert!(
+                            matches!(
+                                parked_reason(&report, &f.clone),
+                                rp::ParkReason::LiveConsumer { .. }
+                            ),
+                            "{report:?}"
+                        );
+                    } else if encoded != path {
+                        assert_eq!(
+                            parked_reason(&report, &f.clone),
+                            rp::ParkReason::ContainerAxisUnanswered
+                        );
+                    } else {
+                        assert_eq!(
+                            item_for(&report, &f.clone).outcome,
+                            rp::ItemOutcome::Deleted,
+                            "{report:?}"
+                        );
+                        assert!(!f.clone.exists());
+                        continue;
+                    }
+                    assert!(env.removed().is_empty());
+                    assert!(f.clone.exists());
+                    assert_remote(&f, true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_container_scan_keeps_clone_even_when_recorded_runtime_answers_empty() {
+        for explicit in [false, true] {
+            let f = fx();
+            let mut items = scan(&f.implement);
+            for item in &mut items {
+                item.consumers.container_mount = sr::HolderState::Unknown;
+            }
+            let lic = license(&f, &[&f.run_id]);
+            let env = FakeEnv::new();
+            let report = run_licensed(&f, &items, &env, false, 1, 2000, explicit.then_some(&lic));
+            assert_eq!(
+                parked_reason(&report, &f.clone),
+                rp::ParkReason::ContainerAxisUnanswered
+            );
+            assert!(env.removed().is_empty());
+            assert!(f.clone.exists());
+        }
+    }
+
+    #[test]
+    fn recorded_runtime_holder_or_unavailable_query_blocks_even_owner_remove() {
+        for explicit in [false, true] {
+            for response in ["printf 'holder\\n'", "exit 1"] {
+                let f = fx();
+                let invocation = f.root.join("invocation-runtime");
+                write(&invocation, "#!/bin/sh\nexit 0\n");
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&invocation, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                assert!(Command::new(&invocation)
+                    .args(["ps", "-aq"])
+                    .output()
+                    .unwrap()
+                    .stdout
+                    .is_empty());
+                write(
+                    &f.root.join("recorded-runtime"),
+                    &format!("#!/bin/sh\n{response}\n"),
+                );
+                let mut items = scan(&f.implement);
+                for item in &mut items {
+                    item.consumers.container_mount = sr::HolderState::Free;
+                }
+                let lic = license(&f, &[&f.run_id]);
+                let env = FakeEnv::new();
+                let report =
+                    run_licensed(&f, &items, &env, false, 1, 2000, explicit.then_some(&lic));
+                assert!(
+                    matches!(
+                        parked_reason(&report, &f.clone),
+                        rp::ParkReason::LiveConsumer { .. }
+                            | rp::ParkReason::ContainerAxisUnanswered
+                    ),
+                    "{report:?}"
+                );
+                assert!(env.removed().is_empty());
+                assert!(f.clone.exists());
+                assert_remote(&f, true);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -5530,120 +4388,6 @@ mod tests {
     // F2 — the owner disposition license: what it replaces, and what it does NOT
     // -----------------------------------------------------------------------------------------
 
-    /// The feature. Work that exists ONLY in the clone reads `no` and parks forever under D-1 alone
-    /// (see `a_branch_only_clone_is_parked_with_its_work_intact`); with the owner's written
-    /// disposition it is reaped, and the receipt says exactly that — an owner license, naming who,
-    /// why, from which file, at which digest, and NEVER a containment claim.
-    #[test]
-    fn a_dispositioned_clone_with_verdict_no_is_deleted_under_the_license() {
-        let f = fx();
-        clone_commit(&f, "feat/x", "src/only-here.rs", "pub fn unique() {}\n");
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        assert!(!f.clone.exists());
-
-        let v = fold_receipt(&f);
-        assert_eq!(v["containment"]["verdict"], VERDICT_OWNER_DISPOSITION);
-        assert_eq!(v["containment"]["authorized_by"], lic.authorized_by);
-        assert_eq!(v["containment"]["reason"], lic.reason);
-        assert_eq!(v["containment"]["list_file"], lic.list_file);
-        assert_eq!(v["containment"]["list_sha256"], lic.list_sha256);
-        assert_eq!(v["disposition"], DISPOSITION_DELETED);
-        // The wording discipline, asserted rather than trusted: nothing on this receipt may read as a
-        // content-on-main claim.
-        assert!(
-            v["durability"]
-                .as_str()
-                .unwrap()
-                .starts_with("OwnerDisposition{"),
-            "durability claims a landing: {}",
-            v["durability"]
-        );
-        assert!(v["containment"]["main_ref"].is_null());
-        assert!(v["containment"]["matched_commit"].is_null());
-        let text = serde_json::to_string(&v).unwrap();
-        for forbidden in ["yes(head)", "yes(tree)", "OnMain{"] {
-            assert!(
-                !text.contains(forbidden),
-                "the licensed receipt claims {forbidden}: {text}"
-            );
-        }
-        // The disclaimer is part of the record, not decoration: a reader who only ever sees this
-        // field must be told, in it, that no containment proof exists (R7).
-        assert!(
-            v["containment"]["detail"]
-                .as_str()
-                .unwrap()
-                .contains("This is a LICENSE, NOT a containment proof"),
-            "the receipt omits the disclaimer: {}",
-            v["containment"]["detail"]
-        );
-        // The run's own work is preserved as EVIDENCE, exactly as an unlicensed reap preserves it.
-        assert!(
-            !r.receipts.is_empty(),
-            "no receipt was recorded for a licensed deletion"
-        );
-    }
-
-    /// THE fail-closed interaction. `git status` says these bytes are on no commit, and an owner
-    /// cannot have dispositioned bytes nobody has read: the license replaces the content-on-main
-    /// proof, never the dirty-state gate. Discriminates a license implemented as a general bypass —
-    /// the shape this slice deliberately built first and watched fail here.
-    #[test]
-    fn a_dispositioned_dirty_clone_parks_with_the_conflict_named() {
-        let f = fx();
-        write(
-            &f.clone.join("src/uncommitted.rs"),
-            "pub fn nobody_read_me() {}\n",
-        );
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::GitStateNotClean { detail } => {
-                assert!(
-                    detail.contains("uncommitted.rs"),
-                    "the refusal does not name the state: {detail}"
-                );
-                assert!(
-                    detail.contains("owner disposition list"),
-                    "the refusal does not name the conflict with the license: {detail}"
-                );
-            }
-            other => panic!("a DIRTY dispositioned clone was not parked: {other:?}"),
-        }
-        assert!(
-            f.clone.join("src/uncommitted.rs").exists(),
-            "bytes on no commit were destroyed under a license that never covered them"
-        );
-        assert!(env.removed().is_empty());
-        assert!(
-            r.notes.iter().any(|n| n.contains("PARKED anyway")),
-            "the report does not disclose that a licensed run parked: {:?}",
-            r.notes
-        );
-    }
-
     /// The other gate the license must not touch: a LIVE owning process. `implement` holds only its
     /// ADR-0025 run lease, so nothing else excludes it — and an owner dispositioning a run cannot
     /// have meant "delete the working directory out from under it while it runs".
@@ -5671,166 +4415,6 @@ mod tests {
         assert!(f.clone.exists());
         assert!(env.removed().is_empty());
         assert!(r.notes.iter().any(|n| n.contains("PARKED anyway")));
-    }
-
-    /// The remaining gates in the "everything else still runs" list, one invocation each, so a
-    /// bypass that skipped any ONE of them cannot hide behind the others.
-    #[test]
-    fn a_dispositioned_clone_still_answers_to_every_other_gate() {
-        // (1) the operation lock — `resume` and `merge` take this exact lock on this exact directory.
-        let f = fx();
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let mut env = FakeEnv::new();
-        env.contended.insert(f.run_id.clone());
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::OperationLockHeld { .. }
-        ));
-        assert!(f.clone.exists());
-
-        // (2) the host consumer probe.
-        let f = fx();
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        *env.probe.borrow_mut() = Box::new(|_| rp::ConsumerProbe::Held {
-            detail: "pid 4242 has an open file here".into(),
-        });
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::LiveConsumer { .. }
-        ));
-        assert!(f.clone.exists());
-
-        // (3) the container axis: a runtime is configured and did not answer for this payload.
-        let f = fx();
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            1,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::ContainerAxisUnanswered
-        ));
-        assert!(f.clone.exists());
-
-        // (4) the shape gate: an ambiguous `.git` proves nothing, licensed or not.
-        let f = fx();
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        std::fs::remove_dir_all(f.clone.join(".git")).unwrap();
-        std::fs::write(f.clone.join(".git"), "gitdir: /elsewhere\n").unwrap();
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::NotAStandaloneClone { .. }
-        ));
-        assert!(f.clone.exists());
-
-        // (5) evidence preservation: an AMBIGUOUS sidecar still refuses.
-        let f = fx();
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let sidecar = sr::evidence_dir(&f.clone);
-        std::fs::remove_dir_all(&sidecar).unwrap();
-        std::os::unix::fs::symlink(&f.source, &sidecar).unwrap();
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert!(matches!(
-            parked_reason(&r, &f.clone),
-            rp::ParkReason::EvidencePreservationFailed { .. }
-        ));
-        assert!(f.clone.exists());
-    }
-
-    /// The ref sweep IS part of the content-on-main proof (it asks the same D-1 question of every
-    /// other tip), so the license replaces it too — otherwise the abandoned runs the license exists to
-    /// clear, which are precisely the ones carrying rogue branches and stashes, would still park.
-    /// Discriminates a license wired only into the HEAD verdict. The unlicensed twin of this fixture
-    /// is `a_landed_head_with_an_unlanded_side_branch_is_parked`.
-    #[test]
-    fn a_dispositioned_clone_with_a_rogue_branch_is_deleted() {
-        let f = fx();
-        git(&f.clone, &["checkout", "-q", "-b", "agent-went-rogue"]);
-        write(
-            &f.clone.join("only-on-that-branch.rs"),
-            "pub fn unique() {}\n",
-        );
-        git(&f.clone, &["add", "-A"]);
-        git(&f.clone, &["commit", "-qm", "the agent committed itself"]);
-        git(&f.clone, &["checkout", "-q", "main"]);
-
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-        let gates = &item_for(&r, &f.clone).gates;
-        assert!(
-            gates
-                .iter()
-                .any(|g| g.contains("RECORDED, not gated") && g.contains("replaces the ref sweep")),
-            "the gates do not disclose that the ref sweep was replaced: {gates:?}"
-        );
-        // ...and the loss is enumerable rather than merely permitted (R2).
-        assert!(
-            gates
-                .iter()
-                .any(|g| g.contains("agent-went-rogue") && g.contains("went with the clone")),
-            "the gates do not name what the licensed deletion took: {gates:?}"
-        );
     }
 
     /// A licensed run refused BEFORE the boundary — by D-2 at the scan root, or by an admission gate
@@ -5913,31 +4497,6 @@ mod tests {
         );
     }
 
-    /// A license is an ENUMERATION of runs, never a mode. Discriminates a `--disposition-list` that
-    /// switches the gate off for the whole invocation.
-    #[test]
-    fn a_license_that_does_not_name_this_run_changes_nothing() {
-        let f = fx();
-        clone_commit(&f, "feat/x", "src/only-here.rs", "pub fn unique() {}\n");
-        let lic = license(&f, &["impl-4242-someone-else"]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "no"),
-            other => panic!("an unnamed run was licensed: {other:?}"),
-        }
-        assert!(f.clone.join("src/only-here.rs").exists());
-    }
-
     /// A list is written by hand against an earlier report, so by the time it is used a run may be
     /// gone. That is a NOTE — refusing the whole command would refuse to act on the runs it does
     /// name. Discriminates both a hard error and a silent drop.
@@ -5975,480 +4534,580 @@ mod tests {
         );
     }
 
-    /// F1 x F2. A chained clone whose parent was reaped first has a BROKEN chain by construction —
-    /// and that is exactly the population an owner disposition exists to clear. The license must not
-    /// rest on a source repository, and the receipt must say honestly that none was found rather than
-    /// naming one.
-    #[test]
-    fn a_dispositioned_clone_with_an_unresolvable_origin_is_still_deleted() {
-        let f = fx();
-        let (b, _) = clone_into_root(&f, &f.source, "bb");
-        let (a, a_id) = clone_into_root(&f, &b, "cc");
-        // The parent went first.
-        std::fs::remove_dir_all(&b).unwrap();
-
-        let lic = license(&f, &[a_id.as_str()]);
-        let items = items_for(&scan(&f.implement), &a);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert_eq!(item_for(&r, &a).outcome, rp::ItemOutcome::Deleted);
-        let v = fold_receipt_for(&f, &a_id);
-        assert_eq!(v["containment"]["verdict"], VERDICT_OWNER_DISPOSITION);
-        assert!(
-            v["source_repo"].is_null(),
-            "the receipt named a source repository that was never resolved: {}",
-            v["source_repo"]
-        );
-        assert!(
-            v["origin_chain"][0]
-                .as_str()
-                .unwrap()
-                .contains("UNRESOLVED"),
-            "the receipt does not record that the chain could not be walked: {}",
-            v["origin_chain"]
-        );
-        // R7: the `None` arm of the removal guard, exercised through a REAL licensed removal rather
-        // than as a unit — and saying which of its two shapes it proved.
-        assert!(
-            item_for(&r, &a)
-                .gates
-                .iter()
-                .any(|g| g.contains("No source repository was resolved")
-                    && g.contains("none for this removal to endanger")),
-            "the guard did not disclose that it ran without a source: {:?}",
-            item_for(&r, &a).gates
-        );
-
-        // The SAME clone without the license parks: the license is what changed the outcome.
-        let f2 = fx();
-        let (b2, _) = clone_into_root(&f2, &f2.source, "bb");
-        let (a2, _) = clone_into_root(&f2, &b2, "cc");
-        std::fs::remove_dir_all(&b2).unwrap();
-        let items2 = items_for(&scan(&f2.implement), &a2);
-        let r2 = run(&f2, &items2, &FakeEnv::new(), false);
-        assert!(matches!(
-            parked_reason(&r2, &a2),
-            rp::ParkReason::OriginNotLocal { .. }
-        ));
-        assert!(a2.exists());
-    }
-
     // =========================================================================================
     // S4b review repairs (R1–R7)
     // =========================================================================================
 
-    /// R1. `git -C <dir>` ASCENDS: pointed at a plain directory it answers from whatever repository
-    /// encloses it. So an `origin` naming a non-repository INSIDE the source's own tree made the
-    /// enclosing repository answer the D-1 question — and the clone was deleted on a history nobody
-    /// asked about, while the gate string claimed "a real git repository". The terminal root must
-    /// pass the same repository check the in-root hops already did.
-    ///
-    /// Discriminates exactly that: the plain directory sits inside the source, whose main DOES contain
-    /// the clone's HEAD, so an ascending probe answers `yes(head)` and deletes.
-    #[test]
-    fn an_origin_naming_a_plain_directory_inside_a_repo_parks() {
-        let f = fx();
-        let plain = f.source.join("vendor/plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        git(
-            &f.clone,
-            &["remote", "set-url", "origin", plain.to_str().unwrap()],
-        );
-
-        let items = scan(&f.implement);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::OriginNotLocal { detail } => assert!(
-                detail.contains("exists but is NOT a git repository"),
-                "unexpected detail: {detail}"
-            ),
-            other => panic!("an enclosing repository answered for a plain directory: {other:?}"),
-        }
-        assert!(
-            f.clone.exists(),
-            "the clone was deleted on an enclosing repository's history"
-        );
-    }
-
-    /// R1, the other half. [`looks_like_git_repo`] is a FILESYSTEM check: a directory holding an empty
-    /// `.git/` passes it, and git then rejects that `.git` as invalid and CARRIES ON UP — so the
-    /// enclosing repository answers after all, and the shape check alone does not close the hole.
-    /// `GIT_CEILING_DIRECTORIES` does, and only when it names the PARENT (an entry equal to the start
-    /// directory matches no ancestor and is a silent no-op).
-    ///
-    /// Discriminates exactly the ascent: the decoy sits inside the source repository, whose main
-    /// contains the clone's HEAD, so an ascending probe answers `yes(head)` and deletes.
-    #[test]
-    fn an_origin_whose_git_is_invalid_never_falls_through_to_the_enclosing_repo() {
-        let f = fx();
-        let decoy = f.source.join("vendor/decoy");
-        std::fs::create_dir_all(decoy.join(".git")).unwrap();
-        assert!(
-            looks_like_git_repo(&decoy),
-            "the fixture must model a directory the SHAPE check accepts"
-        );
-        git(
-            &f.clone,
-            &["remote", "set-url", "origin", decoy.to_str().unwrap()],
-        );
-
-        let items = scan(&f.implement);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "unknown"),
-            other => {
-                panic!("an enclosing repository answered through an invalid `.git`: {other:?}")
-            }
-        }
-        assert!(
-            f.clone.exists(),
-            "the clone was deleted on an enclosing repository's history"
-        );
-    }
-
-    /// R2. The ref sweep is part of the content-on-main proof, so an owner disposition replaces it —
-    /// the run is abandoned, tips and all. But the loss must be INFORMED: what the deletion took has
-    /// to be enumerable from the receipt afterwards. An INVENTORY (never a gate) records every tip.
-    /// Discriminates a licensed path that simply skips the refs and leaves no trace of them.
-    #[test]
-    fn a_licensed_deletion_records_an_inventory_of_every_ref_it_took() {
-        let f = fx();
-        git(&f.clone, &["checkout", "-q", "-b", "agent-went-rogue"]);
-        write(
-            &f.clone.join("only-on-that-branch.rs"),
-            "pub fn unique() {}\n",
-        );
-        git(&f.clone, &["add", "-A"]);
-        git(&f.clone, &["commit", "-qm", "the agent committed itself"]);
-        let rogue = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
-        git(&f.clone, &["checkout", "-q", "main"]);
+    fn landing(f: &Fx) -> bridge_controller::merge::LandingEvidence {
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
         let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
-
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert_eq!(item_for(&r, &f.clone).outcome, rp::ItemOutcome::Deleted);
-
-        let v = fold_receipt(&f);
-        let inv = v["ref_inventory"]
-            .as_array()
-            .expect("no ref inventory on a licensed receipt");
-        let rogue_row = inv
-            .iter()
-            .find(|r| r["refname"] == "refs/heads/agent-went-rogue")
-            .unwrap_or_else(|| panic!("the inventory does not name the rogue branch: {inv:?}"));
-        assert_eq!(
-            rogue_row["oid"], rogue,
-            "the inventory does not carry the oid"
-        );
-        assert_eq!(rogue_row["is_head"], false);
-        assert_eq!(
-            rogue_row["is_ancestor_of_head"], false,
-            "a tip outside HEAD's history was recorded as inside it"
-        );
-        let head_row = inv
-            .iter()
-            .find(|r| r["refname"] == "refs/heads/main")
-            .expect("the inventory omits the checked-out branch");
-        assert_eq!(head_row["oid"], head);
-        assert_eq!(head_row["is_head"], true);
-        // ...and the operator sees it without opening the JSON.
-        let gates = &item_for(&r, &f.clone).gates;
-        assert!(
-            gates
-                .iter()
-                .any(|g| g.contains("ref inventory") && g.contains("agent-went-rogue")),
-            "the gate text does not name what the deletion took: {gates:?}"
-        );
-    }
-
-    /// R4. A chain hop with no checkpoint is followed on its `remote.origin.url` alone, and that URL
-    /// lives in a directory a `:rw` container could write. So the TERMINAL root is corroborated
-    /// independently: it must contain something the clone itself claims about its own provenance —
-    /// its checkpoint's base commit, or failing that its lineage ROOT commit, which a clone shares
-    /// with the repository it was cloned from no matter how much work was added on top.
-    ///
-    /// Discriminates a resolver that accepts whatever the chain points at: here the foreign repo
-    /// carries the clone's EXACT TREE (so containment answers `yes(tree)` and deletes) while sharing
-    /// no history with it at all.
-    #[test]
-    fn a_terminal_root_that_shares_no_history_with_the_clone_parks() {
-        let f = fx();
-        let (b, _) = clone_into_root(&f, &f.source, "bb");
-        let (a, _) = clone_into_root(&f, &b, "cc");
-
-        // A foreign repository with byte-identical content and an unrelated history.
-        let foreign = f.root.join("foreign");
-        std::fs::create_dir_all(&foreign).unwrap();
-        git(&foreign, &["init", "--initial-branch=main", "-q"]);
-        write(&foreign.join("README.md"), "one\n");
-        write(&foreign.join("src/lib.rs"), "pub fn a() {}\n");
-        write(&foreign.join(".gitignore"), "/target\n");
-        git(&foreign, &["add", "-A"]);
-        git(
-            &foreign,
-            &["commit", "-qm", "same content, unrelated history"],
-        );
-        assert_eq!(
-            sr::git_str(&a, &["rev-parse", "HEAD^{tree}"]).unwrap(),
-            sr::git_str(&foreign, &["rev-parse", "HEAD^{tree}"]).unwrap(),
-            "the fixture must model a foreign repo whose TREE matches, or it proves nothing"
-        );
-        git(
-            &b,
-            &["remote", "set-url", "origin", foreign.to_str().unwrap()],
-        );
-
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        match parked_reason(&r, &a) {
-            rp::ParkReason::NotOnSourceMain { verdict, detail } => {
-                assert_eq!(verdict, "unknown");
-                assert!(
-                    detail.contains("corroborat"),
-                    "the refusal does not say the root was uncorroborated: {detail}"
-                );
-            }
-            other => panic!("an uncorroborated terminal root answered the D-1 question: {other:?}"),
-        }
-        assert!(
-            a.exists(),
-            "a clone was deleted against a repository it never came from"
-        );
-    }
-
-    /// R5. `source_repo: None` drops the removal guard's "the source is neither the clone nor inside
-    /// it" clause. That is only honest when there IS no source directory — the parent-already-reaped
-    /// case. When the clone's own `origin` names a directory that EXISTS, the guard must still get it,
-    /// license or no license. Discriminates a licensed path that answers `None` for every resolver
-    /// failure: here `origin` names a repository INSIDE the clone, which the guard exists to refuse.
-    #[test]
-    fn a_licensed_clone_whose_existing_origin_is_inside_itself_is_refused_by_the_guard() {
-        let f = fx();
-        // Under `.git/`, so `git status` says nothing about it and the clone reaches the removal
-        // guard on a CLEAN tree — the gate under test here is the guard's source clause, not the
-        // dirty-state gate.
-        let inner = f.clone.join(".git/vendored-source");
-        std::fs::create_dir_all(&inner).unwrap();
-        git(&inner, &["init", "--initial-branch=main", "-q"]);
-        git(
+        bridge_controller::merge::classify_landing(
             &f.clone,
-            &["remote", "set-url", "origin", inner.to_str().unwrap()],
-        );
-
-        let lic = license(&f, &[f.run_id.as_str()]);
-        let items = items_for(&scan(&f.implement), &f.clone);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
+            &ck,
+            &head,
             DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        match parked_reason(&r, &f.clone) {
-            rp::ParkReason::RemovalGuardRefused { detail } => assert!(
-                detail.contains("INSIDE the clone"),
-                "unexpected detail: {detail}"
-            ),
-            other => panic!("the guard's source clause was dropped under a license: {other:?}"),
-        }
-        assert!(f.clone.exists());
-        assert!(env.removed().is_empty());
+        )
     }
 
-    /// R6. THE stranding defect. Rows are processed in scan order, so a parent clone can be removed
-    /// before the child whose `origin` names it — and the child then resolves nothing, PERMANENTLY:
-    /// no later invocation rewrites a dead `origin`. Resolving every candidate's chain during
-    /// ADMISSION, before any deletion, is what makes deletion order irrelevant; the terminal root is
-    /// outside the scan root by construction, so it survives every sibling removal.
-    ///
-    /// Discriminates order-dependent resolution by running the SAME production shape both ways.
     #[test]
-    fn a_chained_pair_is_reaped_in_one_invocation_whatever_the_order() {
-        for reversed in [false, true] {
+    fn only_exact_main_trailers_confirm_provenance() {
+        for case in [
+            "exact",
+            "wrong-run",
+            "wrong-original",
+            "duplicate",
+            "other-branch",
+        ] {
             let f = fx();
-            // Both clones' HEADs are already on the source's main, so both are deletable; A's only
-            // route to the source runs THROUGH B.
-            let (b, b_id) = clone_into_root(&f, &f.source, "bb");
-            let (a, a_id) = clone_into_root(&f, &b, "cc");
-            write_checkpoint(&b, &b_id, &f.source);
-            write_checkpoint(&a, &a_id, &b);
+            let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+            let run = if case == "wrong-run" {
+                "impl-foreign"
+            } else {
+                &f.run_id
+            };
+            let original = if case == "wrong-original" {
+                "wrong"
+            } else {
+                &head
+            };
+            let duplicate = if case == "duplicate" {
+                "\nA2A-Run: impl-foreign"
+            } else {
+                ""
+            };
+            git(
+                &f.source,
+                &[
+                    "commit",
+                    "--amend",
+                    "--allow-empty",
+                    "-qm",
+                    &format!("landed\n\nA2A-Run: {run}\nA2A-Original: {original}{duplicate}"),
+                ],
+            );
+            let matched = sr::git_str(&f.source, &["rev-parse", "main"]).unwrap();
+            if case == "other-branch" {
+                git(&f.source, &["branch", "side", &matched]);
+                git(&f.source, &["update-ref", "refs/heads/main", &head]);
+            }
+            let evidence = landing(&f);
+            assert_eq!(
+                evidence.confirmed(),
+                case == "exact",
+                "{case}: {evidence:?}"
+            );
+            if case == "exact" {
+                assert_eq!(evidence.matched_commit.as_deref(), Some(matched.as_str()));
+            }
+        }
+    }
 
-            let mut items = scan(&f.implement);
-            if reversed {
-                items.reverse();
+    #[test]
+    fn patch_and_content_equivalence_are_reported_and_parked() {
+        for content_only in [false, true] {
+            let f = fx();
+            if content_only {
+                write(&f.source.join("unrelated"), "additional integration work");
+                git(&f.source, &["add", "unrelated"]);
+            }
+            let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+            git(
+                &f.source,
+                &["update-ref", "refs/heads/main", &ck.base_commit],
+            );
+            git(&f.source, &["add", "-A"]);
+            git(&f.source, &["commit", "-qm", "ordinary landing"]);
+            let evidence = landing(&f);
+            assert_eq!(
+                evidence.confidence,
+                if content_only {
+                    "low-content-equivalence"
+                } else {
+                    "high-patch-equivalence"
+                }
+            );
+            let env = FakeEnv::new();
+            let report = run(&f, &scan(&f.implement), &env, false);
+            let reason = parked_reason(&report, &f.clone).summary();
+            for field in [
+                &f.run_id,
+                "confidence",
+                "matched",
+                "source",
+                "deletion blockers",
+            ] {
+                assert!(reason.contains(field), "{reason}");
+            }
+            assert!(f.clone.exists());
+            assert!(env.removed().is_empty());
+        }
+    }
+
+    #[test]
+    fn content_equivalence_requires_every_path_deletion_and_time_window() {
+        for case in ["match", "missing", "wrong-deletion", "partial", "late"] {
+            let f = fx();
+            let (mut ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+            ck.base_commit = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+            git(&f.clone, &["rm", "README.md"]);
+            write(&f.clone.join("new"), "new bytes");
+            write(&f.clone.join("src/lib.rs"), "changed bytes");
+            git(&f.clone, &["add", "-A"]);
+            git(&f.clone, &["commit", "-qm", "run delta"]);
+            bridge_controller::implement_resume::save_checkpoint(&f.clone, &ck).unwrap();
+            if case != "wrong-deletion" {
+                git(&f.source, &["rm", "README.md"]);
+            }
+            if case != "missing" {
+                write(&f.source.join("new"), "new bytes");
+            }
+            if case != "partial" {
+                write(&f.source.join("src/lib.rs"), "changed bytes");
+            }
+            write(&f.source.join("extra"), "makes patch different");
+            git(&f.source, &["add", "-A"]);
+            let clone_time: i64 = sr::git_str(&f.clone, &["show", "-s", "--format=%ct", "HEAD"])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let time = clone_time + if case == "late" { 14 * 86400 + 1 } else { 1 };
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&f.source)
+                .args(["commit", "-qm", "integration"])
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_COMMITTER_DATE", format!("{time} +0000"))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}", out);
+            let evidence = landing(&f);
+            assert_eq!(
+                evidence.confidence,
+                if case == "match" {
+                    "low-content-equivalence"
+                } else {
+                    "absent"
+                },
+                "{case}: {evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_and_probe_failures_preserve_clone_and_remote() {
+        for case in [
+            "missing-checkpoint",
+            "invalid-schema",
+            "missing-config",
+            "invalid-config",
+            "missing-main",
+        ] {
+            let f = fx();
+            let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+            match case {
+                "missing-checkpoint" => std::fs::remove_file(
+                    bridge_controller::implement_resume::checkpoint_path(&f.clone),
+                )
+                .unwrap(),
+                "invalid-schema" => {
+                    let path = bridge_controller::implement_resume::checkpoint_path(&f.clone);
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["schema_version"] = serde_json::json!(999);
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "missing-config" => std::fs::remove_file(&ck.config_path).unwrap(),
+                "invalid-config" => write(&ck.config_path, "invalid toml"),
+                "missing-main" => git(&f.source, &["update-ref", "-d", "refs/heads/main"]),
+                _ => unreachable!(),
             }
             let env = FakeEnv::new();
-            let r = run(&f, &items, &env, false);
-            assert_eq!(
-                item_for(&r, &a).outcome,
-                rp::ItemOutcome::Deleted,
-                "reversed={reversed}: the chained child was stranded by its parent's removal: {:?}",
-                item_for(&r, &a).outcome
-            );
-            assert_eq!(
-                item_for(&r, &b).outcome,
-                rp::ItemOutcome::Deleted,
-                "reversed={reversed}: the parent was not reaped"
-            );
-            assert_eq!(
-                fold_receipt_for(&f, &a_id)["source_repo"],
-                sr::display_path(&f.source),
-                "reversed={reversed}: the child's receipt does not name the true source"
-            );
-            assert!(f.source.join("src/lib.rs").exists());
+            let report = run(&f, &scan(&f.implement), &env, false);
+            assert!(matches!(
+                item_for(&report, &f.clone).outcome,
+                rp::ItemOutcome::Parked { .. }
+            ));
+            assert!(f.clone.exists());
+            assert_remote(&f, true);
+            if case == "missing-main" {
+                assert_eq!(landing(&f).confidence, "unknown");
+            }
         }
     }
 
-    /// R7. The Q1 boundary: a license is per-run, and the runs it does NOT name must be judged
-    /// exactly as they would be without it — in the SAME invocation, where a mode-shaped
-    /// implementation would leak across.
-    #[test]
-    fn a_listed_and_an_unlisted_clone_are_judged_differently_in_one_invocation() {
-        let f = fx();
-        let (listed, listed_id) = clone_into_root(&f, &f.source, "bb");
-        let (unlisted, _) = clone_into_root(&f, &f.source, "cc");
-        for (c, name) in [(&listed, "listed.rs"), (&unlisted, "unlisted.rs")] {
-            git(c, &["checkout", "-q", "-b", "feat/x"]);
-            write(&c.join(name), "pub fn unique() {}\n");
-            git(c, &["add", "-A"]);
-            git(c, &["commit", "-qm", "never landed"]);
-        }
+    fn assert_remote(f: &Fx, present: bool) {
+        let remote = f.root.join("backup.git");
+        let reference = format!("refs/heads/wip/{}", f.run_id);
+        let out = sr::git_ro(&remote, &["show-ref", "--verify", &reference]).unwrap();
+        assert_eq!(out.status.success(), present, "{reference}");
+    }
 
-        let lic = license(&f, &[listed_id.as_str()]);
-        let items = scan(&f.implement);
-        let env = FakeEnv::new();
-        let r = run_licensed(
-            &f,
-            &items,
-            &env,
-            false,
-            0,
-            DEFAULT_CLONE_REAP_LOOKBACK,
-            Some(&lic),
-        );
-        assert_eq!(item_for(&r, &listed).outcome, rp::ItemOutcome::Deleted);
-        match parked_reason(&r, &unlisted) {
-            rp::ParkReason::NotOnSourceMain { verdict, .. } => assert_eq!(verdict, "no"),
-            other => panic!("the license leaked onto a run it does not name: {other:?}"),
+    #[test]
+    fn shared_gate_agrees_with_reap_for_all_custody_blockers() {
+        for case in [
+            "remote-mismatch",
+            "disabled-push",
+            "dirty",
+            "bad-archive",
+            "side-ref",
+            "index",
+            "nested",
+            "worktree",
+            "ignored",
+        ] {
+            let f = fx();
+            let (ck, mut cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+            match case {
+                "remote-mismatch" => git(
+                    &f.root.join("backup.git"),
+                    &[
+                        "update-ref",
+                        &format!("refs/heads/wip/{}", f.run_id),
+                        &ck.base_commit,
+                    ],
+                ),
+                "disabled-push" => {
+                    cfg.custody.push = false;
+                    let raw = std::fs::read_to_string(&ck.config_path).unwrap().replace(
+                        "delete_remote_on_merge = true",
+                        "delete_remote_on_merge = true\npush = false",
+                    );
+                    write(&ck.config_path, &raw);
+                }
+                "dirty" => write(&f.clone.join("src/lib.rs"), "dirty"),
+                "bad-archive" => {
+                    let archive = cfg
+                        .evidence
+                        .path
+                        .as_ref()
+                        .unwrap()
+                        .join(bridge_controller::evidence::repo_key(&f.source).unwrap())
+                        .join(format!("{}.tar.gz", f.run_id));
+                    write(&archive, "invalid");
+                }
+                "side-ref" => git(
+                    &f.clone,
+                    &[
+                        "update-ref",
+                        "refs/stash",
+                        ck.current_commit.as_deref().unwrap(),
+                    ],
+                ),
+                "index" => git(
+                    &f.clone,
+                    &["update-index", "--assume-unchanged", "src/lib.rs"],
+                ),
+                "nested" => {
+                    std::fs::create_dir_all(f.clone.join("target/nested/.git")).unwrap();
+                }
+                "worktree" => {
+                    git(
+                        &f.clone,
+                        &[
+                            "worktree",
+                            "add",
+                            "-q",
+                            "-b",
+                            "linked",
+                            f.root.join("linked").to_str().unwrap(),
+                        ],
+                    );
+                }
+                "ignored" => write(&f.clone.join("target/ordinary-output"), "cache"),
+                _ => unreachable!(),
+            }
+            let failures = bridge_controller::clone_deletion::failures_for_phase(
+                &f.clone,
+                &ck,
+                &cfg.custody,
+                &cfg.evidence,
+                "approved",
+            );
+            assert_eq!(
+                failures.is_empty(),
+                case == "ignored",
+                "{case}: {failures:?}"
+            );
+            let env = FakeEnv::new();
+            let report = run(&f, &scan(&f.implement), &env, false);
+            assert_eq!(
+                matches!(
+                    item_for(&report, &f.clone).outcome,
+                    rp::ItemOutcome::Deleted
+                ),
+                case == "ignored",
+                "{case}: {report:?}"
+            );
+            assert_remote(&f, case != "ignored");
         }
-        assert!(
-            unlisted.join("unlisted.rs").exists(),
-            "unlisted work was destroyed"
+    }
+
+    #[test]
+    fn explicit_remove_discards_dirty_parked_work_and_keeps_actual_archive_phase() {
+        let f = fx();
+        git(&f.source, &["update-ref", "-d", "refs/heads/main"]);
+        write(&f.clone.join("unsaved"), "owner-authorized discard");
+        git(
+            &f.clone,
+            &["update-index", "--assume-unchanged", "src/lib.rs"],
         );
+        git(&f.clone, &["update-ref", "refs/stash", "HEAD"]);
+        std::fs::create_dir_all(f.clone.join("target/nested/.git")).unwrap();
+        let (_, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let lic = license(&f, &[&f.run_id]);
+        let env = FakeEnv::new();
+        let report = run_licensed(&f, &scan(&f.implement), &env, false, 0, 2000, Some(&lic));
         assert_eq!(
-            fold_receipt_for(&f, &listed_id)["containment"]["verdict"],
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted,
+            "{report:?}"
+        );
+        assert_remote(&f, false);
+        let archive = cfg
+            .evidence
+            .path
+            .unwrap()
+            .join(bridge_controller::evidence::repo_key(&f.source).unwrap())
+            .join(format!("{}.tar.gz", f.run_id));
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(archive).unwrap(),
+        ));
+        let mut phase = None;
+        for entry in tar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == Path::new("manifest.json") {
+                let manifest: bridge_controller::evidence::Manifest =
+                    serde_json::from_reader(&mut entry).unwrap();
+                phase = Some(manifest.terminal_phase);
+            }
+        }
+        assert_eq!(phase.as_deref(), Some("approved"));
+        assert_eq!(
+            fold_receipt(&f)["containment"]["verdict"],
             VERDICT_OWNER_DISPOSITION
         );
     }
 
-    /// R7. `starts_with(scan_root)` decides whether a hop is a sibling quarantine clone or the true
-    /// source, so it must be applied to the RESOLVED path. Discriminates a lexical test: a `../`
-    /// relative URL and a symlink pointing into the root both name in-root siblings without looking
-    /// like it.
     #[test]
-    fn the_scan_root_boundary_is_decided_on_the_resolved_path() {
-        // (1) a relative `../<sibling>` URL.
+    fn keep_unspecified_and_contradictory_decisions_preserve_work() {
         let f = fx();
-        let (b, b_id) = clone_into_root(&f, &f.source, "bb");
-        write_checkpoint(&b, &b_id, &f.source);
-        let (a, a_id) = clone_into_root(&f, &b, "cc");
-        write_checkpoint(&a, &a_id, &b);
-        git(&a, &["remote", "set-url", "origin", &format!("../{b_id}")]);
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
+        let mut lic = license(&f, &["impl-other"]);
+        lic.keep_run_ids.insert(f.run_id.clone());
+        let env = FakeEnv::new();
+        let report = run_licensed(&f, &scan(&f.implement), &env, false, 0, 2000, Some(&lic));
+        assert!(parked_reason(&report, &f.clone).summary().contains("keep"));
+        assert_remote(&f, true);
+        assert!(parse_disposition_document(&format!(r#"{{"authorized_by":"owner","reason":"reviewed","run_ids":["{}"],"keep_run_ids":["{}"]}}"#, f.run_id, f.run_id)).is_err());
+        // A programmatic contradictory document is refused too, before deletion.
+        lic.run_ids.insert(f.run_id.clone());
+        let report = run_licensed(&f, &scan(&f.implement), &env, false, 0, 2000, Some(&lic));
+        assert!(matches!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Parked { .. }
+        ));
+        assert_remote(&f, true);
+    }
+
+    #[test]
+    fn failed_local_removal_never_deletes_remote_refs() {
+        let f = fx();
+        let env = FakeEnv::new();
+        *env.remove.borrow_mut() = Box::new(|_| Err("injected local removal failure".into()));
+        let report = run(&f, &scan(&f.implement), &env, false);
+        assert!(!matches!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted
+        ));
+        assert_remote(&f, true);
+    }
+
+    #[test]
+    fn changed_remote_ref_after_preparation_is_retained_and_reported() {
+        let f = fx();
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let remote = f.root.join("backup.git");
+        let reference = format!("refs/heads/wip/{}", f.run_id);
+        let env = FakeEnv::new();
+        *env.remove.borrow_mut() = Box::new(move |path| {
+            git(&remote, &["update-ref", &reference, &ck.base_commit]);
+            std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+        });
+        let report = run(&f, &scan(&f.implement), &env, false);
         assert_eq!(
-            item_for(&r, &a).outcome,
-            rp::ItemOutcome::Deleted,
-            "a relative in-root origin was not followed: {:?}",
-            item_for(&r, &a).outcome
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted
         );
-        let chain = fold_receipt_for(&f, &a_id)["origin_chain"]
-            .as_array()
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("incomplete remote cleanup")));
+        assert_remote(&f, true);
+    }
+    #[test]
+    fn rename_equivalence_requires_the_old_path_to_be_deleted() {
+        let f = fx();
+        let (mut ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        ck.base_commit = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        git(&f.clone, &["mv", "README.md", "renamed.md"]);
+        git(&f.clone, &["commit", "-qm", "rename"]);
+        bridge_controller::implement_resume::save_checkpoint(&f.clone, &ck).unwrap();
+        write(&f.source.join("renamed.md"), "one\n");
+        write(&f.source.join("extra"), "unrelated");
+        git(&f.source, &["add", "-A"]);
+        git(&f.source, &["commit", "-qm", "copy plus integration"]);
+        assert_eq!(landing(&f).confidence, "absent");
+    }
+
+    #[test]
+    fn automatic_and_owner_cleanup_remove_recorded_normal_and_dirty_refs() {
+        for explicit in [false, true] {
+            let f = fx();
+            let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+            let sha = ck.current_commit.as_ref().unwrap();
+            let dirty = format!("refs/heads/wip/{}-dirty", f.run_id);
+            git(&f.root.join("backup.git"), &["update-ref", &dirty, sha]);
+            let path = bridge_controller::implement_resume::checkpoint_path(&f.clone);
+            let mut checkpoint: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            checkpoint["custody"]["dirty"] = serde_json::json!({"ref":dirty,"last_pushed_sha":sha});
+            std::fs::write(path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+            if explicit {
+                let raw = std::fs::read_to_string(&ck.config_path).unwrap().replace(
+                    "delete_remote_on_merge = true",
+                    "delete_remote_on_merge = false",
+                );
+                write(&ck.config_path, &raw);
+                git(&f.source, &["update-ref", "-d", "refs/heads/main"]);
+            }
+            let lic = license(&f, &[&f.run_id]);
+            let env = FakeEnv::new();
+            let report = run_licensed(
+                &f,
+                &scan(&f.implement),
+                &env,
+                false,
+                0,
+                2000,
+                explicit.then_some(&lic),
+            );
+            assert_eq!(
+                item_for(&report, &f.clone).outcome,
+                rp::ItemOutcome::Deleted,
+                "{report:?}"
+            );
+            assert_remote(&f, false);
+            assert!(!sr::git_ro(
+                &f.root.join("backup.git"),
+                &["show-ref", "--verify", &dirty]
+            )
             .unwrap()
-            .len();
-        assert_eq!(
-            chain, 2,
-            "the relative URL did not resolve as an in-root hop"
-        );
+            .status
+            .success());
+        }
+    }
 
-        // (2) a path whose PARENT is a symlink outside the root and whose leaf is a real directory
-        //     inside it. Lexically it is not under the scan root; canonically it is a sibling clone,
-        //     and reading it as the true source would ask the D-1 question of a quarantine directory
-        //     again — the very defect F1 exists to fix, re-entered through a link.
-        //
-        //     (A symlink at the LEAF is refused outright by `real_dir`'s no-follow check, asserted
-        //     below, so this is the only shape that reaches the boundary test at all.)
-        let f = fx();
-        let (b, b_id) = clone_into_root(&f, &f.source, "bb");
-        write_checkpoint(&b, &b_id, &f.source);
-        let (a, a_id) = clone_into_root(&f, &b, "cc");
-        write_checkpoint(&a, &a_id, &b);
-        let alias = f.root.join("alias");
-        std::os::unix::fs::symlink(&f.implement, &alias).unwrap();
-        git(
-            &a,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                alias.join(&b_id).to_str().unwrap(),
-            ],
-        );
-        let items = items_for(&scan(&f.implement), &a);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        assert_eq!(
-            item_for(&r, &a).outcome,
-            rp::ItemOutcome::Deleted,
-            "a symlinked in-root origin was not resolved: {:?}",
-            item_for(&r, &a).outcome
-        );
-        let v = fold_receipt_for(&f, &a_id);
-        assert_eq!(
-            v["origin_chain"].as_array().unwrap().len(),
-            2,
-            "the symlinked path was taken for the true source: {}",
-            v["origin_chain"]
-        );
-        assert_eq!(v["source_repo"], sr::display_path(&f.source));
+    #[test]
+    fn owner_discard_retains_every_operational_safeguard() {
+        for case in [
+            "pid",
+            "lock",
+            "consumer",
+            "container",
+            "protected",
+            "path-swap",
+        ] {
+            let f = fx();
+            write(&f.clone.join("dirty"), "discard authorized");
+            let lic = license(&f, &[&f.run_id]);
+            let mut env = FakeEnv::new();
+            let mut items = scan(&f.implement);
+            let mut protected = rp::ProtectedRoots::default();
+            match case {
+                "pid" => {
+                    env.alive_pids.insert(DEAD_PID);
+                }
+                "lock" => {
+                    env.contended.insert(f.run_id.clone());
+                }
+                "consumer" => {
+                    *env.probe.borrow_mut() = Box::new(|_| rp::ConsumerProbe::Held {
+                        detail: "cwd held".into(),
+                    });
+                }
+                "container" => {
+                    for item in &mut items {
+                        if item.path == f.clone.display().to_string() {
+                            item.consumers.container_mount = sr::HolderState::Held;
+                        }
+                    }
+                }
+                "protected" => {
+                    protected =
+                        rp::ProtectedRoots::resolve(&[f.clone.display().to_string()], &mut vec![])
+                            .unwrap();
+                }
+                "path-swap" => {
+                    let saved = f.root.join("saved");
+                    *env.probe.borrow_mut() = Box::new(move |path| {
+                        std::fs::rename(path, &saved).unwrap();
+                        std::fs::create_dir_all(path.join(".git")).unwrap();
+                        rp::ConsumerProbe::Free
+                    });
+                }
+                _ => unreachable!(),
+            }
+            let report = reap_clones(
+                ClonesRequest {
+                    scan_root: &f.implement,
+                    items: &items,
+                    protected: &protected,
+                    dry_run: false,
+                    runtimes_configured: 0,
+                    lookback: 2000,
+                    disposition: Some(&lic),
+                },
+                &env,
+            );
+            assert!(
+                matches!(
+                    item_for(&report, &f.clone).outcome,
+                    rp::ItemOutcome::Parked { .. }
+                ),
+                "{case}: {report:?}"
+            );
+            assert!(env.removed().is_empty());
+            assert_remote(&f, true);
+        }
+    }
 
-        // (3) and a symlink at the LEAF is never followed at all — no-follow, not resolved.
+    #[test]
+    fn dry_run_does_not_publish_remove_or_clean_remote_refs() {
         let f = fx();
-        let leaf_link = f.root.join("leaf-link");
-        std::os::unix::fs::symlink(&f.source, &leaf_link).unwrap();
-        git(
-            &f.clone,
-            &["remote", "set-url", "origin", leaf_link.to_str().unwrap()],
-        );
-        let items = items_for(&scan(&f.implement), &f.clone);
-        let r = run(&f, &items, &FakeEnv::new(), false);
-        assert!(
-            matches!(
-                parked_reason(&r, &f.clone),
-                rp::ParkReason::OriginNotLocal { .. }
-            ),
-            "a symlinked origin leaf was followed"
+        let env = FakeEnv::new();
+        let report = run(&f, &scan(&f.implement), &env, true);
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Planned
         );
         assert!(f.clone.exists());
+        assert_remote(&f, true);
+        assert!(report.receipts.is_empty() && report.intents.is_empty());
+        assert!(!receipts_dir(&f.implement).exists());
+        assert!(env.removed().is_empty());
+    }
+    #[test]
+    fn configured_archive_requires_no_duplicate_copy() {
+        let f = fx();
+        let mut env = FakeEnv::new();
+        env.copy_error = Some("legacy copy port must not be invoked".into());
+        let report = run(&f, &scan(&f.implement), &env, false);
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted
+        );
+        assert!(!env.j.borrow().kinds().contains(&"copy-evidence"));
     }
 }
