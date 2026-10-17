@@ -297,6 +297,62 @@ fn a_missing_implement_root_refuses_rather_than_scanning_something_else() {
     );
 }
 
+/// Fold receipts are small deletion records under the scan root. The selected payload archive belongs
+/// to `[evidence]` and has its own retention policy; presenting those as one store would mislead an
+/// operator auditing what a clone reap retained.
+#[test]
+fn clone_reap_distinguishes_fold_receipts_from_evidence_archives_in_text_and_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("workspace");
+    std::fs::create_dir_all(repo.join(".a2a-implement")).unwrap();
+    let archives = dir.path().join("archives");
+    let config = dir.path().join("a2a-bridge.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "default = \"codex\"\nallowed_cwd_root = {repo:?}\n[server]\naddr = \"127.0.0.1:0\"\n\
+             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\n[evidence]\npath = {archives:?}\nretain_days = 7\n"
+        ),
+    )
+    .unwrap();
+    let args = [
+        "storage",
+        "reap",
+        "--clones",
+        "--dry-run",
+        "--config",
+        config.to_str().unwrap(),
+    ];
+    let text = stdout(&run(&args));
+    assert!(text.contains("fold receipts live in"), "{text}");
+    assert!(text.contains("Payload archives are separate"), "{text}");
+    assert!(
+        text.contains("`[evidence]` selects their storage location and retention policy"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("fold receipts and preserved evidence live"),
+        "{text}"
+    );
+
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let json = stdout(&run(&json_args));
+    let notes = serde_json::from_str::<serde_json::Value>(&json).unwrap()["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains("fold receipts live in"), "{notes}");
+    assert!(notes.contains("Payload archives are separate"), "{notes}");
+    assert!(
+        !notes.contains("fold receipts and preserved evidence live"),
+        "{notes}"
+    );
+}
+
 /// A daemon timeout cannot turn missing evidence into permission to discard a clone, even with an
 /// explicit owner disposition. Exercise invocation-scan and recorded-runtime queries separately.
 #[cfg(unix)]
