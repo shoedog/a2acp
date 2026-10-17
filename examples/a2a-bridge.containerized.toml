@@ -196,7 +196,7 @@ addr = "127.0.0.1:8080"
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
-model = "sonnet"   # reviewer pinned to Sonnet 4.6 (dogfood)
+model = "sonnet"   # alias; resolves to claude-sonnet-5-5 on claude-agent-acp 0.93.0 (docs/compatibility.md 2026-10-17)
 [[agents.mcp]]
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"

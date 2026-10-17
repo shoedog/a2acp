@@ -103,6 +103,22 @@ Both container lanes printed `Error response from daemon: removal of container â
 during run-end cleanup, with a successful result and no surviving container: two cleanup paths raced on the same
 removal. Codex image lanes were not rerun; the codex pins are unchanged.
 
+Same-day host checks through the operator config (claude-agent-acp 0.93.0), one fixed `PONG` each:
+
+- `claude` with `haiku`: **PASS**; the transcript records `claude-haiku-5-5`.
+- `kiro` with `deepseek-3.2`: **PASS**.
+- `opencode` with `opencode-go/kimi-k3`: **FAIL**, an operator credential problem rather than an adapter one. The
+  cause reads "This API key has expired". The bridge classified it `upstream.unknown`, not as an authentication
+  failure.
+- `openrouter` (`kind = "api"`) with `nvidia/nemotron-3-ultra-550b-a55b:free`: **FAIL** with
+  `api.prompt.sse_incomplete`. A direct request showed an in-stream OpenRouter error object
+  (`503`, "Upstream error from Nvidia: Service temporarily overloaded", `provider_overloaded`). The bridge did not
+  surface that cause. The control `openrouter/free` passed.
+
+A `smoke` against the live serve's own config is refused before any prompt is sent
+(`smoke.durable_evidence_unavailable`), because the running serve holds that durable store. Run these checks with
+a copy of the config whose `[store] path` points at a private directory.
+
 ## Provider refresh â€” 2026-10-13 (codex-acp 2.2.2, claude-agent-acp 0.90.0)
 
 Motive: codex-acp 1.13.1 does not advertise `gpt-6.1-sol` (2.2.2 does), and both adapters were several releases
