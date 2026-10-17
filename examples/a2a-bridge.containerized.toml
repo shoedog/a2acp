@@ -253,7 +253,9 @@ volumes = ["a2a-kiro-data:/root/.local/share"]
 #    DEFAULT IMPLEMENTOR = codex (gpt-5.5, effort=high). `sandbox_mode=danger-full-access` disables codex's
 #    OWN bubblewrap sandbox (absent from the image) so it can edit the :rw clone — the Docker container IS
 #    the sandbox. effort=high is now honored by the warm session (the ADR-0024 effective_config fold).
-#    To use claude instead: cmd="claude-agent-acp", drop the codex args, and mount the claude creds.
+#    To use claude instead: cmd="claude-agent-acp", drop the codex args, set model="sonnet" and
+#    mode="acceptEdits", and mount the claude creds plus deploy/containers/claude-sonnet-impl-settings.json
+#    at /root/.claude/settings.json:ro (pins sonnet -> claude-sonnet-5-5; docs/compatibility.md 2026-10-17).
 # Tier 3 — container_rw (Docker is the boundary; codex bwrap absent in-container)
 [[agents]]
 id     = "impl"

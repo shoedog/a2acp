@@ -1,0 +1,10 @@
+{
+  "model": "sonnet",
+  "availableModels": ["sonnet"],
+  "env": {
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5"
+  },
+  "permissions": {
+    "deny": ["ScheduleWakeup", "CronCreate", "CronDelete", "RemoteTrigger", "Monitor"]
+  }
+}
