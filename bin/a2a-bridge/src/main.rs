@@ -1248,6 +1248,26 @@ impl Drop for RunEndGuard {
     }
 }
 
+/// Own the operation lock from pre-clone admission through return-path container settlement.
+/// Fields drop in declaration order: even when merge admission returns an error, the container
+/// backstop finishes before the liveness lease and persistent operation lock are released.
+/// Landing alone takes the operation lock.
+struct ImplementRunCustody {
+    run_end: Option<RunEndGuard>,
+    lease: Option<bridge_core::liveness::LeaseGuard>,
+    operation: Option<bridge_core::liveness::PersistentLockGuard>,
+}
+
+impl ImplementRunCustody {
+    fn acquire(clone: &Path) -> Result<Self, String> {
+        Ok(Self {
+            run_end: None,
+            lease: None,
+            operation: Some(implement_resume::acquire_operation_lock(clone)?),
+        })
+    }
+}
+
 /// Build a [`bridge_container::ContainerRwConfig`] from a ContainerRw agent entry — shared by
 /// [`make_spawn_fn`] (per-turn) and the warm `implement` path so both compose the SAME container.
 fn container_rw_cfg_from_entry(
@@ -3554,7 +3574,7 @@ async fn merge_after_loop(
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
-    operation: Option<bridge_core::liveness::PersistentLockGuard>,
+    custody_owner: &mut ImplementRunCustody,
     entry_runtimes: &[String],
 ) -> Result<(), BoxError> {
     if !merge_requested {
@@ -3562,10 +3582,6 @@ async fn merge_after_loop(
     }
     match outcome_phase {
         implement_resume::ImplementPhase::Approved => {
-            let operation = match operation {
-                Some(lock) => lock,
-                None => implement_resume::acquire_operation_lock(clone)?,
-            };
             // Confirm under the same lock held through preflight and landing, so a concurrent
             // resume cannot start a writer between the inventory and the first host Git.
             confirm_clone_containers_absent(entry_runtimes, clone).await?;
@@ -3581,6 +3597,12 @@ async fn merge_after_loop(
                 evidence: evidence_cfg,
                 post_landing: &mut post,
             };
+            // Admission only borrows the caller's owner. Taking custody here leaves no fallible
+            // admission step that could release the lock before the caller's run-end backstop.
+            let operation = custody_owner
+                .operation
+                .take()
+                .expect("implement operation custody");
             let outcome = merge::merge_clone_with_operation_lock(
                 operation,
                 mcfg.as_ref(),
@@ -3596,7 +3618,6 @@ async fn merge_after_loop(
             std::process::exit(outcome.code());
         }
         other => {
-            drop(operation);
             eprintln!("not merged: run ended {other:?}, not Approved — resume/re-run the agent");
             std::process::exit(2);
         }
@@ -3715,6 +3736,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         chosen.ok_or("implement: could not find a free task-id")?
     };
 
+    // Lock the persistent sibling namespace before the clone exists. Keep custody through every
+    // early return, writer generation, terminal finalizer and the optional merge handoff.
+    let mut operation = ImplementRunCustody::acquire(&clone)?;
+
     // R9: resolve the base ref (or the source HEAD) to a SHA for determinism.
     let refname = base_ref.clone().unwrap_or_else(|| "HEAD".into());
     let rp = implement::run_git(Some(&repo), &["rev-parse", &refname])
@@ -3823,6 +3848,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         lease: _lease.path().to_string_lossy().to_string(),
         start: epoch_secs(),
     };
+    operation.lease = Some(_lease);
     // F-1 item 1 (review fix): the verify sweep target, keyed on the STABLE source `repo` — the same key
     // `verify::cache_volume_name` hashes over — NEVER the per-run quarantine `clone` (a fresh nonce every
     // run, which would make a SIGKILL-orphaned verify container's owner unrecoverable by the NEXT
@@ -3860,14 +3886,14 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // `retire` reaps first; this catches anything it missed, including the `:ro` reviewers). The verify
     // runtime is included so the sweep can see verify containers even when [verify].runtime differs from
     // every agent sandbox's runtime (F-1 item 1).
-    let _run_guard = RunEndGuard {
+    operation.run_end = Some(RunEndGuard {
         runtimes: run_guard_runtimes(
             &snapshot,
             &owner_config_path,
             verify_target.as_ref().map(|(runtime, _)| runtime.as_str()),
         ),
         instance_id: instance_id.clone(),
-    };
+    });
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
         wc.enabled.then(|| {
             bridge_worktree::sweep::WorktreeRunEndGuard::new(
@@ -4024,79 +4050,19 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // ones — fell through to `Drop` unsettled.
     settle_worktree_run_end(
         _wt_run_guard.as_ref(),
-        match implement::decide(completed, guard, stage, msg) {
-            implement::Action::Abort(reason) => {
-                finalize_implement_terminal(
-                    &clone,
-                    &custody_cfg,
-                    &no_commit_checkpoint,
-                    Some(implement_resume::ImplementPhase::Abort),
-                    &evidence_cfg,
-                );
-                eprintln!(
-                    "[implement] {reason} — NO commit; clone left at {}",
-                    clone.display()
-                );
-                report_agent_reply(&clone);
-                let _ = warm_runner.retire().await; // sole warm reap site; RunEndGuard is the backstop
-                Err(format!("implement: {reason}").into())
-            }
-            implement::Action::NoCommitClean => {
-                finalize_implement_terminal(
-                    &clone,
-                    &custody_cfg,
-                    &no_commit_checkpoint,
-                    Some(implement_resume::ImplementPhase::NoCommitClean),
-                    &evidence_cfg,
-                );
-                println!(
-                    "implement: made no changes; clone left at {}",
-                    clone.display()
-                );
-                report_agent_reply(&clone);
-                let _ = warm_runner.retire().await;
-                Ok(())
-            }
-            implement::Action::NoCommitDirty => {
-                finalize_implement_terminal(
-                    &clone,
-                    &custody_cfg,
-                    &no_commit_checkpoint,
-                    Some(implement_resume::ImplementPhase::NoCommitDirty),
-                    &evidence_cfg,
-                );
-                eprintln!(
-                    "[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). \
-                 Clone left at {} for inspection.",
-                    clone.display()
-                );
-                report_agent_reply(&clone);
-                let _ = warm_runner.retire().await;
-                Ok(())
-            }
-            implement::Action::Commit(message) => {
-                // Phase 1 → 2 boundary: the LAST fallible setup step. Retire the warm container on its error
-                // path too (a container exists); after this the loop body is lossy (no `?`).
-                let sha = match implement::host_commit(&clone, &message) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        finalize_implement_terminal(
-                            &clone,
-                            &custody_cfg,
-                            &no_commit_checkpoint,
-                            Some(implement_resume::ImplementPhase::CommitFailed),
-                            &evidence_cfg,
-                        );
-                        // Abort/NoCommitClean/NoCommitDirty all print the clone path; this path did
-                        // not, so a failed commit stranded the agent's complete work with no pointer.
-                        eprintln!(
-                            "[implement] commit failed; clone left at {}",
-                            clone.display()
-                        );
-                        let _ = warm_runner.retire().await;
-                        return Err(e.into());
-                    }
-                };
+        match finish_initial_implement_action(
+            implement::decide(completed, guard, stage, msg),
+            &clone,
+            &no_commit_checkpoint,
+            &custody_cfg,
+            &evidence_cfg,
+            warm_runner.as_ref(),
+        )
+        .await
+        {
+            Err(error) => Err(error),
+            Ok(None) => Ok(()),
+            Ok(Some((sha, message))) => {
                 let _ = std::fs::remove_file(clone.join(".git").join("A2A_COMMIT_MSG")); // R13 hygiene
                                                                                          // ADR-0026: build the resume checkpoint (FirstCommitCreated) before the loop.
                 let mut prod_ckpt = implement_resume::ProdCheckpoint {
@@ -4146,22 +4112,82 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                     &evidence_cfg,
                 )
                 .await;
-                merge_after_loop(
-                    merge_requested,
-                    outcome_phase,
-                    merge_cfg,
-                    &custody_cfg,
-                    &evidence_cfg,
-                    &clone,
-                    &root,
-                    onto.as_deref(),
-                    None,
-                    &entry_runtimes,
-                )
-                .await
+                if merge_requested {
+                    // merge_after_loop exits on terminal outcomes: settle before transferring the
+                    // guard, while both settlement and landing still have uninterrupted custody.
+                    settle_worktree_run_end(_wt_run_guard.as_ref(), ());
+                    merge_after_loop(
+                        true,
+                        outcome_phase,
+                        merge_cfg,
+                        &custody_cfg,
+                        &evidence_cfg,
+                        &clone,
+                        &root,
+                        onto.as_deref(),
+                        &mut operation,
+                        &entry_runtimes,
+                    )
+                    .await
+                } else {
+                    // The lifecycle owner keeps custody through the settlement epilogue and
+                    // its container backstop on return.
+                    Ok(())
+                }
             }
         },
     )
+}
+
+/// Execute the initial post-edit decision under writer custody. Terminal paths always publish their
+/// checkpoint/evidence and settle the writer, even when committing or publishing fails. A successful
+/// commit leaves the warm session available for verify/review/fix.
+async fn finish_initial_implement_action(
+    action: implement::Action,
+    clone: &Path,
+    checkpoint: &implement_resume::ImplementCheckpoint,
+    custody: &bridge_controller::custody_push::CustodyConfig,
+    evidence: &bridge_controller::evidence::EvidenceConfig,
+    runner: &resilient::ResilientWarm,
+) -> Result<Option<(String, String)>, BoxError> {
+    use implement_resume::ImplementPhase;
+    let (phase, result) = match action {
+        implement::Action::Commit(message) => match implement::host_commit(clone, &message) {
+            Ok(sha) => return Ok(Some((sha, message))),
+            Err(error) => {
+                eprintln!(
+                    "[implement] commit failed; clone left at {}",
+                    clone.display()
+                );
+                (ImplementPhase::CommitFailed, Err(error.into()))
+            }
+        },
+        implement::Action::Abort(reason) => {
+            eprintln!(
+                "[implement] {reason} — NO commit; clone left at {}",
+                clone.display()
+            );
+            (
+                ImplementPhase::Abort,
+                Err(format!("implement: {reason}").into()),
+            )
+        }
+        implement::Action::NoCommitClean => {
+            println!(
+                "implement: made no changes; clone left at {}",
+                clone.display()
+            );
+            (ImplementPhase::NoCommitClean, Ok(None))
+        }
+        implement::Action::NoCommitDirty => {
+            eprintln!("[implement] agent edited but staged NOTHING — NOT committing (agent owns staging). Clone left at {} for inspection.", clone.display());
+            (ImplementPhase::NoCommitDirty, Ok(None))
+        }
+    };
+    finalize_implement_terminal(clone, custody, checkpoint, Some(phase), evidence);
+    report_agent_reply(clone);
+    let _ = runner.retire().await;
+    result
 }
 
 fn finalize_implement_terminal(
@@ -4233,7 +4259,7 @@ async fn implement_resume_cmd(
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("implement --resume: allowed_cwd_root {root:?}: {e}"))?;
     let clone = implement_resume::resolve_clone(&root, resume_id)?;
-    let _operation = implement_resume::acquire_operation_lock(&clone)
+    let mut _operation = ImplementRunCustody::acquire(&clone)
         .map_err(|e| format!("implement --resume: run {resume_id} is busy: {e}"))?;
     let ck = implement_resume::load_checkpoint(&clone)?;
     let _clone_policy = bridge_controller::clone_config::ClonePolicyScope::install(
@@ -4331,6 +4357,7 @@ async fn implement_resume_cmd(
         lease: _lease.path().to_string_lossy().to_string(),
         start: epoch_secs(),
     };
+    _operation.lease = Some(_lease);
     // F-1 item 1 (review fix): same STABLE-repo-keyed derivation as implement_cmd — `ck.source_repo` is
     // the persisted SOURCE repo path (survives across resumes), never the resume clone. See
     // `verify_owner_token`'s doc for why the owner must be repo-keyed, not clone-keyed.
@@ -4354,14 +4381,14 @@ async fn implement_resume_cmd(
         )
         .await;
     }
-    let _run_guard = RunEndGuard {
+    _operation.run_end = Some(RunEndGuard {
         runtimes: run_guard_runtimes(
             &snapshot,
             &owner_config_path,
             verify_target.as_ref().map(|(runtime, _)| runtime.as_str()),
         ),
         instance_id: instance_id.clone(),
-    };
+    });
     let _wt_run_guard = worktree_cfg.as_ref().and_then(|wc| {
         wc.enabled.then(|| {
             bridge_worktree::sweep::WorktreeRunEndGuard::new(
@@ -4506,7 +4533,7 @@ async fn implement_resume_cmd(
             &clone,
             &root,
             onto,
-            Some(_operation),
+            &mut _operation,
             &entry_runtimes,
         )
         .await,
@@ -12429,6 +12456,7 @@ inputs = []
             let ready = clone.with_file_name("ready");
             let request = clone.with_file_name("replace-request");
             let replaced = clone.with_file_name("replaced");
+            let finished = clone.with_file_name("writer-finished");
             let marker = clone.with_file_name("host-smudge-marker");
             let payload = clone.with_file_name("payload");
             let config = clone.join(".git/config");
@@ -12459,28 +12487,51 @@ inspect)
   fi
   printf '%s true %s\n' "$id" "$paused"
   ;;
-pause) kill -STOP "$2" ;;
-unpause) kill -CONT "$2" ;;
+pause|unpause)
+  if [ "$1" = pause ]; then signal=STOP; expected=T; else signal=CONT; expected=S; fi
+  kill -"$signal" "$2" || exit 1
+  # Signals are asynchronous. Confirm the fake runtime's own transition before returning.
+  # Linux test images need no external `ps` utility.
+  remaining=500
+  while [ "$remaining" -gt 0 ]; do
+    paused=false
+    if [ -r "/proc/$2/status" ]; then
+      while read label value rest; do
+        if [ "$label" = State: ] && [ "$value" = T ]; then paused=true; fi
+      done < "/proc/$2/status"
+    else
+      state=$(ps -o stat= -p "$2") || exit 1
+      case "$state" in *T*) paused=true;; esac
+    fi
+    case "$expected:$paused" in T:true|S:false) exit 0;; esac
+    remaining=$((remaining - 1))
+    sleep 0.01
+  done
+  exit 1
+  ;;
 *) exit 1 ;;
 esac
 "#,
             )
             .unwrap();
             std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+            warm_up_script(&runtime);
             let mut writer = Writer(
                 std::process::Command::new("python3")
                     .arg("-c")
                     .arg(
                         r#"
 import pathlib, sys, time
-ready, request, payload, config, replaced = map(pathlib.Path, sys.argv[1:])
+ready, request, payload, config, replaced, finished = map(pathlib.Path, sys.argv[1:])
 ready.touch()
 while not request.exists(): time.sleep(0.001)
 config.write_bytes(payload.read_bytes())
 replaced.touch()
+# Remain live until the runtime has confirmed unpause and the host has observed replacement.
+while not finished.exists(): time.sleep(0.001)
 "#,
                     )
-                    .args([&ready, &request, &payload, &config, &replaced])
+                    .args([&ready, &request, &payload, &config, &replaced, &finished])
                     .spawn()
                     .unwrap(),
             );
@@ -12504,9 +12555,10 @@ replaced.touch()
                 .await
                 .unwrap();
             exists(&replaced).await;
-            assert!(writer.0.wait().unwrap().success());
             assert!(implement::guard_clone(&clone).is_err());
             assert!(!marker.exists());
+            std::fs::write(&finished, "").unwrap();
+            assert!(writer.0.wait().unwrap().success());
         }
     }
 
@@ -12676,6 +12728,9 @@ replaced.touch()
 [ "$#" -eq 0 ] && exit 0
 printf '%s\n' "$*" >> "$(dirname "$0")/runtime-log"
 [ "$1" = ps ] || exit 9
+if [ "$A2A_TEST_CLONE_ENTRY_MODE" = sugar ]; then
+  A2A_TEST_CLONE_ENTRY_MODE=probe "$A2A_TEST_EXECUTABLE" --exact cli_tests::clone_entry_child --quiet >&2 || exit 10
+fi
 case "$*" in *label=a2a.owner=*) exit 0;; esac
 state="$(cat "$(dirname "$0")/container-state")"
 case "$state" in
@@ -12715,6 +12770,7 @@ esac
             .args(["--exact", "cli_tests::clone_entry_child", "--nocapture"])
             .env("A2A_TEST_CLONE_ENTRY_CONFIG", config)
             .env("A2A_TEST_CLONE_ENTRY_MODE", mode)
+            .env("A2A_TEST_EXECUTABLE", std::env::current_exe().unwrap())
             .env("GIT_TRACE", trace)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -12891,6 +12947,8 @@ esac
             Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
         }
         async fn set_host_custody(&self, _: bool) -> Result<(), BridgeError> {
+            let clone = self.0.parent().unwrap().join(".a2a-implement/impl-test");
+            assert!(implement_resume::acquire_operation_lock(&clone).is_err());
             Ok(())
         }
         async fn prompt(
@@ -12904,6 +12962,8 @@ esac
             Ok(())
         }
         async fn retire(&self) -> Result<(), BridgeError> {
+            let clone = self.0.parent().unwrap().join(".a2a-implement/impl-test");
+            assert!(implement_resume::acquire_operation_lock(&clone).is_err());
             std::fs::write(&self.0, "absent").unwrap();
             Ok(())
         }
@@ -12937,6 +12997,288 @@ esac
             .contains("label=a2a.run=prior-process-run"));
     }
 
+    /// Exercise the CLI boundary in another process, so flock contention cannot accidentally
+    /// pass because a mock or a process-local mutex shares state with the implementation.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_clone_holds_operation_lock_before_git_and_releases_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        struct ChildGuard(Option<std::process::Child>, PathBuf);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                // Unblock Git before joining, including when an assertion catches a regression.
+                let _ = std::fs::write(&self.1, "");
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.wait();
+                }
+            }
+        }
+        for fail_clone in [false, true] {
+            let (root, source, _, config) = clone_entry_fixture("resume", "absent", false);
+            let mut raw = std::fs::read_to_string(&config).unwrap();
+            raw.push_str("\n[storage]\nadmission_floor_gib=0\n");
+            std::fs::write(&config, raw).unwrap();
+            let task = root.path().join("task.md");
+            std::fs::write(
+                &task,
+                "---\ntask-type: freeform\n---\nImplement the fixture task.\n",
+            )
+            .unwrap();
+            let scripts = root.path().join("scripts");
+            std::fs::create_dir(&scripts).unwrap();
+            let git = scripts.join("git");
+            let real_git = std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap();
+            let real_git = String::from_utf8(real_git.stdout).unwrap();
+            std::fs::write(
+                &git,
+                r#"#!/bin/sh
+[ "$#" -eq 0 ] && exit 0
+if [ "$1" = clone ]; then
+  for arg in "$@"; do dest="$arg"; done
+  printf '%s' "$dest" > "$A2A_TEST_BARRIER/clone-dest.tmp"
+  mv "$A2A_TEST_BARRIER/clone-dest.tmp" "$A2A_TEST_BARRIER/clone-dest"
+  remaining=1000
+  while [ ! -f "$A2A_TEST_BARRIER/continue" ]; do
+    [ "$remaining" -gt 0 ] || exit 98
+    remaining=$((remaining - 1))
+    sleep 0.01
+  done
+  [ "$A2A_TEST_FAIL_CLONE" = true ] && exit 99
+fi
+exec "$A2A_TEST_REAL_GIT" "$@"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+            warm_up_script(&git);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_tests::clone_entry_child", "--nocapture"])
+                .env("A2A_TEST_CLONE_ENTRY_CONFIG", &config)
+                .env("A2A_TEST_CLONE_ENTRY_MODE", "fresh")
+                .env("A2A_TEST_BARRIER", root.path())
+                .env("A2A_TEST_FAIL_CLONE", fail_clone.to_string())
+                .env("A2A_TEST_REAL_GIT", real_git.trim())
+                .env(
+                    "PATH",
+                    format!("{}:{}", scripts.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut child = ChildGuard(Some(child), root.path().join("continue"));
+            let barrier = root.path().join("clone-dest");
+            let started = std::time::Instant::now();
+            while !barrier.exists() {
+                if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                    let output = child.0.take().unwrap().wait_with_output().unwrap();
+                    panic!(
+                        "fresh CLI exited before cloning: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                assert!(started.elapsed() < Duration::from_secs(15));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let clone = PathBuf::from(std::fs::read_to_string(barrier).unwrap());
+            assert!(!clone.exists(), "barrier must precede clone creation");
+            assert_run_operation_busy(&clone, &config);
+            std::fs::write(root.path().join("continue"), "").unwrap();
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(if fail_clone {
+                    "git clone failed"
+                } else {
+                    "unknown workflow"
+                }),
+                "{stderr}"
+            );
+            assert_eq!(clone.exists(), !fail_clone);
+            assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+            assert!(source.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_base_resolution_failure_releases_lock_without_creating_clone() {
+        let (root, _, _, config) = clone_entry_fixture("resume", "absent", false);
+        let mut raw = std::fs::read_to_string(&config).unwrap();
+        raw.push_str("\n[storage]\nadmission_floor_gib=0\n");
+        std::fs::write(&config, raw).unwrap();
+        std::fs::write(root.path().join("task.md"), valid_implement_task_spec()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli_tests::clone_entry_child", "--nocapture"])
+            .env("A2A_TEST_CLONE_ENTRY_CONFIG", &config)
+            .env("A2A_TEST_CLONE_ENTRY_MODE", "fresh")
+            .env("A2A_TEST_FRESH_BAD_BASE", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("base-ref"), "{stderr}");
+        let implement_root = root.path().join(".a2a-implement");
+        let locks: Vec<_> =
+            std::fs::read_dir(implement_root.join(implement_resume::OPERATION_LOCK_DIR))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+        assert_eq!(locks.len(), 1);
+        let clone = implement_root.join(locks[0].file_stem().unwrap());
+        assert!(!clone.exists());
+        assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn assert_run_operation_busy(clone: &Path, config: &Path) {
+        use storage_reap::ReapEnv;
+        let id = clone.file_name().unwrap().to_str().unwrap();
+        assert!(implement_resume::acquire_operation_lock(clone).is_err());
+        assert!(matches!(
+            HostReapEnv.acquire_operation_lock(clone.parent().unwrap(), id),
+            Err(storage_reap::LockFailure::Contended)
+        ));
+        let other = clone.with_file_name("different-run");
+        assert!(implement_resume::acquire_operation_lock(&other).is_ok());
+        if !clone.exists() {
+            return; // CLI resolution requires an existing clone; the persistent lock does not.
+        }
+        for mode in ["resume", "merge"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_tests::clone_entry_child", "--nocapture"])
+                .env("A2A_TEST_CLONE_ENTRY_CONFIG", config)
+                .env("A2A_TEST_CLONE_ENTRY_MODE", mode)
+                .env("A2A_TEST_CLONE_ENTRY_ID", id)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("busy") || stderr.contains("holds this run"),
+                "{mode}: {stderr}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_admission_error_holds_custody_until_run_end_cleanup_finishes() {
+        use bridge_core::liveness::LeaseProbe;
+        use std::os::unix::fs::PermissionsExt;
+        struct ChildGuard(Option<std::process::Child>, PathBuf);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.1, "");
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.wait();
+                }
+            }
+        }
+        for failure in ["runtime", "survivor", "config"] {
+            let (root, source, clone, config) = clone_entry_fixture("merge", "absent", false);
+            let runtime = root.path().join("admission-runtime");
+            std::fs::write(
+                &runtime,
+                r#"#!/bin/sh
+[ "$#" -eq 0 ] && exit 0
+root="$(dirname "$0")"
+case "$1" in
+ps)
+  case "$*" in
+    *label=a2a.run=settlement-probe*)
+      touch "$root/cleanup-started"
+      remaining=1000
+      while [ ! -f "$root/cleanup-continue" ]; do
+        [ "$remaining" -gt 0 ] || exit 98
+        remaining=$((remaining - 1))
+        sleep 0.01
+      done
+      echo pending-container
+      ;;
+    *label=a2a.cwd=*)
+      case "$A2A_TEST_ADMISSION_FAILURE" in
+        runtime) exit 7 ;;
+        survivor) echo surviving-writer ;;
+        config) ;;
+        *) exit 99 ;;
+      esac
+      ;;
+  esac
+  ;;
+rm)
+  [ "$2" = -f ] && [ "$3" = pending-container ] || exit 99
+  touch "$root/cleanup-finished"
+  ;;
+*) exit 99 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+            warm_up_script(&runtime);
+            let checkpoint = implement_resume::checkpoint_path(&clone);
+            let before = std::fs::read(&checkpoint).unwrap();
+            let source_head = custody_git(&source, &["rev-parse", "HEAD"]);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_tests::clone_entry_child", "--nocapture"])
+                .env("A2A_TEST_CLONE_ENTRY_CONFIG", &config)
+                .env("A2A_TEST_CLONE_ENTRY_MODE", "merge-admission-error")
+                .env("A2A_TEST_ADMISSION_FAILURE", failure)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let release = root.path().join("cleanup-continue");
+            let mut child = ChildGuard(Some(child), release.clone());
+            let started = std::time::Instant::now();
+            while !root.path().join("cleanup-started").exists() {
+                if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                    let output = child.0.take().unwrap().wait_with_output().unwrap();
+                    panic!(
+                        "cleanup never started: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                assert!(started.elapsed() < Duration::from_secs(15));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The production owner is now dropping after a real merge admission error. Its
+            // synchronous container backstop is paused, so custody must still exclude contenders.
+            assert_run_operation_busy(&clone, &config);
+            let lease = root.path().join("leases/settlement-probe.lock");
+            assert_eq!(
+                bridge_core::liveness::FsLeaseProbe.try_state(lease.to_str().unwrap()),
+                Some(false),
+                "cleanup must remain alive to concurrent orphan recovery"
+            );
+            assert_eq!(std::fs::read(&checkpoint).unwrap(), before);
+            assert!(!root.path().join("evidence").exists());
+            assert!(!root.path().join("cleanup-finished").exists());
+            std::fs::write(release, "").unwrap();
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(root.path().join("cleanup-finished").is_file());
+            assert!(!lease.exists(), "settlement releases the liveness lease");
+            assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+            assert_eq!(std::fs::read(&checkpoint).unwrap(), before);
+            assert_eq!(custody_git(&source, &["rev-parse", "HEAD"]), source_head);
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn clone_entry_child() {
@@ -12945,16 +13287,81 @@ esac
             return;
         };
         let mode = std::env::var("A2A_TEST_CLONE_ENTRY_MODE").unwrap();
+        let id = std::env::var("A2A_TEST_CLONE_ENTRY_ID").unwrap_or_else(|_| "impl-test".into());
         let result = match mode.as_str() {
-            "resume" => implement_resume_cmd("impl-test", &config, false, None, None).await,
-            "merge" => {
-                merge_cmd(&[
-                    "impl-test".into(),
+            "merge-admission-error" => {
+                let root = config.parent().unwrap();
+                let clone = root.join(".a2a-implement/impl-test");
+                let cfg = config::RegistryConfig::parse(&std::fs::read_to_string(&config).unwrap())
+                    .unwrap();
+                let mut owner = ImplementRunCustody::acquire(&clone).unwrap();
+                owner.lease = Some(
+                    bridge_core::liveness::acquire_lease_in(
+                        &root.join("leases"),
+                        "settlement-probe",
+                    )
+                    .unwrap(),
+                );
+                let runtime = root.join("admission-runtime").to_str().unwrap().to_string();
+                owner.run_end = Some(RunEndGuard {
+                    runtimes: vec![runtime.clone()],
+                    instance_id: "settlement-probe".into(),
+                });
+                let failure = std::env::var("A2A_TEST_ADMISSION_FAILURE").unwrap();
+                let merge_cfg = (failure == "config").then(|| {
+                    Err(config::ConfigError::Registry(
+                        "fixture merge config refusal".into(),
+                    ))
+                });
+                let error = merge_after_loop(
+                    true,
+                    implement_resume::ImplementPhase::Approved,
+                    merge_cfg,
+                    &cfg.custody,
+                    &cfg.evidence,
+                    &clone,
+                    root,
+                    Some("release"),
+                    &mut owner,
+                    &[runtime],
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains(match failure.as_str() {
+                        "runtime" => "cannot query container runtime",
+                        "survivor" => "still present or running",
+                        "config" => "fixture merge config refusal",
+                        _ => panic!("unknown failure"),
+                    }),
+                    "{error}"
+                );
+                Err(error)
+            }
+            "probe" => {
+                assert_run_operation_busy(
+                    &config.parent().unwrap().join(".a2a-implement/impl-test"),
+                    &config,
+                );
+                Ok(())
+            }
+            "fresh" => {
+                let root = config.parent().unwrap();
+                let mut args = vec![
+                    "--input".into(),
+                    root.join("task.md").to_str().unwrap().into(),
+                    "--repo".into(),
+                    root.join("source").to_str().unwrap().into(),
                     "--config".into(),
                     config.to_str().unwrap().into(),
-                ])
-                .await
+                ];
+                if std::env::var_os("A2A_TEST_FRESH_BAD_BASE").is_some() {
+                    args.extend(["--base-ref".into(), "nonexistent-base-ref".into()]);
+                }
+                implement_cmd(&args).await
             }
+            "resume" => implement_resume_cmd(&id, &config, false, None, None).await,
+            "merge" => merge_cmd(&[id, "--config".into(), config.to_str().unwrap().into()]).await,
             "sugar" => {
                 let root = config.parent().unwrap();
                 let clone = root.join(".a2a-implement/impl-test");
@@ -12988,6 +13395,7 @@ esac
                     lease: "/unused".into(),
                     start: "0".into(),
                 };
+                let mut operation = ImplementRunCustody::acquire(&clone).unwrap();
                 let terminal = run_warm_loop(
                     &clone,
                     &ck.source_repo,
@@ -13029,7 +13437,7 @@ esac
                     &clone,
                     root,
                     Some("release"),
-                    None,
+                    &mut operation,
                     &runtimes,
                 )
                 .await
@@ -13042,8 +13450,254 @@ esac
         }
     }
 
-    #[test]
-    fn terminal_finalizer_covers_all_terminal_phases_and_creates_no_commit_checkpoint() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_custody_survives_edit_verify_review_fix_and_writer_respawn() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Writer {
+            clone: PathBuf,
+            config: PathBuf,
+            turns: Arc<AtomicUsize>,
+            events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Writer {
+            fn probe(&self, event: &'static str) {
+                assert_run_operation_busy(&self.clone, &self.config);
+                self.events.lock().unwrap().push(event);
+            }
+        }
+        #[async_trait::async_trait]
+        impl AgentBackend for Writer {
+            fn resource_flight_v1(
+                &self,
+            ) -> Result<bridge_core::ports::BackendResourceFlightV1, BridgeError> {
+                Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
+            }
+            async fn set_host_custody(&self, _: bool) -> Result<(), BridgeError> {
+                self.probe("custody");
+                Ok(())
+            }
+            async fn prompt(
+                &self,
+                _: &bridge_core::ids::SessionId,
+                _: Vec<bridge_core::domain::Part>,
+            ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                self.probe(if turn < 2 { "edit" } else { "fix" });
+                if turn == 0 {
+                    return Err(BridgeError::AgentCrashed {
+                        reason: "fixture death before edit".into(),
+                    });
+                }
+                std::fs::write(self.clone.join("work"), format!("turn {turn}\n")).unwrap();
+                custody_git(&self.clone, &["add", "work"]);
+                Ok(Box::pin(tokio_stream::iter(vec![Ok(
+                    bridge_core::ports::Update::Done {
+                        stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
+                    },
+                )])))
+            }
+            async fn cancel(&self, _: &bridge_core::ids::SessionId) -> Result<(), BridgeError> {
+                self.probe("cancel");
+                Ok(())
+            }
+            async fn retire(&self) -> Result<(), BridgeError> {
+                self.probe("retire");
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl resilient::WarmRebuild for Writer {
+            async fn rebuild(&self) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+                self.probe("rebuild");
+                Ok(Arc::new(self.clone()))
+            }
+        }
+        let (root, source, clone, config) = clone_entry_fixture("resume", "absent", false);
+        let operation = ImplementRunCustody::acquire(&clone).unwrap();
+        let writer = Arc::new(Writer {
+            clone: clone.clone(),
+            config: config.clone(),
+            turns: Default::default(),
+            events: Default::default(),
+        });
+        let reset_writer = writer.clone();
+        let runner = resilient::ResilientWarm::new(
+            writer.clone(),
+            writer.clone(),
+            bridge_core::domain::SessionSpec {
+                config: bridge_core::domain::effective_config(&acp_entry("writer"), None),
+                cwd: None,
+            },
+            1,
+            Arc::new(move || {
+                reset_writer.probe("reset");
+                implement::reset_worktree_to_head(&reset_writer.clone)
+            }),
+        );
+        let session = bridge_core::ids::SessionId::parse("lifecycle").unwrap();
+        let telemetry = ImplementAttemptTelemetry::new("lifecycle");
+        assert!(run_direct_implement_turn(&runner, &session, vec![], telemetry.as_ref()).await);
+        runner.acquire_host_custody().await.unwrap();
+        let mut ck = implement_resume::load_checkpoint(&clone).unwrap();
+        let custody = bridge_controller::custody_push::CustodyConfig::default();
+        let evidence = bridge_controller::evidence::EvidenceConfig {
+            path: Some(root.path().join("evidence")),
+            ..Default::default()
+        };
+        let (sha, message) = finish_initial_implement_action(
+            implement::Action::Commit("lifecycle".into()),
+            &clone,
+            &ck,
+            &custody,
+            &evidence,
+            &runner,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        ck.current_commit = Some(sha.clone());
+        ck.original_message = Some(message.clone());
+        let mut checkpoint = implement_resume::ProdCheckpoint {
+            clone: clone.clone(),
+            ck: ck.clone(),
+        };
+        let state = Arc::new(ReviewTelemetryState::default());
+        state.reject_once.store(true, Ordering::SeqCst);
+        let review_writer = writer.clone();
+        *state.probe.lock().unwrap() = Some(Arc::new(move || review_writer.probe("review")));
+        let workflow = bridge_core::ids::WorkflowId::parse("implement-review").unwrap();
+        let workflows = std::collections::HashMap::from([(
+            workflow.clone(),
+            Arc::new(bridge_workflow::graph::WorkflowGraph {
+                id: workflow.clone(),
+                nodes: vec![bridge_workflow::graph::WorkflowNode {
+                    id: bridge_core::ids::NodeId::parse("review").unwrap(),
+                    agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: None,
+                }],
+                panel: None,
+                controls: None,
+            }),
+        )]);
+        let review_cfg = Some(Ok(config::ReviewConfig {
+            workflow,
+            max_output_bytes: 16384,
+            timeout: Duration::from_secs(10),
+            slice_cmd: "/unused/prism".into(),
+            slice_timeout: Duration::from_secs(2),
+            slice_max_bytes: 1024,
+            light_max_lines: 1,
+            light_max_files: 1,
+            thorough_min_lines: 100,
+            thorough_min_files: 100,
+            default_depth: review::Depth::Forced(review::Tier::Standard),
+        }));
+        let executor =
+            bridge_workflow::executor::WorkflowExecutor::new(Arc::new(ReviewTelemetryRegistry {
+                backend: Arc::new(ReviewTelemetryBackend { state }),
+            }));
+        let runtime = root.path().join("verify-runtime");
+        // Each real verify invocation probes from a separate process while the writer is frozen.
+        std::fs::write(&runtime, format!(
+            "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nA2A_TEST_CLONE_ENTRY_CONFIG='{}' A2A_TEST_CLONE_ENTRY_MODE=probe '{}' --exact cli_tests::clone_entry_child\n",
+            config.display(), std::env::current_exe().unwrap().display(),
+        )).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        warm_up_script(&runtime);
+        let verify = Some(Ok(verify::VerifyConfig {
+            runtime: Some(runtime.to_str().unwrap().into()),
+            image: "fake".into(),
+            cache: "lifecycle".into(),
+            egress: bridge_core::domain::EgressPolicy::Open,
+        }));
+        let mut profile = bridge_core::profile::rust_profile();
+        profile.verify_commands.truncate(1);
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "lifecycle".into(),
+            host: "h".into(),
+            lease: "/unused".into(),
+            start: "0".into(),
+        };
+        let cwd = bridge_core::SessionCwd::parse(clone.to_str().unwrap()).unwrap();
+        let terminal = run_warm_loop(
+            &clone,
+            &source,
+            &ck.branch,
+            "task",
+            &ck.base_commit,
+            &ck.task_id,
+            sha,
+            &message,
+            "lifecycle",
+            1,
+            3,
+            true,
+            &runner,
+            &session,
+            &cwd,
+            &verify,
+            Some(&profile),
+            &review_cfg,
+            &workflows,
+            &executor,
+            Some("{{input}}".into()),
+            &mut checkpoint,
+            &custody,
+            review::Depth::Forced(review::Tier::Standard),
+            telemetry,
+            &run,
+            "owner",
+            &evidence,
+        )
+        .await;
+        assert_eq!(terminal, implement_resume::ImplementPhase::Approved);
+        assert_eq!(writer.turns.load(Ordering::SeqCst), 3);
+        let events = writer.events.lock().unwrap();
+        for event in ["edit", "fix", "review", "reset", "rebuild", "retire"] {
+            assert!(events.contains(&event), "missing {event}: {events:?}");
+        }
+        assert_eq!(events.iter().filter(|event| **event == "retire").count(), 2);
+        drop(events);
+        assert_eq!(
+            implement_resume::load_checkpoint(&clone)
+                .unwrap()
+                .attempt_next,
+            2
+        );
+        assert_run_operation_busy(&clone, &config);
+        drop(operation);
+        assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_orchestration_covers_phases_and_settles_despite_publication_failures() {
+        if std::env::var_os("A2A_TEST_TERMINAL_MATRIX_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli_tests::terminal_orchestration_covers_phases_and_settles_despite_publication_failures", "--nocapture"])
+                .env("A2A_TEST_TERMINAL_MATRIX_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("[evidence] warning: archive not published"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("[custody] warning:"), "{stderr}");
+            return;
+        }
         use implement_resume::ImplementPhase::*;
         for phase in [
             Approved,
@@ -13053,50 +13707,215 @@ esac
             NoCommitDirty,
             CommitFailed,
         ] {
-            let (root, source, clone, remote) = custody_fixture();
-            let mut ck = implement_resume::load_checkpoint(&clone).unwrap();
-            ck.current_commit = None;
-            std::fs::remove_file(implement_resume::checkpoint_path(&clone)).unwrap();
-            std::fs::write(clone.join("leftover"), "agent work").unwrap();
-            std::fs::write(clone.join(".git/A2A_TASK.md"), "task").unwrap();
-            let evidence = bridge_controller::evidence::EvidenceConfig {
-                path: Some(root.path().join("evidence")),
-                ..Default::default()
-            };
-            finalize_implement_terminal(
-                &clone,
-                &bridge_controller::custody_push::CustodyConfig::default(),
-                &ck,
-                Some(phase),
-                &evidence,
-            );
-            let archive = evidence
-                .path
-                .as_ref()
-                .unwrap()
-                .join(bridge_controller::evidence::repo_key(&source).unwrap())
-                .join(format!("{}.tar.gz", ck.task_id));
-            assert!(archive.is_file(), "{phase:?} did not publish evidence");
-            let saved = implement_resume::load_checkpoint(&clone).unwrap();
-            assert_eq!(saved.phase, phase);
-            assert!(saved.current_commit.is_none());
-            assert_eq!(saved.task_id, ck.task_id);
-            assert_eq!(saved.source_repo, source);
-            assert_eq!(saved.branch, ck.branch);
-            assert_eq!(saved.base_commit, ck.base_commit);
-            let state = implement_resume::load_custody(&clone).unwrap().unwrap();
-            let sha = state.dirty.last_pushed_sha.unwrap();
-            assert_eq!(
-                custody_git(&remote, &["rev-parse", "refs/heads/wip/impl-test-dirty"]),
-                sha
-            );
+            for failure in ["none", "archive", "push"] {
+                let (root, source, clone, config) = clone_entry_fixture("resume", "present", false);
+                let remote = root.path().join("backup.git");
+                let operation = ImplementRunCustody::acquire(&clone).unwrap();
+                let worktree_guard = bridge_worktree::sweep::WorktreeRunEndGuard::new(
+                    root.path().to_string_lossy().into_owned(),
+                    "terminal-fixture".into(),
+                );
+                let mut ck = implement_resume::load_checkpoint(&clone).unwrap();
+                ck.current_commit = None;
+                ck.original_message = None;
+                std::fs::remove_file(implement_resume::checkpoint_path(&clone)).unwrap();
+                let initial_head = implement::head_sha(&clone).unwrap();
+                let dirty = matches!(phase, Abort | NoCommitDirty | CommitFailed);
+                if phase != NoCommitClean {
+                    std::fs::write(clone.join("work"), "tracked agent work\n").unwrap();
+                    if !dirty || phase == CommitFailed {
+                        custody_git(&clone, &["add", "work"]);
+                    }
+                }
+                if dirty {
+                    std::fs::write(clone.join("leftover"), "untracked agent work\n").unwrap();
+                }
+                if phase == CommitFailed {
+                    // A deterministic initial commit failure, without disturbing snapshot Git.
+                    std::fs::remove_file(clone.join(".git/COMMIT_EDITMSG")).unwrap();
+                    std::fs::create_dir(clone.join(".git/COMMIT_EDITMSG")).unwrap();
+                    // Commit populates Git's cache-tree extension even when opening the message
+                    // fails. Prime that bookkeeping before checking finalization's byte preservation.
+                    custody_git(&clone, &["write-tree"]);
+                }
+                let index_before = std::fs::read(clone.join(".git/index")).unwrap();
+                let status_before = custody_git(&clone, &["status", "--porcelain"]);
+                let mut evidence = bridge_controller::evidence::EvidenceConfig {
+                    path: Some(root.path().join("evidence")),
+                    ..Default::default()
+                };
+                if failure == "archive" {
+                    let file = root.path().join("archive-blocker");
+                    std::fs::write(&file, "not a directory").unwrap();
+                    evidence.path = Some(file);
+                }
+                if failure == "push" {
+                    custody_git(
+                        &source,
+                        &[
+                            "remote",
+                            "set-url",
+                            "origin",
+                            "/nonexistent/a2a-test-remote",
+                        ],
+                    );
+                }
+                let custody = bridge_controller::custody_push::CustodyConfig::default();
+                let writer = Arc::new(EntryWriterBackend(root.path().join("container-state")));
+                let runner = resilient::ResilientWarm::new(
+                    writer.clone(),
+                    writer,
+                    bridge_core::domain::SessionSpec {
+                        config: bridge_core::domain::effective_config(&acp_entry("writer"), None),
+                        cwd: None,
+                    },
+                    0,
+                    Arc::new(|| Ok(())),
+                );
+                runner.acquire_host_custody().await.unwrap();
+                assert_run_operation_busy(&clone, &config);
+                let action = implement::decide(
+                    phase != Abort,
+                    implement::head_guard(&clone, &ck.branch, &initial_head),
+                    implement::stage_state(&clone).unwrap(),
+                    ("fixture commit".into(), implement::CommitSource::Derived),
+                );
+                let result = finish_initial_implement_action(
+                    action, &clone, &ck, &custody, &evidence, &runner,
+                )
+                .await;
+                if matches!(phase, Approved | LoopStopped) {
+                    let (sha, message) = result.unwrap().unwrap();
+                    ck.current_commit = Some(sha.clone());
+                    ck.original_message = Some(message.clone());
+                    ck.phase = FirstCommitCreated;
+                    implement_resume::save_checkpoint(&clone, &ck).unwrap();
+                    let mut checkpoint = implement_resume::ProdCheckpoint {
+                        clone: clone.clone(),
+                        ck: ck.clone(),
+                    };
+                    let session = bridge_core::ids::SessionId::parse("terminal-fixture").unwrap();
+                    let cwd = bridge_core::SessionCwd::parse(clone.to_str().unwrap()).unwrap();
+                    let run = bridge_core::run_identity::RunHandle {
+                        instance_id: "terminal-fixture".into(),
+                        host: "h".into(),
+                        lease: "/unused".into(),
+                        start: "0".into(),
+                    };
+                    let review = (phase == LoopStopped).then(|| {
+                        Err(config::ConfigError::Registry(
+                            "fixture review refusal".into(),
+                        ))
+                    });
+                    let terminal = run_warm_loop(
+                        &clone,
+                        &source,
+                        &ck.branch,
+                        "task",
+                        &ck.base_commit,
+                        &ck.task_id,
+                        sha,
+                        &message,
+                        "fixture commit",
+                        1,
+                        1,
+                        false,
+                        &runner,
+                        &session,
+                        &cwd,
+                        &None,
+                        None,
+                        &review,
+                        &std::collections::HashMap::new(),
+                        &bridge_workflow::executor::WorkflowExecutor::new(Arc::new(UnusedRegistry)),
+                        None,
+                        &mut checkpoint,
+                        &custody,
+                        review::Depth::Auto,
+                        ImplementAttemptTelemetry::new("terminal-fixture"),
+                        &run,
+                        "owner",
+                        &evidence,
+                    )
+                    .await;
+                    assert_eq!(terminal, phase);
+                } else {
+                    assert_eq!(result.is_err(), matches!(phase, Abort | CommitFailed));
+                    assert_eq!(implement::head_sha(&clone).unwrap(), initial_head);
+                    assert_eq!(
+                        custody_git(&clone, &["status", "--porcelain"]),
+                        status_before
+                    );
+                    assert_eq!(
+                        std::fs::read(clone.join(".git/index")).unwrap(),
+                        index_before
+                    );
+                }
+                settle_worktree_run_end(Some(&worktree_guard), ());
+                assert!(worktree_guard.is_settled());
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("container-state")).unwrap(),
+                    "absent"
+                );
+                assert_eq!(
+                    custody_git(&clone, &["branch", "--show-current"]),
+                    ck.branch
+                );
+                let saved = implement_resume::load_checkpoint(&clone).unwrap();
+                assert_eq!(saved.phase, phase, "{failure}");
+                assert_eq!(
+                    saved.current_commit.is_none(),
+                    !matches!(phase, Approved | LoopStopped)
+                );
+                let state = implement_resume::load_custody(&clone)
+                    .unwrap()
+                    .unwrap_or_default();
+                assert_eq!(
+                    state.last_error.is_some(),
+                    failure == "push" && phase != NoCommitClean,
+                    "{phase:?} {failure}"
+                );
+                if dirty {
+                    assert_eq!(
+                        std::fs::read_to_string(clone.join("work")).unwrap(),
+                        "tracked agent work\n"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(clone.join("leftover")).unwrap(),
+                        "untracked agent work\n"
+                    );
+                    if failure != "push" {
+                        let snapshot = state.dirty.last_pushed_sha.unwrap();
+                        assert_eq!(
+                            custody_git(&remote, &["show", &format!("{snapshot}:work")]),
+                            "tracked agent work"
+                        );
+                        assert_eq!(
+                            custody_git(&remote, &["show", &format!("{snapshot}:leftover")]),
+                            "untracked agent work"
+                        );
+                    }
+                } else {
+                    assert!(state.dirty.last_pushed_sha.is_none());
+                }
+                let archive = evidence
+                    .path
+                    .as_ref()
+                    .unwrap()
+                    .join(bridge_controller::evidence::repo_key(&source).unwrap())
+                    .join(format!("{}.tar.gz", ck.task_id));
+                assert_eq!(archive.is_file(), failure != "archive");
+                assert_run_operation_busy(&clone, &config);
+                drop(operation);
+                assert!(implement_resume::acquire_operation_lock(&clone).is_ok());
+            }
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn resume_busy_writes_nothing_and_dirty_refusal_preserves_progress() {
-        let (_root, _source, clone, config) = clone_entry_fixture("resume", "absent", false);
+        let (root, _source, clone, config) = clone_entry_fixture("resume", "absent", false);
         std::fs::write(clone.join("leftover"), "agent work").unwrap();
         let path = implement_resume::checkpoint_path(&clone);
         let before = std::fs::read(&path).unwrap();
@@ -13107,6 +13926,10 @@ esac
         assert!(error.to_string().contains("busy"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(implement_resume::load_custody(&clone).unwrap().is_none());
+        assert!(
+            !root.path().join("evidence").exists(),
+            "busy resume must not archive"
+        );
         drop(lock);
         let error = implement_resume_cmd("impl-test", &config, false, None, None)
             .await
@@ -13273,6 +14096,8 @@ esac
         activity_owned: std::sync::atomic::AtomicBool,
         evidence_bound: std::sync::atomic::AtomicBool,
         custody_expected: std::sync::Mutex<Option<(PathBuf, String)>>,
+        probe: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        reject_once: std::sync::atomic::AtomicBool,
     }
 
     struct ReviewTelemetryBackend {
@@ -13295,6 +14120,18 @@ esac
             _parts: Vec<bridge_core::domain::Part>,
             observers: bridge_core::ports::BackendObservers,
         ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            if let Some(probe) = self.state.probe.lock().unwrap().as_ref() {
+                probe();
+            }
+            let verdict = if self
+                .state
+                .reject_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                "REJECT"
+            } else {
+                "APPROVE"
+            };
             if let Some((remote, sha)) = self.state.custody_expected.lock().unwrap().as_ref() {
                 assert_eq!(
                     custody_git(remote, &["rev-parse", "refs/heads/wip/impl-test"]),
@@ -13318,9 +14155,9 @@ esac
                 std::sync::atomic::Ordering::SeqCst,
             );
             Ok(Box::pin(tokio_stream::iter(vec![
-                Ok(bridge_core::ports::Update::Text(
-                    "VERDICT: APPROVE\nSUMMARY: review telemetry reached".into(),
-                )),
+                Ok(bridge_core::ports::Update::Text(format!(
+                    "VERDICT: {verdict}\nSUMMARY: review telemetry reached"
+                ))),
                 Ok(bridge_core::ports::Update::Done {
                     stop_reason: "end_turn".into(),
                     prefix_attestation: Default::default(),

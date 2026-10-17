@@ -4472,21 +4472,39 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let runtime = tmp.path().join("runtime");
-        // A runtime accepting pause without actually freezing is not custody.
-        std::fs::write(&runtime, "#!/bin/sh\ncase \"$1\" in\ninspect) printf 'immutable-id true false\\n';;\npause) exit 0;;\n*) exit 1;;\nesac\n").unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            set_container_host_custody(runtime.to_str().unwrap(), "immutable-id", true)
-                .await
-                .is_err()
-        );
-        // A reused selector or a mismatched returned identity is never sufficient either.
-        std::fs::write(&runtime, "#!/bin/sh\nprintf 'different-id true true\\n'\n").unwrap();
-        assert!(
-            set_container_host_custody(runtime.to_str().unwrap(), "immutable-id", true)
-                .await
-                .is_err()
-        );
+        for (index, output) in [
+            "immutable-id true false\n", // accepting pause without actually freezing
+            "different-id true true\n",  // wrong immutable identity
+            "immutable-id false true\n", // no running container
+            "immutable-id true\n",       // truncated output
+            "immutable-id true true extra\n", // unexpected fields
+            "\\377\n",                   // invalid UTF-8
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let runtime = runtime.with_extension(index.to_string());
+            let calls = tmp.path().join(format!("calls-{index}"));
+            std::fs::write(&runtime, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\ninspect) printf '{}' ;;\npause) exit 0;;\n*) exit 1;;\nesac\n",
+                calls.display(), output,
+            )).unwrap();
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(matches!(
+                set_container_host_custody(runtime.to_str().unwrap(), "immutable-id", true).await,
+                Err(BridgeError::IdentityUnavailable)
+            ));
+            let calls = std::fs::read_to_string(calls).unwrap();
+            assert_eq!(
+                calls,
+                if index == 0 {
+                    "inspect\npause\ninspect\n"
+                } else {
+                    "inspect\n"
+                },
+                "identity and freeze failures must never be hidden by retries"
+            );
+        }
     }
 
     #[tokio::test]
