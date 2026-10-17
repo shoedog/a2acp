@@ -69,6 +69,56 @@ fake adapter. With the option on, one served fixed-`PONG` turn passed on codex-a
 serve; one `prism-mcp` instead of two, freed about 60 s after release), and the codex host lane of the
 2026-10-13 provider refresh below passed on codex-acp 2.2.2 with the option on.
 
+## Claude refresh — 2026-10-17 (claude-agent-acp 0.93.0, Sonnet 5.5 implementor)
+
+Motive: run Sonnet 5.5 as a second reviewer and as a containerized implementor. Claude ACP 0.93.0 declares Agent
+SDK 0.3.300 (bundled Claude Code 2.1.300); codex, Kiro and OpenCode pins are unchanged. Binary: operator release
+`a2a-bridge` 0.3.1 built with `cargo build --release --locked` from `main` `15f183f2`, SHA-256
+`39273de690478bb43b7b40b9dc795be3f9f07f67adcf35d1d117bfdd526122b3`. Images (linux/arm64): reader
+`sha256:4e88ae9bc7593b2135b8acbb1dca022ba47d037e94769b9b069aabb55b623640`, toolchain
+`sha256:fa72a5f80bfdd69ddf020226541dbcabda9f023fdc322c9eae1dc414c81b473d` built `FROM` that reader; both carry the
+`claude-agent-acp=0.93.0` / `claude-agent-sdk=0.3.300` provenance labels.
+
+**Model identity.** Neither 0.90.0 nor 0.93.0 advertises an explicit Sonnet 5.5 id: `models` lists `sonnet` and
+`claude-sonnet-5`. The `sonnet` alias resolves to `claude-sonnet-5-5`: the session transcript's `"model"` field
+records it on both versions (host) and in the container (0.93.0). The smoke artifact records only the requested
+alias. Container agents pin the alias with
+[`claude-sonnet-impl-settings.json`](../deploy/containers/claude-sonnet-impl-settings.json)
+(`ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5`, plus a deny list for wakeup/cron/monitor tools so an
+implementor cannot end its turn while background work is pending), mounted at
+`/root/.claude/settings.json:ro` alongside the credentials.
+
+Every lane ran exactly one fixed `PONG` prompt (`--acknowledge-billable`, no retry). Each artifact records
+`success: true`, terminal state `completed`, one prompt call, `exact_pong: true`, stop reason `end_turn` and
+`timed_out: false`:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Claude host (ACP 0.90.0) | `sonnet` | **PASS** | `attempt-8c2b2158…`; transcript `claude-sonnet-5-5`. |
+| Claude host (ACP 0.93.0) | `sonnet` | **PASS** | `attempt-6f031717…`; USD 0.163; transcript `claude-sonnet-5-5`, Claude Code 2.1.300. |
+| Claude container implementor (`container_rw`, toolchain `fa72a5f8…`, `acceptEdits`) | `sonnet` / `high` | **PASS** | `attempt-8ff912d6…`; USD 0.077; session cwd a throwaway git directory; container transcript `claude-sonnet-5-5`, Claude Code 2.1.300. |
+| Claude reader (reader `4e88ae9b…`, `:ro`) | `sonnet` / `high` | **PASS** | `attempt-477b95fa…`; USD 0.070. |
+
+Both container lanes printed `Error response from daemon: removal of container … is already in progress` on stderr
+during run-end cleanup, with a successful result and no surviving container: two cleanup paths raced on the same
+removal. Codex image lanes were not rerun; the codex pins are unchanged.
+
+Same-day host checks through the operator config (claude-agent-acp 0.93.0), one fixed `PONG` each:
+
+- `claude` with `haiku`: **PASS**; the transcript records `claude-haiku-5-5`.
+- `kiro` with `deepseek-3.2`: **PASS**.
+- `opencode` with `opencode-go/kimi-k3`: **FAIL**, an operator credential problem rather than an adapter one. The
+  cause reads "This API key has expired". The bridge classified it `upstream.unknown`, not as an authentication
+  failure.
+- `openrouter` (`kind = "api"`) with `nvidia/nemotron-3-ultra-550b-a55b:free`: **FAIL** with
+  `api.prompt.sse_incomplete`. A direct request showed an in-stream OpenRouter error object
+  (`503`, "Upstream error from Nvidia: Service temporarily overloaded", `provider_overloaded`). The bridge did not
+  surface that cause. The control `openrouter/free` passed.
+
+A `smoke` against the live serve's own config is refused before any prompt is sent
+(`smoke.durable_evidence_unavailable`), because the running serve holds that durable store. Run these checks with
+a copy of the config whose `[store] path` points at a private directory.
+
 ## Provider refresh — 2026-10-13 (codex-acp 2.2.2, claude-agent-acp 0.90.0)
 
 Motive: codex-acp 1.13.1 does not advertise `gpt-6.1-sol` (2.2.2 does), and both adapters were several releases

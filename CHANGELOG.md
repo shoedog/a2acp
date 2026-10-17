@@ -9,6 +9,10 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- Reader and toolchain images pin claude-agent-acp 0.93.0 with Agent SDK 0.3.300 / Claude Code 2.1.300
+  (was 0.90.0 / 0.3.296 / 2.1.296). New `deploy/containers/claude-sonnet-impl-settings.json` pins the
+  `sonnet` alias to `claude-sonnet-5-5` for containerized Claude implementors and reviewers. Host, reader
+  and `container_rw` fixed-`PONG` lanes passed; see `docs/compatibility.md`.
 - ACP turns outside a workflow are now bounded by default (#47). Served unary turns (`message/send`,
   and so `submit`), served session turns and `implement` turns end after 30 minutes without activity
   while no tool call is open and no permission request is pending (`acp.prompt.silence_cutoff`), and
