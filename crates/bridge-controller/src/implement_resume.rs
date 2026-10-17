@@ -96,7 +96,8 @@ pub const OPERATION_LOCK_DIR: &str = ".operation-locks";
 
 /// One non-blocking operation lock for a quarantine clone. Its namespace is a sibling of the clones rather
 /// than inside `.git`, so guarded clone reaping cannot unlink the lock inode while another command has already
-/// resolved the run. Resume and merge both hold this guard for their entire clone-mutating/reaping operation.
+/// resolved the run. Fresh implement acquires it before cloning; implement, resume and merge hold it
+/// for their entire clone-mutating/reaping operation.
 pub fn acquire_operation_lock(
     clone: &Path,
 ) -> Result<bridge_core::liveness::PersistentLockGuard, String> {
@@ -466,6 +467,26 @@ mod tests {
         for bytes in [b"invalid".as_slice(), b"[\"\"]", b"[\"bad/run\"]"] {
             std::fs::write(&path, bytes).unwrap();
             assert!(container_run_ids(td.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_operation_lock_precedes_clone_and_releases_on_setup_error() {
+        let root = tempfile::tempdir().unwrap();
+        let clone = root.path().join(".a2a-implement/fresh-run");
+        let fail = |create_partial: bool| -> Result<(), String> {
+            let _operation = acquire_operation_lock(&clone)?;
+            assert!(!clone.exists());
+            assert!(acquire_operation_lock(&clone).is_err());
+            if create_partial {
+                std::fs::create_dir_all(&clone).unwrap();
+            }
+            Err("clone setup failed".into())
+        };
+        for create_partial in [false, true] {
+            assert!(fail(create_partial).is_err());
+            assert_eq!(clone.exists(), create_partial);
+            assert!(acquire_operation_lock(&clone).is_ok());
         }
     }
 
