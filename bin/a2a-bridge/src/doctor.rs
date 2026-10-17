@@ -272,36 +272,15 @@ pub trait RuntimeProbes {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounded `<program> <args...>` — true iff the process exits 0 within `timeout`. A wedged/slow process
-/// is killed and treated as "not found", so `doctor` can never hang on a half-started daemon. This
-/// duplicates (rather than reuses) `main.rs`'s `runtime_responds` bounded-poll pattern because it needs
-/// an arbitrary arg vector (network/image name), not the fixed `info` subcommand; `runtime_responds`
-/// itself IS reused as-is below (see `RealProbes::runtime_responds`).
+/// Read-only success probe. The shared owner bounds exit and pipe collection and settles the
+/// process group on expiry, while retaining no runtime diagnostics.
 fn bounded_probe_ok(program: &str, args: &[&str], timeout: Duration) -> bool {
-    let mut child = match std::process::Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return false,
-        }
-    }
+    bridge_core::control_command::output_until(
+        std::process::Command::new(program).args(args),
+        std::time::Instant::now() + timeout,
+        bridge_core::control_command::OutputPolicy::DISCARD,
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 #[cfg(unix)]
@@ -2482,6 +2461,47 @@ pub fn doctor_cmd(args: &[String]) -> Result<(), crate::BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn discarded_probe_streams_preserve_success_and_nonzero_exit() {
+        for code in [0, 7] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("child");
+            let script = format!(
+                "sleep 60 >&2 & echo $! > '{}'; exit {code}",
+                marker.display()
+            );
+            let started = std::time::Instant::now();
+            let success = bounded_probe_ok("sh", &["-c", &script], Duration::from_millis(300));
+            let pid: i32 = std::fs::read_to_string(marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            assert_eq!(success, code == 0, "exit {code}");
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "discarded streams delayed the probe"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let script = format!("sleep 120 & echo \"$$ $!\" > '{}'; wait", marker.display());
+        let started = std::time::Instant::now();
+        assert!(!bounded_probe_ok(
+            "sh",
+            &["-c", &script],
+            Duration::from_millis(300)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        crate::cli_tests::assert_runtime_group_settled(&marker);
+    }
+
     use bridge_core::domain::{AgentEntry, MountAccess, SandboxConfig};
     use bridge_core::ids::AgentId;
     use bridge_core::mcp::McpServerSpec;

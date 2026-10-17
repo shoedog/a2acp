@@ -109,15 +109,14 @@ pub async fn set_container_host_custody(
     held: bool,
 ) -> Result<(), BridgeError> {
     async fn command(runtime: &str, args: &[&str]) -> Result<std::process::Output, BridgeError> {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new(runtime)
-                .args(args)
-                .kill_on_drop(true)
-                .output(),
+        let mut cmd = std::process::Command::new(runtime);
+        cmd.args(args);
+        bridge_core::control_command::output_async(
+            cmd,
+            std::time::Instant::now() + Duration::from_secs(10),
+            Default::default(),
         )
         .await
-        .map_err(|_| BridgeError::IdentityUnavailable)?
         .map_err(|_| BridgeError::IdentityUnavailable)
     }
     async fn paused(runtime: &str, id: &str) -> Result<bool, BridgeError> {

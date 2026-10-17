@@ -1762,26 +1762,26 @@ fn recorded_containers_absent(
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
             for runtime in runtimes {
                 for filter in &filters {
-                    let out = tokio::time::timeout_at(
-                        deadline,
-                        tokio::process::Command::new(&runtime)
-                            .kill_on_drop(true)
-                            .args([
-                                "ps",
-                                "-aq",
-                                "--filter",
-                                "label=a2a.managed=1",
-                                "--filter",
-                                filter,
-                            ])
-                            .output(),
+                    let mut command = std::process::Command::new(&runtime);
+                    command.args([
+                        "ps",
+                        "-aq",
+                        "--filter",
+                        "label=a2a.managed=1",
+                        "--filter",
+                        filter,
+                    ]);
+                    let out = bridge_core::control_command::output_async(
+                        command,
+                        deadline.into_std(),
+                        Default::default(),
                     )
                     .await;
                     match out {
-                        Ok(Ok(out))
+                        Ok(out)
                             if out.status.success()
                                 && out.stdout.iter().all(u8::is_ascii_whitespace) => {}
-                        Ok(Ok(out)) if out.status.success() => {
+                        Ok(out) if out.status.success() => {
                             return Err(rp::ParkReason::LiveConsumer {
                                 kind: "recorded runtime container".into(),
                                 detail: format!("{runtime}: container still exists for {filter}"),

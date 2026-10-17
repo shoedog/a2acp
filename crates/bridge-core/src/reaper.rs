@@ -1,6 +1,7 @@
 //! Shared container-reaping primitives (used by the :rw ContainerRwBackend and the :ro AcpBackend path).
 //! Detached + idempotent so a `Drop` (which may fire off-runtime at process shutdown) never blocks/panics.
 use crate::attempt_activity::{MonotonicClock, SystemMonotonicClock};
+use crate::control_command::{self, ControlError, OutputPolicy, StreamPolicy};
 use crate::execution_policy::Sha256HexV1;
 use crate::ids::{AttemptId, NodeId};
 use crate::resource_flight::BoundedRecoveryReasonV1;
@@ -19,11 +20,10 @@ use crate::run_identity::CanonicalContainerOwnershipV1;
 use futures::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 
 pub const CONTAINER_IDENTITY_FORMAT: &str = "{{.Id}}{{\"\\t\"}}{{json .Config.Labels}}";
 pub const CONTAINER_INVENTORY_FORMAT: &str = "{{.ID}}{{\"\\t\"}}{{.Names}}";
@@ -925,99 +925,78 @@ async fn observe_container_identity(
     selector: &str,
     timeout: Duration,
 ) -> Result<ContainerRuntimeIdentityV1, ReapFailure> {
-    let mut command = tokio::process::Command::new(runtime);
-    command
-        .args([
-            "container",
-            "inspect",
-            "--format",
-            CONTAINER_IDENTITY_FORMAT,
-            selector,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-    let stdout = child.stdout.take().ok_or(ReapFailure::Spawn)?;
-    let observation = async move {
-        let mut bytes = Vec::new();
-        stdout
-            .take(CONTAINER_IDENTITY_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| ReapFailure::IdentityUnavailable)?;
-        let status = child.wait().await.map_err(|_| ReapFailure::Spawn)?;
-        Ok((status.success(), bytes))
-    };
-    let (inspect_succeeded, bytes) = tokio::time::timeout(timeout, observation)
-        .await
-        .map_err(|_| ReapFailure::Timeout)??;
+    let deadline = std::time::Instant::now() + timeout.min(control_command::CONTROL_TIMEOUT);
+    let mut command = Command::new(runtime);
+    command.args([
+        "container",
+        "inspect",
+        "--format",
+        CONTAINER_IDENTITY_FORMAT,
+        selector,
+    ]);
+    let out = control_command::output_async(
+        command,
+        deadline,
+        OutputPolicy {
+            stdout: StreamPolicy::Capture(Some(CONTAINER_IDENTITY_MAX_BYTES as usize + 1)),
+            stderr: StreamPolicy::Null,
+        },
+    )
+    .await
+    .map_err(control_failure)?;
+    let inspect_succeeded = out.status.success();
+    let bytes = out.stdout;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CONTAINER_IDENTITY_MAX_BYTES {
         return Err(ReapFailure::IdentityUnavailable);
     }
     if inspect_succeeded {
         return parse_container_identity(&bytes);
     }
-    if runtime_inventory_contains(runtime, selector, timeout).await? {
+    if runtime_inventory_contains_until(
+        runtime,
+        selector,
+        tokio::time::Instant::now() + timeout.min(control_command::CONTROL_TIMEOUT),
+    )
+    .await?
+    {
         Err(ReapFailure::IdentityUnavailable)
     } else {
         Err(ReapFailure::AlreadyGone)
     }
 }
 
-async fn runtime_inventory_contains(
-    runtime: &str,
-    selector: &str,
-    timeout: Duration,
-) -> Result<bool, ReapFailure> {
-    let bound = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .ok_or(ReapFailure::Timeout)?;
-    runtime_inventory_contains_until(runtime, selector, bound).await
-}
-
-/// [`runtime_inventory_contains`] against an absolute `bound`, so the child's spawn, its output,
+/// Inventory against an absolute `bound`, so the child's spawn, its output,
 /// and its exit all share one caller-owned deadline.
 async fn runtime_inventory_contains_until(
     runtime: &str,
     selector: &str,
     bound: tokio::time::Instant,
 ) -> Result<bool, ReapFailure> {
-    let mut command = tokio::process::Command::new(runtime);
-    command
-        .args([
-            "container",
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--format",
-            CONTAINER_INVENTORY_FORMAT,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-    let stdout = child.stdout.take().ok_or(ReapFailure::Spawn)?;
-    let observation = async move {
-        let mut bytes = Vec::new();
-        stdout
-            .take(CONTAINER_IDENTITY_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| ReapFailure::IdentityUnavailable)?;
-        let status = child.wait().await.map_err(|_| ReapFailure::Spawn)?;
-        if !status.success()
-            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CONTAINER_IDENTITY_MAX_BYTES
-        {
-            return Err(ReapFailure::IdentityUnavailable);
-        }
-        parse_container_inventory_contains(&bytes, selector)
-    };
-    tokio::time::timeout_at(bound, observation)
-        .await
-        .map_err(|_| ReapFailure::Timeout)?
+    let mut command = Command::new(runtime);
+    command.args([
+        "container",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--format",
+        CONTAINER_INVENTORY_FORMAT,
+    ]);
+    let out = control_command::output_async(
+        command,
+        bound
+            .into_std()
+            .min(std::time::Instant::now() + control_command::CONTROL_TIMEOUT),
+        OutputPolicy {
+            stdout: StreamPolicy::Capture(Some(CONTAINER_IDENTITY_MAX_BYTES as usize + 1)),
+            stderr: StreamPolicy::Null,
+        },
+    )
+    .await
+    .map_err(control_failure)?;
+    if !out.status.success() || out.stdout.len() as u64 > CONTAINER_IDENTITY_MAX_BYTES {
+        return Err(ReapFailure::IdentityUnavailable);
+    }
+    parse_container_inventory_contains(&out.stdout, selector)
 }
 
 async fn remove_container_id(
@@ -1030,15 +1009,17 @@ async fn remove_container_id(
         .checked_add(timeout)
         .ok_or(ReapFailure::Timeout)?;
     let (program, argv) = crate::sandbox::reap_argv(runtime, immutable_container_id);
-    let mut command = tokio::process::Command::new(&program);
-    command.args(&argv).kill_on_drop(true);
-    let child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-    // Neither exit status is evidence: `run --rm` can win the race behind a nonzero exit, and a
-    // runtime wrapper can exit zero without removing anything. Only the inventory decides.
-    tokio::time::timeout_at(deadline, child.wait_with_output())
-        .await
-        .map_err(|_| ReapFailure::Timeout)?
-        .map_err(|_| ReapFailure::Spawn)?;
+    let mut command = Command::new(&program);
+    command.args(&argv);
+    // Exit status alone is not absence evidence: preserve the run --rm race.
+    control_command::status_async(
+        command,
+        deadline
+            .into_std()
+            .min(std::time::Instant::now() + control_command::CONTROL_TIMEOUT),
+    )
+    .await
+    .map_err(control_failure)?;
     confirm_exact_id_absent_after_removal(runtime, immutable_container_id, deadline).await
 }
 
@@ -1108,48 +1089,44 @@ fn classify_container_start_status(status: &[u8]) -> ContainerStartState {
     }
 }
 
+fn control_failure(error: ControlError) -> ReapFailure {
+    match error {
+        ControlError::Timeout => ReapFailure::Timeout,
+        ControlError::Io(_) => ReapFailure::Spawn,
+        ControlError::Output(_) => ReapFailure::IdentityUnavailable,
+    }
+}
+
 fn production_start_probe(timeout: Duration) -> ContainerStartProbeFn {
     Arc::new(move |runtime, name| {
         Box::pin(async move {
-            let mut command = tokio::process::Command::new(&runtime);
-            command
-                .args([
-                    "container",
-                    "inspect",
-                    "--format",
-                    "{{.State.Status}}",
-                    &name,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            let mut child = match command.spawn() {
-                Ok(child) => child,
-                Err(_) => return ContainerStartState::Unknown,
-            };
-            let Some(stdout) = child.stdout.take() else {
-                return ContainerStartState::Unknown;
-            };
-            let observation = async move {
-                let mut bytes = Vec::new();
-                stdout
-                    .take(CONTAINER_START_STATUS_MAX_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .await
-                    .map_err(|_| ())?;
-                let status = child.wait().await.map_err(|_| ())?;
-                if !status.success()
-                    || u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-                        > CONTAINER_START_STATUS_MAX_BYTES
+            let mut command = Command::new(&runtime);
+            command.args([
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &name,
+            ]);
+            match control_command::output_async(
+                command,
+                std::time::Instant::now() + timeout.min(control_command::CONTROL_TIMEOUT),
+                OutputPolicy {
+                    stdout: StreamPolicy::Capture(Some(
+                        CONTAINER_START_STATUS_MAX_BYTES as usize + 1,
+                    )),
+                    stderr: StreamPolicy::Null,
+                },
+            )
+            .await
+            {
+                Ok(out)
+                    if out.status.success()
+                        && out.stdout.len() as u64 <= CONTAINER_START_STATUS_MAX_BYTES =>
                 {
-                    return Ok(ContainerStartState::Unknown);
+                    classify_container_start_status(&out.stdout)
                 }
-                Ok(classify_container_start_status(&bytes))
-            };
-            match tokio::time::timeout(timeout, observation).await {
-                Ok(Ok(state)) => state,
-                Ok(Err(())) | Err(_) => ContainerStartState::Unknown,
+                _ => ContainerStartState::Unknown,
             }
         })
     })
@@ -1220,16 +1197,54 @@ pub fn production_reap_fn() -> ReapFn {
 
 // ---- Increment A: label-scoped reaping + liveness sweep + staleness (shell out; live-gated) -------------
 
-/// Reap THIS run's containers (END-sweep): `ps -aq --filter label=a2a.run=<id>` → `rm -f` each. Best-effort.
-pub fn run_scoped_reap(runtime: &str, run_id: &str) {
+/// A failed sweep identifies the runtime call without depending on a tracing subscriber.
+#[derive(Debug, thiserror::Error)]
+pub enum SweepFailure {
+    #[error("{runtime} {call}: {source}")]
+    Control {
+        runtime: String,
+        call: String,
+        #[source]
+        source: ControlError,
+    },
+    #[error("{runtime} {call}: runtime control command exited with {status}")]
+    Exit {
+        runtime: String,
+        call: String,
+        status: std::process::ExitStatus,
+    },
+}
+
+fn sweep_output(runtime: &str, args: &[String]) -> Result<std::process::Output, SweepFailure> {
+    let out = control_command::output(std::process::Command::new(runtime).args(args)).map_err(
+        |source| SweepFailure::Control {
+            runtime: runtime.to_string(),
+            call: args.join(" "),
+            source,
+        },
+    )?;
+    if !out.status.success() {
+        return Err(SweepFailure::Exit {
+            runtime: runtime.to_string(),
+            call: args.join(" "),
+            status: out.status,
+        });
+    }
+    Ok(out)
+}
+
+/// Reap THIS run's containers (END-sweep): `ps -aq --filter label=a2a.run=<id>` → `rm -f` each.
+/// Attempt every removal even after a failure, returning the first failure for the caller to report.
+pub fn run_scoped_reap(runtime: &str, run_id: &str) -> Result<(), SweepFailure> {
     let (p, argv) = crate::sandbox::by_run_filter_argv(runtime, run_id);
-    if let Ok(out) = std::process::Command::new(&p).args(&argv).output() {
-        for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-            let _ = std::process::Command::new(runtime)
-                .args(["rm", "-f", id])
-                .output();
+    let out = sweep_output(&p, &argv)?;
+    let mut failure = None;
+    for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        if let Err(error) = sweep_output(runtime, &["rm".into(), "-f".into(), id.into()]) {
+            failure.get_or_insert(error);
         }
     }
+    failure.map_or(Ok(()), Err)
 }
 
 /// PURE recovery planner: classify a batch of inspected managed records `(id, host, lease)` against the
@@ -1268,18 +1283,17 @@ pub fn plan_recovery(
 /// reap ONLY `Dead` (same host + free lease lock). RETURNS the dead lease files (deduped) for the caller to
 /// delete ONCE, after EVERY owner has been swept — NOT here: a crashed run's containers span multiple owners
 /// but share one lease, so deleting it per-owner would blind the later owners' sweeps (see [`plan_recovery`]).
-/// Never touches Alive/Unknown. Best-effort (any docker error ⇒ no reaps, no dead leases).
-#[must_use]
+/// Never touches Alive/Unknown. A runtime error returns failure, distinct from a successful empty
+/// sweep. If ANY owner fails, the caller must retain ALL leases collected in that recovery pass:
+/// an unavailable inventory can conceal references to any shared lease.
 pub fn classify_sweep(
     runtime: &str,
     owner: &str,
     my_host: &str,
     probe: &dyn crate::liveness::LeaseProbe,
-) -> Vec<String> {
+) -> Result<Vec<String>, SweepFailure> {
     let (p, argv) = crate::sandbox::managed_inspect_argv(runtime, owner);
-    let Ok(out) = std::process::Command::new(&p).args(&argv).output() else {
-        return Vec::new();
-    };
+    let out = sweep_output(&p, &argv)?;
     let records: Vec<(String, String, String)> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
@@ -1294,20 +1308,17 @@ pub fn classify_sweep(
         .collect();
     let (reap_ids, dead_leases) = plan_recovery(&records, my_host, probe);
     for id in reap_ids {
-        let _ = std::process::Command::new(runtime)
-            .args(["rm", "-f", &id])
-            .output();
+        sweep_output(runtime, &["rm".into(), "-f".into(), id])?;
     }
-    dead_leases
+    Ok(dead_leases)
 }
 
 /// True iff the container produced NO log line within `window` (⇒ stale). `docker logs --since <window>
 /// --tail 1 <name>` empty ⇒ stale. Best-effort: any error ⇒ false (bias against a false-stale flag).
 pub fn is_stale(runtime: &str, name: &str, window: &str) -> bool {
-    match std::process::Command::new(runtime)
-        .args(["logs", "--since", window, "--tail", "1", name])
-        .output()
-    {
+    match control_command::output(
+        std::process::Command::new(runtime).args(["logs", "--since", window, "--tail", "1", name]),
+    ) {
         Ok(o) => o.stdout.is_empty() && o.stderr.is_empty(),
         Err(_) => false,
     }

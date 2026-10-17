@@ -296,3 +296,155 @@ fn a_missing_implement_root_refuses_rather_than_scanning_something_else() {
         "the refusal does not name the root it expected: {text}"
     );
 }
+
+/// A daemon timeout cannot turn missing evidence into permission to discard a clone, even with an
+/// explicit owner disposition. Exercise invocation-scan and recorded-runtime queries separately.
+#[cfg(unix)]
+fn hung_runtime_keeps_clone(scan_hangs: bool) {
+    use std::{
+        os::unix::{fs::PermissionsExt, process::CommandExt},
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source");
+    std::fs::create_dir(&source).unwrap();
+    let git = |path: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&source, &["init", "-q", "--initial-branch=main"]);
+    git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+    let run_id = "impl-4294967294-deadline";
+    let clone = root.join(".a2a-implement").join(run_id);
+    std::fs::create_dir(clone.parent().unwrap()).unwrap();
+    git(
+        &source,
+        &[
+            "clone",
+            "-q",
+            source.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    git(&clone, &["update-ref", "refs/heads/wip/deadline", "HEAD"]);
+    let refs_before = git(&clone, &["show-ref"]);
+    let marker = root.join("started");
+    let hanging = root.join("hanging-runtime");
+    let healthy = root.join("healthy-runtime");
+    // The descendant owns the inherited pipes. Base behavior kills only the shell at the existing
+    // recorded-runtime timeout; checking the descendant catches that incomplete settlement.
+    std::fs::write(&hanging, "#!/bin/sh\n[ \"$1\" = volume ] && exit 0\nsleep 120 &\necho \"$$ $!\" >> \"$STARTED\"\nwait\n").unwrap();
+    std::fs::write(&healthy, "#!/bin/sh\nexit 0\n").unwrap();
+    for path in [&hanging, &healthy] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let invocation = root.join("invocation.toml");
+    let recorded = root.join("recorded.toml");
+    for (config, runtime) in [
+        (&invocation, if scan_hangs { &hanging } else { &healthy }),
+        (&recorded, if scan_hangs { &healthy } else { &hanging }),
+    ] {
+        std::fs::write(config, format!("default = \"test\"\nallowed_cwd_root = {root:?}\n[server]\naddr = \"127.0.0.1:0\"\n[verify]\nruntime = {runtime:?}\nimage = \"test\"\ncache = \"test\"\negress = \"open\"\n")).unwrap();
+    }
+    let checkpoint = serde_json::json!({
+        "schema_version": 1, "resume_id": run_id, "task_id": run_id, "task_brief": "deadline test",
+        "source_repo": source, "clone_path": clone, "config_path": recorded,
+        "branch": "main", "base_commit": git(&clone, &["rev-parse", "HEAD"]),
+        "edit_workflow": "edit", "fix_workflow": "fix", "loop_max_attempts": 3,
+        "attempt_next": 1, "phase": "Approved", "created_at_ms": 0, "updated_at_ms": 0
+    });
+    let ck_dir = clone.join(".git/a2a-bridge");
+    std::fs::create_dir_all(&ck_dir).unwrap();
+    std::fs::write(
+        ck_dir.join("implement-checkpoint.json"),
+        serde_json::to_vec(&checkpoint).unwrap(),
+    )
+    .unwrap();
+    let disposition = root.join("disposition.json");
+    std::fs::write(&disposition, serde_json::to_vec(&serde_json::json!({"authorized_by":"owner", "reason":"discard parked run", "run_ids":[run_id]})).unwrap()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .args(["storage", "reap", "--clones", "--json", "--config"])
+        .arg(&invocation)
+        .arg("--disposition-list")
+        .arg(&disposition)
+        .env("STARTED", &marker)
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let budget = Duration::from_secs(if scan_hangs { 38 } else { 18 });
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if started.elapsed() >= budget {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            panic!("storage reap exceeded runtime query budget");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("ContainerAxisUnanswered")
+            || text.contains("container_axis_unanswered")
+            || text.contains("container axis unanswered"),
+        "{text}"
+    );
+    assert!(clone.exists());
+    assert_eq!(git(&clone, &["show-ref"]), refs_before);
+    let records = std::fs::read_to_string(&marker).expect("hanging runtime started");
+    for record in records.lines() {
+        let pids: Vec<i32> = record
+            .split_whitespace()
+            .map(|v| v.parse().unwrap())
+            .collect();
+        for pid in pids {
+            let settled_by = Instant::now() + Duration::from_secs(2);
+            let alive = loop {
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    s.split_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+                let alive = !zombie && unsafe { libc::kill(pid, 0) } == 0;
+                if !alive || Instant::now() >= settled_by {
+                    break alive;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if alive {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(!alive, "runtime process {pid} survived query timeout");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hung_storage_scan_preserves_clone_and_refs_with_owner_disposition() {
+    hung_runtime_keeps_clone(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn hung_recorded_runtime_preserves_clone_and_refs_with_owner_disposition() {
+    hung_runtime_keeps_clone(false);
+}
