@@ -28,7 +28,7 @@ impl Default for CustodyConfig {
             push: true,
             remote: "origin".into(),
             ref_prefix: "wip/".into(),
-            delete_remote_on_merge: false,
+            delete_remote_on_merge: true,
             push_timeout_secs: 120,
         }
     }
@@ -1242,20 +1242,25 @@ mod tests {
     #[test]
     fn object_format_handles_loose_packed_and_detached_head_without_clone_config() {
         for format in ["sha1", "sha256"] {
+            let assert_format = |clone: &Path| {
+                let config_path = clone.join(".git/config");
+                let config = std::fs::read(&config_path).unwrap();
+                std::fs::write(&config_path, "not valid git configuration").unwrap();
+                assert_eq!(object_format_from_head(clone).unwrap(), format);
+                assert!(Scratch::new(clone, Duration::from_secs(1)).is_ok());
+                std::fs::write(&config_path, config).unwrap();
+            };
             let mut f = Fixture::with_object_format(format);
-            assert_eq!(object_format_from_head(&f.clone).unwrap(), format);
+            assert_format(&f.clone);
             f.push();
             run(&f.clone, &["pack-refs", "--all"]);
             assert!(!f.clone.join(".git/refs/heads/implement/impl-test").exists());
-            assert_eq!(object_format_from_head(&f.clone).unwrap(), format);
+            assert_format(&f.clone);
             assert_eq!(f.remote_sha(), Some(f.head()));
             let head = f.head();
             std::fs::write(f.clone.join(".git/HEAD"), format!("{head}\n")).unwrap();
-            assert_eq!(object_format_from_head(&f.clone).unwrap(), format);
+            assert_format(&f.clone);
             assert_eq!(f.remote_sha(), Some(head));
-            // Clone configuration must not participate even in format detection.
-            std::fs::write(f.clone.join(".git/config"), "not valid git configuration").unwrap();
-            assert!(Scratch::new(&f.clone, Duration::from_secs(1)).is_ok());
         }
     }
 
@@ -1532,6 +1537,79 @@ mod tests {
     }
 
     #[test]
+    fn remote_cleanup_defaults_and_explicit_configuration() {
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Config {
+            custody: CustodyConfig,
+        }
+        assert!(CustodyConfig::default().delete_remote_on_merge);
+        for input in ["{}", r#"{"custody":{}}"#] {
+            let cfg: Config = serde_json::from_str(input).unwrap();
+            assert!(cfg.custody.delete_remote_on_merge);
+        }
+        for value in [false, true] {
+            let cfg: Config = serde_json::from_value(serde_json::json!({
+                "custody": {"delete_remote_on_merge": value}
+            }))
+            .unwrap();
+            assert_eq!(cfg.custody.delete_remote_on_merge, value);
+        }
+    }
+
+    #[test]
+    fn unresolved_object_format_refuses_instead_of_using_host_default() {
+        for head in [
+            "",
+            "1234",
+            "ref: refs/heads/missing",
+            "ref: ../outside",
+            "ref: refs/heads/loop",
+        ] {
+            let f = Fixture::new();
+            std::fs::write(f.clone.join(".git/HEAD"), head).unwrap();
+            std::fs::write(f.clone.join(".git/refs/heads/loop"), "ref: refs/heads/loop").unwrap();
+            assert_eq!(
+                object_format_from_head(&f.clone).unwrap_err(),
+                "custody object format unavailable"
+            );
+            assert_eq!(
+                Scratch::new(&f.clone, Duration::from_secs(1))
+                    .err()
+                    .unwrap(),
+                "custody object format unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_cleanup_preserves_foreign_update_and_unrelated_refs() {
+        let mut f = Fixture::new();
+        f.push();
+        let cleanup = RemoteCleanup::prepare(&f.clone, &f.cfg, &f.ck).unwrap();
+        let scratch_path = cleanup.scratch.0.clone();
+        let foreign = f.ck.base_commit.clone();
+        run(
+            &f.remote,
+            &["update-ref", "refs/heads/wip/impl-test", &foreign],
+        );
+        run(
+            &f.remote,
+            &["update-ref", "refs/heads/wip/another-run", &foreign],
+        );
+        assert_eq!(
+            cleanup.delete().unwrap_err(),
+            "custody remote cleanup failed; remote ref kept"
+        );
+        assert!(!scratch_path.exists());
+        assert_eq!(f.remote_sha(), Some(foreign.clone()));
+        assert_eq!(
+            run(&f.remote, &["rev-parse", "refs/heads/wip/another-run"]),
+            foreign
+        );
+    }
+
+    #[test]
     fn validates_values() {
         let mut cfg = CustodyConfig::default();
         cfg.validate().unwrap();
@@ -1563,7 +1641,7 @@ mod tests {
         .unwrap();
         let stalled_shim = root.path().join("stalled-ssh.sh");
         std::fs::write(&stalled_shim,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CUSTODY_HELPER_PID\"\nsleep 30 &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CUSTODY_DESCENDANT_PID\"\nwait \"$descendant\"\n"
+            "#!/bin/sh\nif [ -r /proc/$$/stat ]; then read -r pid comm state parent group rest < /proc/$$/stat; printf '%s\\n' \"$group\"; else ps -o pgid= -p $$; fi > \"$CUSTODY_GIT_PID\"\nprintf '%s\\n' \"$$\" > \"$CUSTODY_HELPER_PID\"\nsleep 30 &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$CUSTODY_DESCENDANT_PID\"\nwait \"$descendant\"\n"
         ).unwrap();
         let host_config = root.path().join("gitconfig");
         std::fs::write(
@@ -1578,9 +1656,22 @@ mod tests {
             "host-config",
             "missing",
             "object-format",
+            "object-format-sha256",
+            "credentials",
         ] {
             let scratch_root = root.path().join(scenario);
             std::fs::create_dir(&scratch_root).unwrap();
+            let scenario_config = root.path().join(format!("{scenario}.gitconfig"));
+            let config = std::fs::read_to_string(&host_config).unwrap();
+            std::fs::write(
+                &scenario_config,
+                if scenario == "object-format-sha256" {
+                    config.replace("sha256", "sha1")
+                } else {
+                    config
+                },
+            )
+            .unwrap();
             let out = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1597,10 +1688,11 @@ mod tests {
                         format!("sh '{}'", shim.display())
                     },
                 )
+                .env("CUSTODY_GIT_PID", root.path().join("git.pid"))
                 .env("CUSTODY_HELPER_PID", root.path().join("helper.pid"))
                 .env("CUSTODY_DESCENDANT_PID", root.path().join("descendant.pid"))
                 .env("GIT_SSH_VARIANT", "ssh")
-                .env("GIT_CONFIG_GLOBAL", &host_config)
+                .env("GIT_CONFIG_GLOBAL", &scenario_config)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("HTTPS_PROXY", "")
                 .env("ALL_PROXY", "")
@@ -1617,7 +1709,14 @@ mod tests {
             if scenario == "missing" {
                 assert_eq!(stderr.matches("[custody] warning:").count(), 1);
             }
-            assert!(!stderr.contains("user:token") && !stderr.contains("https://user"));
+            for secret in [
+                "user:token",
+                "https://user",
+                "password=token",
+                "dXNlcjp0b2tlbg==",
+            ] {
+                assert!(!stderr.contains(secret), "credential-bearing diagnostics");
+            }
             assert_eq!(
                 std::fs::read_dir(&scratch_root).unwrap().count(),
                 0,
@@ -1627,6 +1726,18 @@ mod tests {
     }
 
     fn assert_stalled_transport_terminated() {
+        let path = std::env::var_os("CUSTODY_GIT_PID").unwrap();
+        let pid = std::fs::read_to_string(&path).unwrap();
+        let pid: std::ffi::c_int = pid.trim().parse().unwrap();
+        // Unlike grandchildren, the owned Git child must be reaped, not a zombie.
+        // SAFETY: signal zero only probes the recorded process group leader.
+        assert_eq!(
+            unsafe { signal_process(pid, 0) },
+            -1,
+            "owned Git child was not reaped"
+        );
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(3)); // ESRCH
+        std::fs::remove_file(path).unwrap();
         for key in ["CUSTODY_HELPER_PID", "CUSTODY_DESCENDANT_PID"] {
             let path = std::env::var_os(key).unwrap();
             let pid: u32 = std::fs::read_to_string(&path)
@@ -1667,6 +1778,208 @@ mod tests {
         }
     }
 
+    // A loopback smart-HTTP server challenges every unauthenticated request and
+    // delegates authenticated requests to Git's real receive/upload-pack backend.
+    // Its owned thread is joined on all paths, including assertion failures.
+    struct AuthServer {
+        address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl AuthServer {
+        fn new(root: &Path) -> Self {
+            use std::io::{BufRead, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            let root = root.to_path_buf();
+            let worker = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("HTTP accept: {error}"),
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = std::io::BufReader::new(socket.try_clone().unwrap());
+                    let mut line = String::new();
+                    request.read_line(&mut line).unwrap();
+                    let first = line.clone();
+                    let mut authorized = false;
+                    let mut length = 0;
+                    let mut content_type = String::new();
+                    loop {
+                        line.clear();
+                        request.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        let (name, value) = line.split_once(':').unwrap();
+                        let value = value.trim();
+                        match name.to_ascii_lowercase().as_str() {
+                            "authorization" => authorized = value == "Basic dXNlcjp0b2tlbg==",
+                            "content-length" => length = value.parse::<usize>().unwrap(),
+                            "content-type" => content_type = value.into(),
+                            "transfer-encoding" => panic!("unexpected chunked test request"),
+                            _ => {}
+                        }
+                    }
+                    if !authorized {
+                        socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=Custody\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue;
+                    }
+                    assert!(length < 1024 * 1024);
+                    let mut body = vec![0; length];
+                    request.read_exact(&mut body).unwrap();
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap();
+                    let target = parts.next().unwrap();
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    let mut child = Command::new("git")
+                        .args(["-c", "http.receivepack=true", "http-backend"])
+                        .env("GIT_PROJECT_ROOT", &root)
+                        .env("GIT_HTTP_EXPORT_ALL", "1")
+                        .env("REMOTE_USER", "user")
+                        .env("REQUEST_METHOD", method)
+                        .env("PATH_INFO", path)
+                        .env("QUERY_STRING", query)
+                        .env("CONTENT_TYPE", &content_type)
+                        .env("CONTENT_LENGTH", length.to_string())
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(&body).unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    assert!(output.status.success());
+                    let split = output
+                        .stdout
+                        .windows(4)
+                        .position(|s| s == b"\r\n\r\n")
+                        .unwrap();
+                    let (headers, body) = output.stdout.split_at(split);
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        body.len() - 4
+                    )
+                    .unwrap();
+                    socket.write_all(headers).unwrap();
+                    socket.write_all(b"\r\n\r\n").unwrap();
+                    socket.write_all(&body[4..]).unwrap();
+                }
+            });
+            Self {
+                address,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+    impl Drop for AuthServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    fn authenticated_transport_control(f: &mut Fixture) {
+        let server = AuthServer::new(f._root.path());
+        let url = format!("http://{}/backup.git", server.address);
+        let clone_marker = f._root.path().join("clone-helper-ran");
+        let host_marker = f._root.path().join("host-helper-ran");
+        let helper = |marker: &Path| {
+            format!(
+                "!cat >/dev/null; touch '{}'; printf 'username=user\\npassword=token\\n'",
+                marker.display()
+            )
+        };
+        // Reset the inherited helper list: running transport in the clone would
+        // invoke this helper even when the host helper already has credentials.
+        run(&f.clone, &["config", "credential.helper", ""]);
+        run(
+            &f.clone,
+            &[
+                "config",
+                "--add",
+                "credential.helper",
+                &helper(&clone_marker),
+            ],
+        );
+        let global = std::env::var_os("GIT_CONFIG_GLOBAL").unwrap();
+        run(
+            &f.source,
+            &[
+                "config",
+                "--file",
+                global.to_str().unwrap(),
+                "credential.helper",
+                &helper(&host_marker),
+            ],
+        );
+        // Same endpoint, host configuration and credentials as scratch transport.
+        // The clone's reset helper list must invoke its sentinel in this control.
+        let mut positive = git();
+        positive
+            .arg("-C")
+            .arg(&f.clone)
+            .args(["ls-remote", "--", &url]);
+        assert!(bounded(positive, Duration::from_secs(5))
+            .unwrap()
+            .status
+            .success());
+        assert!(clone_marker.exists());
+        assert!(!host_marker.exists());
+        std::fs::remove_file(&clone_marker).unwrap();
+
+        run(&f.source, &["remote", "set-url", "origin", &url]);
+        // Separate markers for push and query prove both exercised host auth.
+        f.push();
+        assert_eq!(
+            f.custody.as_ref().unwrap().normal.last_pushed_sha,
+            Some(f.head())
+        );
+        assert!(host_marker.exists());
+        assert!(!clone_marker.exists());
+        std::fs::remove_file(&host_marker).unwrap();
+        assert_eq!(f.remote_sha(), Some(f.head()));
+        assert!(host_marker.exists());
+        assert!(!clone_marker.exists());
+        let state =
+            std::fs::read_to_string(crate::implement_resume::checkpoint_path(&f.clone)).unwrap();
+        for secret in ["password", "token", "user:token", "dXNlcjp0b2tlbg=="] {
+            assert!(!state.contains(secret), "credentials persisted");
+        }
+        // Authentication denial remains sanitized and cannot execute clone config.
+        run(
+            &f.source,
+            &[
+                "config",
+                "--file",
+                global.to_str().unwrap(),
+                "--unset",
+                "credential.helper",
+            ],
+        );
+        std::fs::remove_file(&host_marker).unwrap();
+        assert_eq!(
+            ls_remote_ref(&f.source, &f.clone, &f.cfg, "refs/heads/wip/impl-test").unwrap_err(),
+            "custody ls-remote failed"
+        );
+        assert!(!host_marker.exists() && !clone_marker.exists());
+    }
+
     fn memory_destination(url: String) -> Destination {
         Destination {
             identity: identity(&url),
@@ -1682,7 +1995,11 @@ mod tests {
         let Ok(scenario) = std::env::var("CUSTODY_TEST_SCENARIO") else {
             return;
         };
-        let mut f = Fixture::new();
+        let mut f = Fixture::with_object_format(if scenario == "object-format-sha256" {
+            "sha256"
+        } else {
+            "sha1"
+        });
         match scenario.as_str() {
             "usernames" => {
                 let mut state = CustodyState::default();
@@ -1740,14 +2057,40 @@ mod tests {
                         .unwrap();
                 assert!(!text.contains("user:token") && !text.contains("https://user"));
             }
-            "object-format" => {
+            "object-format" | "object-format-sha256" => {
+                let format = object_format_from_head(&f.clone).unwrap();
+                let expected_host = if format == "sha1" { "sha256" } else { "sha1" };
+                let host_default = git()
+                    .args(["config", "--global", "init.defaultObjectFormat"])
+                    .output()
+                    .unwrap();
                 assert_eq!(
-                    run(&f.clone, &["rev-parse", "--show-object-format"]),
-                    "sha1"
+                    String::from_utf8(host_default.stdout).unwrap().trim(),
+                    expected_host
                 );
+                assert_eq!(f.remote_sha(), None);
                 f.push();
                 assert_eq!(f.remote_sha(), Some(f.head()));
+                f.commit(true);
+                f.push();
+                assert_eq!(f.remote_sha(), Some(f.head()));
+                run(
+                    &f.remote,
+                    &["update-ref", "refs/heads/wip/another-run", &f.head()],
+                );
+                let cleanup = RemoteCleanup::prepare(&f.clone, &f.cfg, &f.ck).unwrap();
+                let path = cleanup.scratch.0.clone();
+                assert_eq!(run(&path, &["rev-parse", "--show-object-format"]), format);
+                // Prepared deletion must work after removal of the clone/alternates.
+                std::fs::remove_dir_all(&f.clone).unwrap();
+                cleanup.delete().unwrap();
+                assert!(!path.exists());
+                assert_eq!(
+                    run(&f.remote, &["for-each-ref", "--format=%(refname)"]),
+                    "refs/heads/wip/another-run"
+                );
             }
+            "credentials" => authenticated_transport_control(&mut f),
             "missing" => {
                 run(&f.source, &["remote", "remove", "origin"]);
                 f.push();
@@ -1777,6 +2120,29 @@ mod tests {
                 );
                 assert!(start.elapsed() < Duration::from_secs(3));
                 assert_stalled_transport_terminated();
+                let dest = destination(&f.source, &f.clone, &f.cfg).unwrap();
+                f.custody = Some(CustodyState {
+                    destination: dest.identity,
+                    destination_fingerprint: dest.fingerprint,
+                    normal: PushRecord {
+                        r#ref: "refs/heads/wip/impl-test".into(),
+                        last_pushed_sha: Some(f.head()),
+                    },
+                    ..Default::default()
+                });
+                crate::implement_resume::save_checkpoint_with_custody(
+                    &f.clone,
+                    &f.ck,
+                    f.custody.clone(),
+                )
+                .unwrap();
+                let cleanup = RemoteCleanup::prepare(&f.clone, &f.cfg, &f.ck).unwrap();
+                let path = cleanup.scratch.0.clone();
+                let start = Instant::now();
+                assert_eq!(cleanup.delete().unwrap_err(), "custody git timeout");
+                assert!(start.elapsed() < Duration::from_secs(3));
+                assert_stalled_transport_terminated();
+                assert!(!path.exists());
             }
             "host-config" => {
                 // An unpublished submodule commit would make on-demand push

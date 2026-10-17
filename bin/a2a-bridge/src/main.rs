@@ -13148,6 +13148,11 @@ esac
     #[test]
     fn custody_old_checkpoint_merge_path_pushes_before_landing() {
         let (root, source, clone, config) = clone_entry_fixture("merge", "absent", false);
+        // Retain the run ref so this legacy-checkpoint regression can inspect
+        // publication after landing; cleanup is enabled by default.
+        let mut config_text = std::fs::read_to_string(&config).unwrap();
+        config_text.push_str("\n[custody]\ndelete_remote_on_merge = false\n");
+        std::fs::write(&config, config_text).unwrap();
         let remote = root.path().join("backup.git");
         std::fs::remove_file(clone.join(".git/a2a-bridge/container-runs.json")).unwrap();
         let sha = custody_git(&clone, &["rev-parse", "HEAD"]);
