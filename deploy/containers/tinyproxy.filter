@@ -3,6 +3,8 @@
 (^|\.)anthropic\.com$
 (^|\.)openai\.com$
 (^|\.)chatgpt\.com$
+# OpenCode Go 1.18.27's 2026-10-18 fixed-PONG proxy log showed only inference and model-catalog hosts.
+^(models\.)?opencode\.ai$
 # kiro (Amazon Q / Cognito + kiro.dev) — EXACT region-pinned hosts from the proxy log (Task 9), NOT a
 # broad amazonaws.com glob. The q.us-east-1 regex also covers desktop-release.q.us-east-1.amazonaws.com.
 (^|\.)cognito-identity\.us-east-1\.amazonaws\.com$

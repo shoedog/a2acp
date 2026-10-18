@@ -1,6 +1,6 @@
 # Containerized Agents — Operator Runbook (Slice A)
 
-Run the a2a-bridge's review/design agents (claude, codex, kiro) as **`:ro` containerized readers**
+Run the a2a-bridge's review/design agents (claude, codex, kiro, OpenCode Go) as **`:ro` containerized readers**
 behind an **egress-locked proxy**, plus a non-process **ollama** (`kind="api"`) agent. Containment is
 the security boundary (ADR-0013/ADR-0016): the `:ro` mount is the only hard read-only guarantee, and
 egress is locked to the model providers only.
@@ -153,6 +153,15 @@ codex-acp's advertised browser-login action. Do not also set `auth_method` on th
   echo "Reply with exactly: KIRO_OK" | docker run -i --rm -v a2a-kiro-data:/root/.local/share \
     a2a-agent-reader:latest kiro-cli chat --no-interactive --wrap never
   ```
+- **OpenCode Go** — source the Go key from `OPENCODE_API_KEY`, then create the dedicated store file before
+  serving: `OPENCODE_API_KEY=... deploy/containers/sync-creds.sh opencode`. `sync-creds.sh opencode` copies the
+  key from the environment of the shell that runs it; for zsh, a non-interactive shell reads `~/.zshenv`, so keep
+  the key current there. The script writes only
+  `~/.config/a2a-creds/opencode/auth.json`, mode `0600`, with OpenCode's API credential shape and refreshes
+  it in place so an existing bind mount retains its inode. The pinned [v1.18.27 credential lookup](https://github.com/anomalyco/opencode/blob/v1.18.27/packages/opencode/src/auth/index.ts)
+  reads the `opencode-go` and `opencode` provider records, while `opencode-go/...` remains the model namespace. The reader mounts that file read-only at the
+  documented `~/.local/share/opencode/auth.json` location; it mounts no Git credential. Missing keys report
+  a diagnostic without rendering the key.
 - **ollama** — local needs a pulled model (`ollama pull qwen2.5-coder:7b`); cloud needs
   `OLLAMA_API_KEY` in the serve process env (`base_url = https://ollama.com/v1`).
 
@@ -244,7 +253,11 @@ docker logs a2a-egress-proxy 2>&1 | grep -i "refused on filtered" | sed -E 's/.*
 Add the **exact** hosts as anchored ERE regexes (NOT broad globs like `amazonaws.com`), then
 `up -d --build`. Discovered so far: claude `*.anthropic.com`; **codex `chatgpt.com`** (ChatGPT
 backend, not `api.openai.com`); **kiro `cognito-identity.us-east-1.amazonaws.com`,
-`q.us-east-1.amazonaws.com`, `*.kiro.dev`**.
+`q.us-east-1.amazonaws.com`, `*.kiro.dev`**; and **OpenCode Go `opencode.ai` plus `models.opencode.ai`**. The
+2026-10-18 proxy log for the pinned 1.18.27 fixed PONG showed only those inference and model-catalog hosts, so
+the filter permits `^(models\\.)?opencode\\.ai$` only. OpenCode also attempts `registry.npmjs.org` at startup;
+that request is intentionally blocked, and the fixed PONG passes without it. Auxiliary-host acceptance remains
+open: before adding one, retain the orchestrator proxy log that shows the pinned client requested that exact hostname.
 
 ## 7. Fallbacks & caveats
 

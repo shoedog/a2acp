@@ -178,9 +178,9 @@ name = "test"
 cmd  = "npm test --if-present"   # honors the project's test script; no-op if absent
 
 [registry]
-# podman: the container runtime for the impl/kiro/verify sandboxes.
+# podman: the container runtime for the impl/kiro/opencode-go/verify sandboxes.
 # codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
-allowed_cmds = ["podman", "codex-acp", "claude-agent-acp"]
+allowed_cmds = ["podman", "codex-acp", "claude-agent-acp", "opencode"]
 
 [server]
 addr = "127.0.0.1:8080"
@@ -241,6 +241,43 @@ egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
 volumes = ["a2a-kiro-data:/root/.local/share"]
+
+[[agents]]
+id   = "opencode-go"
+cmd  = "opencode"
+args = ["acp"]
+pre_authenticated = true
+model = "opencode-go/kimi-k3"
+[agents.sandbox]
+runtime = "podman"
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+no_proxy = "localhost,127.0.0.1,::1"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/opencode/auth.json:/root/.local/share/opencode/auth.json:ro"]
+
+# OpenCode Go can also implement in a quarantine clone after an operator creates a separate workflow.
+# It inherits the toolchain image, has no Git credential volume, and uses the same isolated Go credential store.
+# [[agents]]
+# id   = "opencode-go-impl"
+# kind = "container_rw"
+# cmd  = "opencode"
+# args = ["acp"]
+# pre_authenticated = true
+# model = "opencode-go/kimi-k2.7-code"
+# [agents.sandbox]
+# runtime = "podman"
+# image   = "a2a-toolchain:latest"
+# mount   = "/Users/wesleyjinks/code"
+# access  = "rw"
+# egress  = "locked"
+# network = "a2a-egress-internal"
+# proxy   = "http://a2a-egress-proxy:8888"
+# no_proxy = "localhost,127.0.0.1,::1"
+# volumes = ["/Users/wesleyjinks/.config/a2a-creds/opencode/auth.json:/root/.local/share/opencode/auth.json:ro"]
 
 # ── impl: WRITE-capable containerized agent (kind="container_rw" PERMITS access="rw"). Under `implement`
 #    it runs WARM (one container + one ACP session across the edit+fix turns, reaped at the end — ADR-0024);
@@ -328,6 +365,24 @@ id = "review"
 agent = "codex"
 prompt = "review-sol-risk"
 inputs = []
+
+[[workflows]]
+id = "code-review-oc"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt = "review-sol-risk"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-oc-synth.md"
+inputs = ["review", "opencode"]
 
 [[workflows]]
 id = "implement-review-sol"
@@ -489,6 +544,39 @@ prompt_file = "../prompts/spec-review-synth.md"
 inputs = ["rigor", "soundness"]
 
 [[workflows]]
+id = "spec-review-oc"
+[[workflows.nodes]]
+id = "rigordraft"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundnessdraft"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-oc-synth.md"
+inputs = ["rigor", "soundness", "opencode"]
+
+[[workflows]]
 id = "plan-review"
 [[workflows.nodes]]
 id = "execdraft"
@@ -515,6 +603,39 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/plan-review-synth.md"
 inputs = ["exec", "coverage"]
+
+[[workflows]]
+id = "plan-review-oc"
+[[workflows.nodes]]
+id = "execdraft"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coveragedraft"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-oc-synth.md"
+inputs = ["exec", "coverage", "opencode"]
 
 [[workflows]]
 id = "design"

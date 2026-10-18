@@ -6,11 +6,14 @@ const REQUIRED_READER_PINS: &[&str] = &[
     "@openai/codex@0.162.1",
     "@agentclientprotocol/claude-agent-acp@0.93.0",
     "@anthropic-ai/claude-agent-sdk@0.3.300",
+    "opencode-ai@1.18.27",
+    "test \"$(opencode --version)\" = \"1.18.27\"",
     "claudeCodeVersion\")\" = \"2.1.300\"",
     "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.2.2\"",
     "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.162.1\"",
     "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.93.0\"",
     "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.300\"",
+    "io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.18.27\"",
     "io.a2a-bridge.provenance.kiro.agent-cli=\"kiro-cli=2.24.1\"",
     "ARG KIRO_CLI_VERSION=2.24.1",
     "ARG KIRO_CLI_AMD64_SHA256=0187d8f613b4ad6b63f7fe069a187c33c79664ee9874ec5848faa7dc8c001ef9",
@@ -27,10 +30,12 @@ const SINGLE_OCCURRENCE_MARKERS: &[&str] = &[
     "@openai/codex@",
     "@agentclientprotocol/claude-agent-acp@",
     "@anthropic-ai/claude-agent-sdk@",
+    "opencode-ai@",
     "io.a2a-bridge.provenance.codex.adapter=",
     "io.a2a-bridge.provenance.codex.agent-cli=",
     "io.a2a-bridge.provenance.claude.adapter=",
     "io.a2a-bridge.provenance.claude.agent-cli=",
+    "io.a2a-bridge.provenance.opencode.agent-cli=",
     "io.a2a-bridge.provenance.kiro.agent-cli=",
     "ARG KIRO_CLI_VERSION=",
     "ARG KIRO_CLI_AMD64_SHA256=",
@@ -91,6 +96,14 @@ fn validate_reader_pins(containerfile: &str) -> Result<(), Vec<&'static str>> {
             .copied()
             .filter(|marker| containerfile.matches(marker).count() != 1),
     );
+    let opencode_selectors = containerfile
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| matches!(c, '\\' | ',' | '"' | '\'')))
+        .filter(|token| *token == "opencode-ai" || token.starts_with("opencode-ai@"))
+        .collect::<Vec<_>>();
+    if opencode_selectors != ["opencode-ai@1.18.27"] {
+        problems.push("every OpenCode npm selector must use opencode-ai@1.18.27");
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -121,6 +134,9 @@ fn reader_pin_guard_rejects_floating_or_mismatched_nested_versions() {
     let mismatched_claude = valid.replace("2.1.300", "2.1.303");
     assert!(validate_reader_pins(&mismatched_claude).is_err());
 
+    let floating_opencode = valid.replace("opencode-ai@1.18.27", "opencode-ai@latest");
+    assert!(validate_reader_pins(&floating_opencode).is_err());
+
     let mutable_kiro = format!("{valid}\nhttps://example.invalid/latest/kirocli.zip");
     assert!(validate_reader_pins(&mutable_kiro).is_err());
 }
@@ -137,10 +153,19 @@ fn reader_pin_guard_rejects_additive_selectors_and_duplicate_labels() {
     );
     assert!(validate_reader_pins(&additive_floating).is_err());
 
+    let additive_unversioned_opencode =
+        format!("{containerfile}\nRUN npm install -g opencode-ai\n");
+    assert!(validate_reader_pins(&additive_unversioned_opencode).is_err());
+
     let conflicting_label = format!(
         "{containerfile}\nLABEL io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.0.1\"\n"
     );
     assert!(validate_reader_pins(&conflicting_label).is_err());
+
+    let conflicting_opencode_label = format!(
+        "{containerfile}\nLABEL io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=9.9.9\"\n"
+    );
+    assert!(validate_reader_pins(&conflicting_opencode_label).is_err());
 
     let second_kiro_version = format!("{containerfile}\nARG KIRO_CLI_VERSION=9.9.9\n");
     assert!(validate_reader_pins(&second_kiro_version).is_err());

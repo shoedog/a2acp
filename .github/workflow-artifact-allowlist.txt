@@ -24,9 +24,11 @@ prompts/plan-review-coverage-refine.md
 prompts/plan-review-coverage.md
 prompts/plan-review-exec-refine.md
 prompts/plan-review-exec.md
+prompts/plan-review-oc-synth.md
 prompts/plan-review-synth.md
 prompts/review-architecture.md
 prompts/review-correctness.md
+prompts/review-implement-oc-synth.md
 prompts/review-implement-refine.md
 prompts/review-implement-synth.md
 prompts/review-implement.md
@@ -34,6 +36,7 @@ prompts/review-sol-risk.md
 prompts/review-synth.md
 prompts/smoke-read.md
 prompts/smoke-reply.md
+prompts/spec-review-oc-synth.md
 prompts/spec-review-rigor-refine.md
 prompts/spec-review-rigor.md
 prompts/spec-review-soundness-refine.md
