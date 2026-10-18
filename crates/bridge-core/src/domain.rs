@@ -193,7 +193,7 @@ pub struct AgentOverride {
 
 /// Per-session config the backend applies at ACP mint.
 /// `model` is the agent-native id (NO `{provider}@{model}`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveConfig {
     pub model: Option<String>,
     pub effort: Option<Effort>,

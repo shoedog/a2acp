@@ -1844,8 +1844,13 @@ fn workflow_progress_events(kind: &crate::reattach::FrameKind) -> Vec<Event> {
                 reason.as_str()
             ))]
         }
-        crate::reattach::FrameKind::NodeStarted { node } => {
-            vec![Event::status(format!("node {node} started"))]
+        crate::reattach::FrameKind::NodeStarted { node, selection } => {
+            let mut event = Event::status(format!("node {node} started"))
+                .with_metadata("a2a-bridge.node", node.clone());
+            if let Some(selection) = selection {
+                event = event.with_metadata("a2a-bridge.configured-selection", serde_json::json!(selection));
+            }
+            vec![event]
         }
         crate::reattach::FrameKind::NodeFinished {
             node,
@@ -2506,6 +2511,7 @@ fn snapshot_frames(
                 phase: crate::reattach::Phase::Snapshot,
                 kind: crate::reattach::FrameKind::NodeStarted {
                     node: node.as_str().to_string(),
+                    selection: None,
                 },
             });
         }
@@ -2545,7 +2551,8 @@ struct ToolCallFold {
 
 /// Build the ordered, cursor-filtered snapshot phase including folded rich ACP rows.
 ///
-/// Node frames come from the existing S6 projection unchanged. Rich rows are folded
+/// Node frames retain journaled configuration intent, including starts of completed nodes.
+/// Rich rows are folded
 /// over the durable journal in seq order, merged with node frames, and only then
 /// filtered by the cursor so the reattach snapshot has one consistent ordering.
 fn rich_snapshot_frames(
@@ -2566,10 +2573,14 @@ fn rich_snapshot_frames(
         .map(|(seq, node, index)| ((seq, node), index))
         .collect::<std::collections::HashMap<_, _>>();
     let mut latest_plan = None;
+    let mut latest_starts = std::collections::HashMap::new();
     let mut tool_calls = std::collections::HashMap::<String, ToolCallFold>::new();
 
     for event in events {
         match &event.kind {
+            bridge_core::orch::OrchEventKind::NodeStarted { node, .. } => {
+                latest_starts.insert(node, event);
+            }
             bridge_core::orch::OrchEventKind::NodeFinished { node, .. } => {
                 if let Some(index) = node_frame_positions.get(&(event.seq, node.clone())) {
                     if let Some(projected) = crate::reattach::project_orch_frame(
@@ -2654,6 +2665,22 @@ fn rich_snapshot_frames(
                 entry.last_seq = event.seq;
             }
             _ => {}
+        }
+    }
+
+    for (node, event) in latest_starts {
+        let projected = crate::reattach::project_orch_frame(
+            &event.kind,
+            crate::reattach::Phase::Snapshot,
+            event.seq,
+        )
+        .expect("node starts project");
+        if let Some(frame) = frames.iter_mut().find(|frame| matches!(&frame.kind, crate::reattach::FrameKind::NodeStarted { node: started, .. } if started == node)) {
+            if frame.seq == event.seq { *frame = projected; }
+        } else if matches!(&event.kind, bridge_core::orch::OrchEventKind::NodeStarted { selection: Some(_), .. }) {
+            // Completed/terminal nodes no longer have a typed start row. Preserve its
+            // journal sequence so the normal ordering and cursor filter still apply.
+            frames.push(projected);
         }
     }
 
@@ -7288,6 +7315,9 @@ mod tests {
                 id: WorkflowId::parse("code-review").unwrap(),
                 nodes: vec![
                     WorkflowNode {
+                        model: None,
+                        effort: None,
+                        mode: None,
                         id: NodeId::parse("reviewer").unwrap(),
                         agent: AgentId::parse("codex").unwrap(),
                         prompt_template: "{{input}}".into(),
@@ -7296,6 +7326,9 @@ mod tests {
                         harvest_sanitization: None,
                     },
                     WorkflowNode {
+                        model: None,
+                        effort: None,
+                        mode: None,
                         id: NodeId::parse("synth").unwrap(),
                         agent: AgentId::parse("codex").unwrap(),
                         prompt_template: "{{reviewer}}".into(),
@@ -12676,6 +12709,9 @@ mod tests {
             cwd: Some(cwd.clone()),
         };
         let node = WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: bridge_core::ids::NodeId::parse("n1").unwrap(),
             agent: AgentId::parse("a").unwrap(),
             prompt_template: "go".into(),
@@ -12789,6 +12825,9 @@ mod tests {
             cwd: None,
         };
         let node = WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: bridge_core::ids::NodeId::parse("n1").unwrap(),
             agent: AgentId::parse("a").unwrap(),
             prompt_template: "go".into(),
@@ -12942,6 +12981,9 @@ mod tests {
             let graph = Arc::new(WorkflowGraph {
                 id: bridge_core::ids::WorkflowId::parse(&workflow_raw).unwrap(),
                 nodes: vec![WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: bridge_core::ids::NodeId::parse("n1").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13390,6 +13432,9 @@ mod tests {
         let graph = Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf-observed").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("n1").unwrap(),
                 agent: AgentId::parse("a").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -14485,6 +14530,9 @@ mod tests {
         let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("kiro").unwrap(),
                 prompt_template: "review {{input}}".into(),
@@ -17922,6 +17970,9 @@ mod tests {
         let graph = WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: terminal_node.clone(),
                 agent: AgentId::parse("kiro").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -19065,6 +19116,115 @@ mod tests {
             ],
             "in-flight: snapshot then live tail, no dup/gap: {frames:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn served_selection_survives_live_reconnect_terminal_and_cursors() {
+        use crate::workflow_sink::WorkflowSink;
+        use bridge_core::domain::{EffectiveConfig, Effort};
+        async fn values(response: Response) -> Vec<Value> {
+            sse_data_payloads(&body_string(response).await)
+                .iter()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect()
+        }
+        let store = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task = seed_task_record(&store, "selection-replay").await;
+        let srv = build_with_task_store(store.clone());
+        let hub = insert_hub(&srv, &task).await;
+        let live = durable_workflow_a2a_sse_response(&srv, &task, json!(1)).await;
+        let mut sink = crate::workflow_sink::DetachedProgressSink::new(
+            store.clone(),
+            task.clone(),
+            hub.clone(),
+        );
+        let selections =
+            ["opencode-go/kimi-k3", "opencode-go/deepseek-v4-pro"].map(|model| EffectiveConfig {
+                model: Some(model.into()),
+                effort: Some(Effort::High),
+                mode: Some("code".into()),
+            });
+        for (node, selection) in ["a", "b"].into_iter().zip(&selections) {
+            sink.node_started_with_selection(node, Some(selection))
+                .await
+                .unwrap();
+        }
+        sink.node_started("old").await.unwrap();
+        let op = operation_id_for_task(&task);
+        let a = bridge_core::ids::NodeId::parse("a").unwrap();
+        let b = bridge_core::ids::NodeId::parse("b").unwrap();
+        store
+            .put_node_checkpoint_sequenced(&task, &a, &op, "a", true, 1, None)
+            .await
+            .unwrap();
+        let reconnect = call_subscribe(&srv, task.as_str(), None).await;
+        let cursor = call_subscribe(&srv, task.as_str(), Some(1)).await;
+        store
+            .put_node_checkpoint_sequenced(&task, &b, &op, "b", true, 1, None)
+            .await
+            .unwrap();
+        sink.terminal(
+            bridge_workflow::executor::WorkflowOutcome::Completed,
+            "done".into(),
+        )
+        .await
+        .unwrap();
+        for response in [
+            live,
+            durable_workflow_a2a_sse_response(&srv, &task, json!(2)).await,
+        ] {
+            let statuses: Vec<_> = values(response)
+                .await
+                .into_iter()
+                .filter_map(|value| match serde_json::from_value(value).unwrap() {
+                    a2a::StreamResponse::StatusUpdate(event) => event.metadata,
+                    _ => None,
+                })
+                .collect();
+            for (node, selection) in ["a", "b"].into_iter().zip(&selections) {
+                let matches: Vec<_> = statuses
+                    .iter()
+                    .filter(|m| {
+                        m.get("a2a-bridge.node") == Some(&json!(node))
+                            && m.contains_key("a2a-bridge.configured-selection")
+                    })
+                    .collect();
+                assert_eq!(matches.len(), 1);
+                assert_eq!(
+                    matches[0]["a2a-bridge.configured-selection"],
+                    json!(selection)
+                );
+            }
+        }
+        for response in [reconnect, call_subscribe(&srv, task.as_str(), None).await] {
+            let frames = values(response).await;
+            let starts: Vec<_> = frames
+                .iter()
+                .filter(|v| v["kind"] == "node_started")
+                .collect();
+            for (node, selection) in ["a", "b"].into_iter().zip(&selections) {
+                let matches: Vec<_> = starts.iter().filter(|v| v["node"] == node).collect();
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0]["selection"], json!(selection));
+            }
+            for old in starts.iter().filter(|v| v["node"] == "old") {
+                assert!(old.get("selection").is_none());
+            }
+        }
+        let filtered = values(cursor).await;
+        assert!(!filtered
+            .iter()
+            .any(|v| v["kind"] == "node_started" && v["node"] == "a"));
+        assert_eq!(
+            filtered
+                .iter()
+                .filter(|v| v["kind"] == "node_started" && v["node"] == "b")
+                .count(),
+            1
+        );
+        let covered = values(call_subscribe(&srv, task.as_str(), Some(i64::MAX)).await).await;
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0]["kind"], "snapshot_complete");
     }
 
     /// (9a2) A Working task with an IN-PROGRESS node — a `record_node_started` with no

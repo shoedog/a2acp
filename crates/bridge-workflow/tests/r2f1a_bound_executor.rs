@@ -43,6 +43,8 @@ impl Lease for NoopLease {}
 
 #[derive(Default)]
 struct Calls {
+    dispatches: Mutex<Vec<(String, bridge_core::domain::EffectiveConfig)>>,
+    session_configs: Mutex<BTreeMap<String, bridge_core::domain::EffectiveConfig>>,
     unbound_resolves: AtomicUsize,
     binds: AtomicUsize,
     bound_resolves: AtomicUsize,
@@ -110,9 +112,13 @@ impl AgentBackend for FanoutBackend {
 impl AgentBackend for RecordingBackend {
     async fn prompt(
         &self,
-        _session: &SessionId,
+        session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        self.calls.dispatches.lock().unwrap().push((
+            parts[0].text.clone(),
+            self.calls.session_configs.lock().unwrap()[session.as_str()].clone(),
+        ));
         let is_preflight = parts
             .first()
             .is_some_and(|part| part.text == "Reply with exactly PONG and nothing else.");
@@ -148,9 +154,14 @@ impl AgentBackend for RecordingBackend {
 
     async fn configure_bound_session(
         &self,
-        _session: &SessionId,
+        session: &SessionId,
         spec: &BoundSessionSpecV1,
     ) -> Result<(), BridgeError> {
+        self.calls
+            .session_configs
+            .lock()
+            .unwrap()
+            .insert(session.as_str().into(), spec.session.config.clone());
         self.calls.bound_specs.lock().unwrap().push(spec.clone());
         Ok(())
     }
@@ -367,6 +378,9 @@ fn frozen_worktree_run_with_controls(
     let graph = WorkflowGraph {
         id: WorkflowId::parse("review").unwrap(),
         nodes: vec![WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("review-node").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "{{input}}".into(),
@@ -402,6 +416,9 @@ fn frozen_fail_fast_run_with_ledger(
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let nodes = vec![
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("fail-root").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "FAIL_ROOT".into(),
@@ -410,6 +427,9 @@ fn frozen_fail_fast_run_with_ledger(
             harvest_sanitization: None,
         },
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("slow-root").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "SLOW_ROOT".into(),
@@ -418,6 +438,9 @@ fn frozen_fail_fast_run_with_ledger(
             harvest_sanitization: None,
         },
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("synth").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "SYNTH_NODE {{fail-root}} {{slow-root}}".into(),
@@ -904,7 +927,7 @@ async fn v2_fail_fast_cancels_running_sibling_and_never_admits_synthesis() {
     assert_eq!(calls.synth_prompts.load(Ordering::SeqCst), 0);
     assert!(!events.iter().any(|event| matches!(
         event,
-        WorkflowEvent::NodeStarted { node } if node.as_str() == "synth"
+        WorkflowEvent::NodeStarted { node, .. } if node.as_str() == "synth"
     )));
     assert!(matches!(
         events.last(),
@@ -1748,6 +1771,9 @@ fn frozen_synthesis_run(entry: &AgentEntry, synthesis: SynthesisModeV1) -> Workf
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let nodes = vec![
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("root").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "ROOT_FAIL".into(),
@@ -1756,6 +1782,9 @@ fn frozen_synthesis_run(entry: &AgentEntry, synthesis: SynthesisModeV1) -> Workf
             harvest_sanitization: None,
         },
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("middle").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "MID_NODE {{root}}".into(),
@@ -1764,6 +1793,9 @@ fn frozen_synthesis_run(entry: &AgentEntry, synthesis: SynthesisModeV1) -> Workf
             harvest_sanitization: None,
         },
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("terminal").unwrap(),
             agent: entry.id.clone(),
             prompt_template: "FINAL_NODE {{middle}}".into(),
@@ -1890,7 +1922,7 @@ async fn v2_strict_synthesis_structurally_skips_failed_dependency_chain() {
     );
     assert!(!events.iter().any(|event| matches!(
         event,
-        WorkflowEvent::NodeStarted { node }
+        WorkflowEvent::NodeStarted { node, .. }
             if matches!(node.as_str(), "middle" | "terminal")
     )));
     for node in ["middle", "terminal"] {
@@ -2203,6 +2235,9 @@ async fn admit_through_production_admission(
     let graph = Arc::new(WorkflowGraph {
         id: WorkflowId::parse("review").unwrap(),
         nodes: vec![WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("review-node").unwrap(),
             agent: AgentId::parse("codex").unwrap(),
             prompt_template: "{{input}}".into(),
@@ -2437,6 +2472,9 @@ async fn fresh_v3_binder_refuses_run_spec_from_another_genuine_admission() {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse(workflow_id).unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse(node_id).unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: prompt_template.into(),
@@ -2548,4 +2586,112 @@ async fn an_admission_with_no_contract_still_routes_v2_through_the_same_binder()
         specs[0].custody().is_none(),
         "a V2 admission must reach the backend indistinguishable from before this slice"
     );
+}
+
+#[tokio::test]
+async fn node_selections_survive_frozen_admission_restore_and_execution() {
+    use bridge_core::domain::Effort;
+    use bridge_workflow::admission::{
+        DirectWorkflowCheckoutPlannerV1, WorkflowAdmissionRequestV1, WorkflowAdmissionV1,
+    };
+    for preflight in [false, true] {
+        let mut configured = entry();
+        configured.preflight = preflight;
+        configured.fallback_models.clear();
+        let calls = Arc::new(Calls::default());
+        let registry = Arc::new(BoundOnlyRegistry {
+            entry: Arc::new(configured.clone()),
+            backend: Arc::new(RecordingBackend {
+                calls: calls.clone(),
+            }),
+            slot: Arc::new(()),
+            calls: calls.clone(),
+            fail_preflight_ordinal: None,
+        });
+        let admission = WorkflowAdmissionV1::new(
+            registry.clone(),
+            Arc::new(DirectWorkflowCheckoutPlannerV1),
+            SessionCwd::parse("/repo/source").unwrap(),
+            None,
+        );
+        let mut graph = frozen_worktree_run(&configured).graph;
+        let mut first = graph.nodes[0].clone();
+        first.model = Some("opencode-go/kimi-k3".into());
+        first.effort = Some(Effort::High);
+        first.mode = Some("code".into());
+        let mut second = first.clone();
+        second.id = NodeId::parse("second").unwrap();
+        second.model = Some("opencode-go/deepseek-v4-pro".into());
+        second.inputs = vec![first.id.clone()];
+        graph.nodes = vec![first, second];
+        for node in &mut graph.nodes {
+            node.prompt_template = node.id.as_str().into();
+        }
+        let admitted = admission
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: bridge_core::ids::AttemptIdentity::initial()
+                    .unwrap()
+                    .attempt_id,
+                graph: Arc::new(graph),
+                requested_session_cwd: None,
+                policy_invocation: ExecutionPolicyInvocationV1::default(),
+                ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                    kind: HistoryAllocationKindV1::Configured,
+                },
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        let encoded = serde_json::to_string(admitted.run_spec.as_ref()).unwrap();
+        let restored = admission
+            .restore(serde_json::from_str(&encoded).unwrap())
+            .unwrap();
+        let run_spec = restored.run_spec;
+        assert_ne!(
+            run_spec.node_execution_identities[0]
+                .selection
+                .selection_digest,
+            run_spec.node_execution_identities[1]
+                .selection
+                .selection_digest
+        );
+        let mut tampered = (*run_spec).clone();
+        tampered.graph.nodes[0].model = Some("other".into());
+        assert!(tampered.validate().is_err());
+        let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+            .with_frozen_run_spec(run_spec.clone(), None)
+            .unwrap();
+        let events: Vec<_> = WorkflowExecutor::new(registry)
+            .run_with_diagnostic_context(
+                Arc::new(run_spec.graph.clone()),
+                "review".into(),
+                "node-frozen".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect()
+            .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Ok(WorkflowEvent::Terminal {
+                    outcome: WorkflowOutcome::Completed,
+                    ..
+                })
+            )),
+            "{events:?}"
+        );
+        let specs = calls.bound_specs.lock().unwrap();
+        assert_eq!(specs.len(), if preflight { 4 } else { 2 });
+        for node in &run_spec.graph.nodes {
+            let expected = node.effective_config(&configured);
+            let dispatches = calls.dispatches.lock().unwrap();
+            let actual: Vec<_> = dispatches
+                .iter()
+                .filter(|(prompt, _)| prompt == node.id.as_str())
+                .collect();
+            assert_eq!(actual.len(), 1);
+            assert_eq!(actual[0].1, expected);
+        }
+    }
 }

@@ -78,9 +78,10 @@ fn serve_one_response_observed(
         let mut request = [0_u8; 16 * 1024];
         let mut request_len = 0;
         loop {
-            let read = stream
-                .read(&mut request[request_len..])
-                .expect("read fake model request");
+            let read = match stream.read(&mut request[request_len..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other.expect("read fake model request"),
+            };
             assert!(read > 0, "model request closed before headers completed");
             request_len += read;
             if let Some(first_read) = first_read.take() {
@@ -129,7 +130,14 @@ fn fake_model_endpoint_waits_for_complete_request_headers() {
     first_read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
     let mut first_response_byte = [0_u8; 1];
-    let early_read = client.read(&mut first_response_byte);
+    // A signal (e.g. SIGCHLD from parallel tests, or coverage tooling) can interrupt the blocking read
+    // before its timeout; EINTR says nothing about the endpoint, so retry it.
+    let early_read = loop {
+        match client.read(&mut first_response_byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => break other,
+        }
+    };
     assert!(
         matches!(
             early_read,
@@ -192,6 +200,13 @@ fn configured_agent_probe_failure_is_structured_and_nonzero() {
             .is_some_and(|error| error.contains("spawn") && !error.is_empty()),
         "deepest bounded error was not retained: {failure}",
     );
+    let filtered = bridge_models(
+        &config,
+        &["--agent", "broken", "--match", "no-match", "--json"],
+    );
+    assert!(!filtered.status.success());
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(&filtered["broken"]["failure"], failure);
     assert_eq!(failure["diagnostic"]["failed_phase"], "spawn");
     let deepest = failure["diagnostic"]["causes"]
         .as_array()
@@ -402,4 +417,38 @@ fn non_success_api_status_is_provider_error_and_body_is_not_exposed() {
     assert!(!value
         .to_string()
         .contains("body-must-not-be-treated-as-models-or-echoed"));
+}
+
+#[test]
+fn models_match_filters_text_json_and_preserves_empty_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = dir.path().join("kiro-cli");
+    executable(&adapter, "#!/bin/sh\nprintf '%s\\n' '* opencode-go/kimi-k3 1x credits Kimi' 'opencode-go/deepseek-v4-pro 1x credits DeepSeek' 'other 1x credits Other'\n");
+    let config = dir.path().join("a2a-bridge.toml");
+    write_config(&config, &format!("default = \"one\"\n[server]\naddr = \"127.0.0.1:0\"\n[registry]\nallowed_cmds = [{adapter:?}]\n[[agents]]\nid = \"one\"\ncmd = {adapter:?}\n"));
+    for (filters, expected) in [
+        (
+            vec!["--match", "GO/KIMI", "--match", "DEEPSEEK"],
+            vec!["opencode-go/kimi-k3", "opencode-go/deepseek-v4-pro"],
+        ),
+        (vec!["--match", "no-match"], vec![]),
+    ] {
+        let mut args = vec!["--agent", "one", "--json"];
+        args.extend(&filters);
+        let output = bridge_models(&config, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["one"]["models"], serde_json::json!(expected));
+        assert_eq!(value["one"]["current"], "opencode-go/kimi-k3");
+        args.retain(|flag| *flag != "--json");
+        let text = bridge_models(&config, &args);
+        assert!(text.status.success());
+        let text = String::from_utf8(text.stdout).unwrap();
+        assert!(!text.contains("other"));
+        assert_eq!(text.contains("deepseek-v4-pro"), !expected.is_empty());
+    }
 }

@@ -16,9 +16,7 @@ use bridge_core::attestation::{
     append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
     PrefixAttestationCapability, PrefixAttestationStatus,
 };
-use bridge_core::domain::{
-    effective_config, AgentEntry, AgentOverride, EffectiveConfig, Part, SessionSpec,
-};
+use bridge_core::domain::{AgentEntry, AgentOverride, EffectiveConfig, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy as ep;
 use bridge_core::execution_policy::{
@@ -1333,7 +1331,10 @@ impl PreflightSource<'_> {
 
     fn cache_key(&self) -> String {
         match self {
-            Self::Legacy(entry) => entry.id.as_str().to_string(),
+            Self::Legacy(entry) => format!(
+                "legacy:{:?}:{:?}:{:?}:{:?}",
+                entry.id, entry.model, entry.effort, entry.mode
+            ),
             Self::Bound { identity, .. } => {
                 let mut effect_bytes = Vec::new();
                 for attempt in &identity.provider_attempts {
@@ -1922,14 +1923,11 @@ impl WorkflowOutcome {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the public event shape is stable and avoids a per-node heap allocation"
-)]
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
     NodeStarted {
         node: NodeId,
+        selection: Option<EffectiveConfig>,
     },
     NodeFinished {
         node: NodeId,
@@ -2023,6 +2021,28 @@ impl WorkflowExecutor {
         }
     }
 
+    /// Configuration intent only; backend capability resolution happens at session mint.
+    fn configured_node_selection(
+        &self,
+        node: &WorkflowNode,
+        authority: Option<&FrozenWorkflowAuthority>,
+    ) -> Option<EffectiveConfig> {
+        if let Some(authority) = authority {
+            authority
+                .node_identity(node)
+                .ok()
+                .map(|identity| EffectiveConfig {
+                    model: identity.selection.effective_model.clone(),
+                    effort: identity.selection.effective_effort,
+                    mode: identity.selection.effective_mode.clone(),
+                })
+        } else {
+            self.registry
+                .entry_snapshot(&node.agent)
+                .map(|entry| node.effective_config(&entry))
+        }
+    }
+
     fn bind_frozen_entry(
         &self,
         authority: &FrozenWorkflowAuthority,
@@ -2043,7 +2063,7 @@ impl WorkflowExecutor {
             .ok_or(BridgeError::BindUnsupported)?;
         let reconstructed = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
             entry: &bound.entry,
-            overrides: None,
+            overrides: Some(&node.overrides()),
             node: identity.node.clone(),
             logical_session,
             checkout: persisted.checkout.clone(),
@@ -2166,7 +2186,14 @@ impl WorkflowExecutor {
             diagnostic_factory,
             prompt_dispatch,
             cancel,
-            PreflightSource::Legacy(entry),
+            PreflightSource::Legacy(Arc::new({
+                let mut entry = (*entry).clone();
+                let config = node.effective_config(&entry);
+                entry.model = config.model;
+                entry.effort = config.effort;
+                entry.mode = config.mode;
+                entry
+            })),
             cache,
             cleanup_tracker,
         )
@@ -2322,7 +2349,7 @@ impl WorkflowExecutor {
                         };
                         resolved_result
                             .map(|resolved| {
-                                let mut config = effective_config(&resolved.entry, None);
+                                let mut config = node.effective_config(&resolved.entry);
                                 config.model = model.clone();
                                 WorkflowAttemptUse::Legacy { resolved, config }
                             })
@@ -2389,8 +2416,9 @@ impl WorkflowExecutor {
             }
 
             let session = match SessionId::parse(format!(
-                "workflow-preflight-{wf_id}-{}-{run_id}-{attempt_no}",
-                agent.as_str()
+                "workflow-preflight-{wf_id}-{}-{}-{run_id}-{attempt_no}",
+                agent.as_str(),
+                node.id.as_str()
             )) {
                 Ok(session) => session,
                 Err(error) => {
@@ -2965,17 +2993,16 @@ impl WorkflowExecutor {
                             );
                         }
                     };
-                    let mut eff = effective_config(entry, None);
+                    let mut eff = node.effective_config(entry);
                     eff.model = preflight_decision.selected_model.clone();
-                    let checkout_overrides =
-                        preflight_decision
-                            .substituted_from
-                            .as_ref()
-                            .map(|_| AgentOverride {
-                                model: preflight_decision.selected_model.clone(),
-                                effort: None,
-                                mode: None,
-                            });
+                    let checkout_overrides = (preflight_decision.substituted_from.is_some()
+                        || node.model.is_some()
+                        || node.effort.is_some()
+                        || node.mode.is_some())
+                    .then(|| AgentOverride {
+                        model: preflight_decision.selected_model.clone(),
+                        ..node.overrides()
+                    });
                     (
                         checkout_overrides,
                         eff.model.clone(),
@@ -2985,7 +3012,17 @@ impl WorkflowExecutor {
                         eff.mode.clone(),
                     )
                 } else {
-                    (None, None, None, None)
+                    let eff = entry_snapshot
+                        .as_ref()
+                        .map(|entry| node.effective_config(entry));
+                    (
+                        Some(node.overrides()),
+                        eff.as_ref().and_then(|e| e.model.clone()),
+                        eff.as_ref()
+                            .and_then(|e| e.effort)
+                            .map(|e| format!("{e:?}").to_ascii_lowercase()),
+                        eff.and_then(|e| e.mode),
+                    )
                 };
             let attempt = 1_u32;
             // A successful prompt-open makes this path deliberately single-attempt:
@@ -3879,7 +3916,7 @@ impl WorkflowExecutor {
                                 }
                             };
                         }
-                        let mut config = effective_config(&resolved.entry, None);
+                        let mut config = node.effective_config(&resolved.entry);
                         config.model = decision.selected_model.clone();
                         (WorkflowAttemptUse::Legacy { resolved, config }, decision)
                     };
@@ -5594,7 +5631,9 @@ impl WorkflowExecutor {
 
             let scheduler_started_ms = cleanup_clock.elapsed_ms();
             for node in schedule_ready!() {
-                yield Ok(WorkflowEvent::NodeStarted { node });
+                let selection = graph.nodes.iter().find(|n| n.id == node)
+                    .and_then(|n| this.configured_node_selection(n, frozen_authority.as_ref()));
+                yield Ok(WorkflowEvent::NodeStarted { node, selection });
             }
             use crate::scheduler_arbitration::SchedulerArmV1 as Arm;
             let scheduler_active = ep::scheduler_activation_readiness_v1()
@@ -6315,7 +6354,9 @@ impl WorkflowExecutor {
                     stop_scheduling = true;
                 }
                 for node in schedule_ready!() {
-                    yield Ok(WorkflowEvent::NodeStarted { node });
+                    let selection = graph.nodes.iter().find(|n| n.id == node)
+                    .and_then(|n| this.configured_node_selection(n, frozen_authority.as_ref()));
+                yield Ok(WorkflowEvent::NodeStarted { node, selection });
                 }
             }
             observe_external_root_cancellation!();
@@ -7126,6 +7167,9 @@ mod tests {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: prompt_template.into(),
@@ -7158,6 +7202,9 @@ mod tests {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "echo {{input}}".into(),
@@ -8801,6 +8848,8 @@ mod tests {
 
     #[derive(Default)]
     struct PreflightRec {
+        dispatches: Mutex<Vec<(String, String, EffectiveConfig)>>,
+        session_configs: Mutex<HashMap<String, EffectiveConfig>>,
         prompts: Mutex<Vec<String>>,
         configured_models: Mutex<Vec<Option<String>>>,
         session_models: Mutex<HashMap<String, Option<String>>>,
@@ -8981,6 +9030,20 @@ mod tests {
                 .get(session.as_str())
                 .cloned()
                 .unwrap_or_default();
+            let config = self
+                .rec
+                .session_configs
+                .lock()
+                .unwrap()
+                .get(session.as_str())
+                .cloned()
+                .unwrap_or_default();
+            self.rec.dispatches.lock().unwrap().push((
+                session.as_str().into(),
+                prompt.clone(),
+                config,
+            ));
+            tokio::task::yield_now().await;
             if prompt == WORKFLOW_PREFLIGHT_PROMPT {
                 if model.as_deref() == Some("reject") {
                     Err(preflight_prompt_failure(false))
@@ -9015,6 +9078,11 @@ mod tests {
                 }
             }
             self.rec
+                .session_configs
+                .lock()
+                .unwrap()
+                .insert(session.as_str().into(), spec.config.clone());
+            self.rec
                 .configured_models
                 .lock()
                 .unwrap()
@@ -9025,6 +9093,179 @@ mod tests {
                 .unwrap()
                 .insert(session.as_str().to_string(), spec.config.model.clone());
             Ok(())
+        }
+    }
+
+    struct SelectionDispatcher {
+        backend: Arc<PreflightBackend>,
+        entry: AgentEntry,
+    }
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for SelectionDispatcher {
+        async fn checkout(
+            &self,
+            _: &str,
+            _: &WorkflowNode,
+            _: &str,
+            _: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            unreachable!()
+        }
+        async fn checkout_observed_with_overrides(
+            &self,
+            _: &str,
+            node: &WorkflowNode,
+            _: &str,
+            _: &WorkflowRunContext,
+            overrides: Option<AgentOverride>,
+            _: Arc<dyn DiagnosticObserver>,
+        ) -> Result<NodeTurn, BridgeError> {
+            let session = SessionId::parse(format!("selection-{}", node.id.as_str()))?;
+            self.backend
+                .configure_session(
+                    &session,
+                    &SessionSpec::from_config(bridge_core::domain::effective_config(
+                        &self.entry,
+                        overrides.as_ref(),
+                    )),
+                )
+                .await?;
+            Ok(NodeTurn {
+                backend: self.backend.clone(),
+                session,
+                seed: None,
+                cleanup: Box::new(CompositePathCleanup),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn node_selections_reach_cold_and_dispatcher_with_distinct_preflights() {
+        for (preflight, rejection) in [(true, false), (false, false), (true, true)] {
+            for warm in [false, true] {
+                let rec = Arc::new(PreflightRec::default());
+                let models = ["opencode-go/kimi-k3", "opencode-go/deepseek-v4-pro"];
+                let backend = Arc::new(PreflightBackend {
+                    rec: rec.clone(),
+                    pong_models: models
+                        .iter()
+                        .filter(|s| !rejection || **s != models[1])
+                        .map(|s| s.to_string())
+                        .collect(),
+                    configure_gate: None,
+                });
+                let mut entry = preflight_entry("default-model", &[]);
+                entry.preflight = preflight;
+                entry.effort = Some(bridge_core::domain::Effort::Low);
+                entry.mode = Some("default-mode".into());
+                let registry = Arc::new(SharedBackendRegistry {
+                    entry: entry.clone(),
+                    backend: backend.clone(),
+                    invalidates: AtomicUsize::new(0),
+                });
+                let executor = WorkflowExecutor::new(registry);
+                let mut graph = (*one_node_graph()).clone();
+                let mut a = graph.nodes[0].clone();
+                a.model = Some(models[0].into());
+                a.effort = Some(bridge_core::domain::Effort::High);
+                a.mode = Some("code".into());
+                let mut b = a.clone();
+                b.id = NodeId::parse("b").unwrap();
+                b.inputs = vec![];
+                b.model = Some(models[1].into());
+                let mut c = a.clone();
+                c.id = NodeId::parse("c").unwrap();
+                c.inputs = vec![a.id.clone(), b.id.clone()];
+                let mut d = c.clone();
+                d.id = NodeId::parse("d").unwrap();
+                d.inputs = vec![c.id.clone()];
+                d.effort = None;
+                d.mode = None;
+                let mut e = d.clone();
+                e.id = NodeId::parse("e").unwrap();
+                e.inputs = vec![d.id.clone()];
+                e.mode = Some("code".into());
+                let expected: Vec<_> = [&a, &b, &c, &d, &e]
+                    .iter()
+                    .map(|n| n.effective_config(&entry))
+                    .collect();
+                graph.nodes = vec![a, b, c, d, e];
+                for node in &mut graph.nodes {
+                    node.prompt_template = node.id.as_str().into();
+                }
+                let stream = if warm {
+                    executor.run_with_context_and_dispatcher(
+                        Arc::new(graph),
+                        "DIFF".into(),
+                        "selection-run".into(),
+                        CancellationToken::new(),
+                        WorkflowRunContext::default(),
+                        Arc::new(SelectionDispatcher { backend, entry }),
+                    )
+                } else {
+                    executor.run(
+                        Arc::new(graph),
+                        "DIFF".into(),
+                        "selection-run".into(),
+                        CancellationToken::new(),
+                    )
+                };
+                let events: Vec<_> = stream
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .map(Result::unwrap)
+                    .collect();
+                let starts: Vec<_> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        WorkflowEvent::NodeStarted { selection, .. } => selection.clone(),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(starts, expected, "warm={warm}, preflight={preflight}");
+                assert!(events.iter().any(|e| matches!(
+                    e,
+                    WorkflowEvent::Terminal {
+                        outcome: WorkflowOutcome::Completed,
+                        ..
+                    }
+                )));
+                assert!(events.iter().any(|e| matches!(e, WorkflowEvent::NodeFinished { node, ok, .. } if node.as_str() == "b" && *ok != rejection)));
+                let dispatches = rec.dispatches.lock().unwrap();
+                for (node, selection) in ["only", "b", "c", "d", "e"].into_iter().zip(&expected) {
+                    let actual: Vec<_> = dispatches
+                        .iter()
+                        .filter(|(_, prompt, _)| prompt == node)
+                        .collect();
+                    assert_eq!(actual.len(), usize::from(!(rejection && node == "b")));
+                    for (_, _, config) in actual {
+                        assert_eq!(config, selection, "real prompt for {node}");
+                    }
+                }
+                let probes = rec
+                    .prompts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                    .count();
+                let probe_sessions: std::collections::HashSet<_> = dispatches
+                    .iter()
+                    .filter(|(_, prompt, _)| prompt == WORKFLOW_PREFLIGHT_PROMPT)
+                    .map(|(session, _, _)| session)
+                    .collect();
+                assert_eq!(
+                    probe_sessions.len(),
+                    probes,
+                    "distinct probes must not share a session"
+                );
+                assert_eq!(
+                    probes,
+                    if preflight { 4 } else { 0 },
+                    "distinct selections probe separately and identical selections reuse"
+                );
+            }
         }
     }
 
@@ -11974,6 +12215,9 @@ mod tests {
             id: WorkflowId::parse("g").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -11982,6 +12226,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -11990,6 +12237,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
@@ -12415,6 +12665,9 @@ mod tests {
 
     fn review_graph() -> Arc<WorkflowGraph> {
         let n = |id: &str, ag: &str, ins: &[&str], tpl: &str| WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse(id).unwrap(),
             agent: AgentId::parse(ag).unwrap(),
             prompt_template: tpl.into(),
@@ -12447,6 +12700,9 @@ mod tests {
             id: WorkflowId::parse("refine").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("draftnode").unwrap(),
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "draft {{input}}".into(),
@@ -12455,6 +12711,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("refinenode").unwrap(),
                     agent: AgentId::parse("claude").unwrap(),
                     prompt_template: "refine against {{draft}} for {{input}}".into(),
@@ -12515,7 +12774,7 @@ mod tests {
         let order = evs
             .iter()
             .map(|event| match event.as_ref().unwrap() {
-                WorkflowEvent::NodeStarted { node } => format!("start:{}", node.as_str()),
+                WorkflowEvent::NodeStarted { node, .. } => format!("start:{}", node.as_str()),
                 WorkflowEvent::NodeFinished { node, .. } => format!("finish:{}", node.as_str()),
                 WorkflowEvent::CleanupObserved { .. } => "cleanup".into(),
                 WorkflowEvent::Terminal { .. } => "terminal".into(),
@@ -12549,6 +12808,9 @@ mod tests {
         let graph = Arc::new(WorkflowGraph {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -12647,6 +12909,9 @@ mod tests {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("root").unwrap(),
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -12655,6 +12920,9 @@ mod tests {
                     harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("synth").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "{{root}}".into(),
@@ -12776,6 +13044,9 @@ mod tests {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("root").unwrap(),
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -12784,6 +13055,9 @@ mod tests {
                     harvest_sanitization: root_mode,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("synth").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "{{root}}".into(),
@@ -13113,6 +13387,9 @@ mod tests {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "root-a {{input}}".into(),
@@ -13121,6 +13398,9 @@ mod tests {
                     harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "root-b {{input}}".into(),
@@ -13129,6 +13409,9 @@ mod tests {
                     harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("synth").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "{{a}}|{{b}}".into(),
@@ -13282,6 +13565,9 @@ mod tests {
             id: WorkflowId::parse("g").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13290,6 +13576,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13298,6 +13587,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
@@ -13344,6 +13636,9 @@ mod tests {
             id: WorkflowId::parse("p").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13352,6 +13647,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "got {{a}}".into(),
@@ -13360,6 +13658,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("c").unwrap(),
                     agent: AgentId::parse("c").unwrap(),
                     prompt_template: "got {{b}}".into(),
@@ -13445,6 +13746,9 @@ mod tests {
             id: WorkflowId::parse("panel").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("member_a").unwrap(),
                     agent: AgentId::parse("member_a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13453,6 +13757,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("member_b").unwrap(),
                     agent: AgentId::parse("member_b").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13461,6 +13768,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("synth").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "{{member_b}}\n{{workflow.costs}}".into(),
@@ -13641,6 +13951,9 @@ mod tests {
             id: WorkflowId::parse("g").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13649,6 +13962,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13657,6 +13973,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
@@ -13805,6 +14124,9 @@ mod tests {
             id: WorkflowId::parse("g").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13813,6 +14135,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -13821,6 +14146,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("t").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{a}}{{b}}".into(),
@@ -14042,7 +14370,7 @@ mod tests {
         let started: Vec<_> = evs
             .iter()
             .filter_map(|e| match e.as_ref().unwrap() {
-                WorkflowEvent::NodeStarted { node } => Some(node.as_str().to_string()),
+                WorkflowEvent::NodeStarted { node, .. } => Some(node.as_str().to_string()),
                 _ => None,
             })
             .collect();
@@ -14325,6 +14653,9 @@ mod tests {
             id: WorkflowId::parse("p").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("a").unwrap(),
                     agent: AgentId::parse("a").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -14333,6 +14664,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("b").unwrap(),
                     agent: AgentId::parse("b").unwrap(),
                     prompt_template: "got {{a}}".into(),
@@ -14341,6 +14675,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("c").unwrap(),
                     agent: AgentId::parse("c").unwrap(),
                     prompt_template: "got {{b}}".into(),
@@ -14656,6 +14993,9 @@ mod tests {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("first").unwrap(),
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "echo {{input}}".into(),
@@ -14664,6 +15004,9 @@ mod tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse(second).unwrap(),
                     agent: AgentId::parse("codex").unwrap(),
                     prompt_template: "echo {{first}}".into(),
@@ -16029,6 +16372,9 @@ mod observability_tests {
         let graph = Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("n").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".to_string(),
@@ -16137,6 +16483,9 @@ mod observability_tests {
         Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("n").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".to_string(),
@@ -16153,6 +16502,9 @@ mod observability_tests {
         Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("n").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".to_string(),

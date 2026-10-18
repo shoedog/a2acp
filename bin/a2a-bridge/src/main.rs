@@ -170,7 +170,7 @@ SUBCOMMANDS:
   run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
-  models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
+  models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--match <text>]... [--json]
   compatibility       Validate recipes/manifests, resolve floating candidates, run exact canaries,
                       compare evidence, or inspect schedule status.
                       validate | resolve | run | compare | schedule status [--json]
@@ -5436,7 +5436,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut policy_trigger_json: Option<String> = None;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => {
+            Ok(WorkflowEvent::NodeStarted { node, selection }) => {
                 let ordinal = u64::from(completed_nodes)
                     .saturating_add(u64::from(failed_nodes))
                     .saturating_add(1);
@@ -5445,7 +5445,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     bridge_core::attempt_activity::ActivityReason::PhaseTransition,
                     ordinal,
                 );
-                eprintln!("[workflow] node {} started", node.as_str());
+                eprintln!(
+                    "[workflow] node {} started; configured selection: {:?}",
+                    node.as_str(),
+                    selection
+                );
             }
             Ok(WorkflowEvent::NodeFinished {
                 node,
@@ -6163,22 +6167,25 @@ async fn workflow_stats_cmd(args: &[String]) -> Result<(), BoxError> {
 // ---------------------------------------------------------------------------
 
 const MODELS_USAGE: &str = "\
-usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
+usage: a2a-bridge models [--config <path>] [--agent <id>] [--match <substring>]... [--json]
   List each configured agent's advertised models (+ effort levels + modes), probed live host-side.
   Pass models only when model_configurable=true; effort/mode only when those lists are present.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
+  --match <text>   keep advertised model IDs containing text (repeatable OR, case-insensitive)
   --json           emit an agent map; successful values match the card's agent-models shape, while
                    failed probes are explicit {available:false,failure:{...}} records. Failure detail
                    is in failure.phase/category/error/diagnostic; dynamic text is bounded and redacted";
 
 struct ModelsArgs {
+    matches: Vec<String>,
     config: Option<String>,
     agent: Option<String>,
     json: bool,
 }
 
 fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
+    let mut matches = Vec::new();
     let mut config: Option<String> = None;
     let mut agent: Option<String> = None;
     let mut json = false;
@@ -6199,6 +6206,11 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
                         .clone(),
                 );
             }
+            "--match" => matches.push(
+                iter.next()
+                    .ok_or("models: --match requires a value")?
+                    .clone(),
+            ),
             "--json" => json = true,
             other => {
                 return Err(format!("models: unknown flag {other:?}\n{MODELS_USAGE}").into());
@@ -6206,6 +6218,7 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
         }
     }
     Ok(ModelsArgs {
+        matches,
         config,
         agent,
         json,
@@ -6217,12 +6230,22 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
 fn catalog_report_to_json(
     entries: &[(String, AgentEntry)],
     report: &catalog_probe::CatalogProbeReport,
+    matches: &[String],
 ) -> serde_json::Value {
     let agents: serde_json::Map<String, serde_json::Value> = entries
         .iter()
         .map(|(id, _)| {
             let value = if let Some(caps) = report.catalog.get(id) {
-                bridge_core::catalog::caps_to_json(caps)
+                let mut value = bridge_core::catalog::caps_to_json(caps);
+                if let Some(models) = value.get_mut("models") {
+                    let mut catalog = bridge_core::catalog::ModelCatalog::from([(
+                        id.clone(),
+                        bridge_core::catalog::sanitize_model_caps(caps.clone()),
+                    )]);
+                    filter_catalog_models(&mut catalog, matches);
+                    *models = serde_json::json!(catalog[id].models);
+                }
+                value
             } else {
                 let failure = report
                     .failures
@@ -6237,6 +6260,21 @@ fn catalog_report_to_json(
         })
         .collect();
     serde_json::Value::Object(agents)
+}
+
+/// Filter only the advertised values. Current/configurable identity, capabilities and failures
+/// describe the probe and stay unchanged even when no values match.
+fn filter_catalog_models(catalog: &mut bridge_core::catalog::ModelCatalog, matches: &[String]) {
+    if matches.is_empty() {
+        return;
+    }
+    let matches: Vec<_> = matches.iter().map(|s| s.to_lowercase()).collect();
+    for caps in catalog.values_mut() {
+        caps.models.retain(|model| {
+            let model = model.to_lowercase();
+            matches.iter().any(|needle| model.contains(needle))
+        });
+    }
 }
 
 async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
@@ -6273,12 +6311,11 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         return Err(format!("models: no agents configured in {config_path:?}").into());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let report = catalog_probe::probe_all_report(&entries, &cwd).await;
+    let mut report = catalog_probe::probe_all_report(&entries, &cwd).await;
+    let json_report = catalog_report_to_json(&entries, &report, &parsed.matches);
+    filter_catalog_models(&mut report.catalog, &parsed.matches);
     if parsed.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&catalog_report_to_json(&entries, &report))?
-        );
+        println!("{}", serde_json::to_string_pretty(&json_report)?);
     } else {
         for (id, _) in &entries {
             match report.catalog.get(id) {
@@ -13152,6 +13189,9 @@ while not finished.exists(): time.sleep(0.001)
         let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: workflow.clone(),
             nodes: vec![bridge_workflow::graph::WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("review").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -14150,6 +14190,9 @@ esac
             Arc::new(bridge_workflow::graph::WorkflowGraph {
                 id: workflow.clone(),
                 nodes: vec![bridge_workflow::graph::WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: bridge_core::ids::NodeId::parse("review").unwrap(),
                     agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -14904,6 +14947,9 @@ esac
         let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: workflow_id.clone(),
             nodes: vec![bridge_workflow::graph::WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("review").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -15146,6 +15192,9 @@ esac
             .iter()
             .enumerate()
             .map(|(i, a)| WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse(format!("n{i}")).unwrap(),
                 agent: AgentId::parse(*a).unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -18103,6 +18152,9 @@ The command prints schemas, templates, and validates input.
         let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("review").unwrap(),
             nodes: vec![bridge_workflow::graph::WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: bridge_core::ids::NodeId::parse("only").unwrap(),
                 agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -18697,6 +18749,66 @@ The command prints schemas, templates, and validates input.
         assert!(
             captured["last_event_id"].is_null(),
             "Last-Event-ID must be absent without --from, got {captured}"
+        );
+    }
+
+    #[test]
+    fn models_match_filters_values_preserving_probe_shape() {
+        use bridge_core::catalog::AgentCaps;
+        let args: Vec<_> = [
+            "--agent", "opencode", "--match", "GO/KIMI", "--match", "deepseek", "--json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = parse_models_args(&args).unwrap();
+        assert_eq!(parsed.matches, ["GO/KIMI", "deepseek"]);
+        assert!(parse_models_args(&["--match".into()]).is_err());
+        let mut report = catalog_probe::CatalogProbeReport {
+            catalog: Default::default(),
+            failures: Default::default(),
+        };
+        report.catalog.insert(
+            "opencode".into(),
+            AgentCaps {
+                current_model: Some("other".into()),
+                models: vec![
+                    "opencode-go/kimi-k3".into(),
+                    "opencode-go/deepseek-v4-pro".into(),
+                    "other".into(),
+                ],
+                model_configurable: true,
+                effort_levels: vec!["high".into()],
+                modes: vec!["code".into()],
+                current_mode: Some("code".into()),
+            },
+        );
+        let entries = vec![("opencode".into(), acp_entry("opencode"))];
+        let all = catalog_report_to_json(&entries, &report, &[]);
+        let matched = catalog_report_to_json(&entries, &report, &parsed.matches);
+        assert_eq!(
+            matched["opencode"]["models"],
+            serde_json::json!(["opencode-go/kimi-k3", "opencode-go/deepseek-v4-pro"])
+        );
+        let empty = catalog_report_to_json(&entries, &report, &["no-match".into()]);
+        assert_eq!(empty["opencode"]["models"], serde_json::json!([]));
+        for key in [
+            "current",
+            "model_configurable",
+            "effort",
+            "modes",
+            "current_mode",
+        ] {
+            assert_eq!(empty["opencode"][key], all["opencode"][key]);
+            assert_eq!(matched["opencode"][key], all["opencode"][key]);
+        }
+        filter_catalog_models(&mut report.catalog, &parsed.matches);
+        assert_eq!(report.catalog["opencode"].models.len(), 2);
+        filter_catalog_models(&mut report.catalog, &["absent".into()]);
+        assert!(report.catalog["opencode"].models.is_empty());
+        assert!(
+            report.failures.is_empty(),
+            "no match is still an available probe"
         );
     }
 

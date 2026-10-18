@@ -326,9 +326,8 @@ impl WorkflowAdmissionV1 {
                 "automatic R2f1b deadline activation is incompatible with legacy agent watchdog settings",
             ));
         }
-        let any_max_effort = entries.iter().any(|entry| {
-            bridge_core::domain::effective_config(entry, None).effort
-                == Some(bridge_core::domain::Effort::Max)
+        let any_max_effort = nodes.iter().zip(&entries).any(|(node, entry)| {
+            node.effective_config(entry).effort == Some(bridge_core::domain::Effort::Max)
         });
         let controls = resolve_execution_policy_with_readiness_v1(
             request
@@ -398,7 +397,7 @@ impl WorkflowAdmissionV1 {
                 bundles.push(
                     freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
                         entry: &entry,
-                        overrides: None,
+                        overrides: Some(&node.overrides()),
                         node: node_ref.clone(),
                         logical_session,
                         checkout,
@@ -694,6 +693,9 @@ mod slice4b_tests {
             graph: Arc::new(WorkflowGraph {
                 id: WorkflowId::parse(id).unwrap(),
                 nodes: vec![WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("inspect").unwrap(),
                     agent,
                     prompt_template: "{{input}}".into(),

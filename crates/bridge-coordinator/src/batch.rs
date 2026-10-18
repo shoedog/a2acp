@@ -1656,6 +1656,9 @@ mod tests {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("batch-test").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("agent").unwrap(),
                 prompt_template: "{{input}}".into(),

@@ -138,6 +138,9 @@ fn load_workflow_map(
                 std::fs::read_to_string(base.join(pf)).map_err(|e| e.to_string())?
             };
             nodes.push(WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse(n.id.clone()).map_err(|e| format!("{e:?}"))?,
                 agent: AgentId::parse(n.agent.clone()).map_err(|e| format!("{e:?}"))?,
                 prompt_template: tpl,
@@ -541,5 +544,117 @@ fn offline_run_freezes_the_silence_cutoff_by_invocation_then_workflow() {
             "{workflow_keys:?} {args:?}"
         );
         assert_eq!(controls.effective_work_cutoff_ms(), 7_200_000);
+    }
+}
+
+#[test]
+fn node_selection_uses_acp_capability_and_fable_gates_before_task_prompt() {
+    let dir = tempdir().unwrap();
+    let adapter = dir.path().join("selection-acp");
+    let prompted = dir.path().join("prompted");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -E 's/^\{"jsonrpc":"2.0","id":([^,]+),"method".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]},"id":%s}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","result":{"sessionId":"selected","models":{"currentModelId":"good","availableModels":[{"modelId":"good","name":"Good"},{"modelId":"claude-fable-5","name":"Fable"}]},"modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"}]}},"id":%s}\n' "$id" ;;
+    *'"method":"session/set_mode"'*'"modeId":"missing"'*)
+      printf '{"jsonrpc":"2.0","error":{"code":-32602,"message":"invalid mode"},"id":%s}\n' "$id" ;;
+    *'"method":"session/set_model"'*|*'"method":"session/set_mode"'*|*'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      touch '__PROMPTED__'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"selected","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FINAL"}}}}'
+      printf '{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":%s}\n' "$id" ;;
+  esac
+done
+"#.replace("__PROMPTED__", prompted.to_str().unwrap());
+    fs::write(&adapter, script).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    let input = dir.path().join("input.md");
+    fs::write(&input, "---\ntask-type: freeform\n---\nCheck selection\n").unwrap();
+    for (model, mode, allow_fable, succeeds, error) in [
+        ("missing", "code", false, false, "not advertised"),
+        ("good", "missing", false, false, "mode"),
+        ("claude-fable-5", "code", false, false, "blocked"),
+        ("claude-fable-5", "code", true, true, ""),
+        (
+            "claude-fable-missing",
+            "code",
+            true,
+            false,
+            "not advertised",
+        ),
+    ] {
+        let _ = fs::remove_file(&prompted);
+        let config = dir.path().join("selection.toml");
+        fs::write(
+            &config,
+            format!(
+                r#"
+default = "fake"
+allowed_cwd_root = {root:?}
+[registry]
+allowed_cmds = [{adapter:?}]
+[[agents]]
+id = "fake"
+cmd = {adapter:?}
+pre_authenticated = true
+model = "good"
+[[workflows]]
+id = "selection"
+[[workflows.nodes]]
+id = "only"
+agent = "fake"
+prompt_text = "{{{{input}}}}"
+model = {model:?}
+mode = {mode:?}
+[server]
+addr = "127.0.0.1:0"
+"#,
+                root = dir.path()
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+            .args([
+                "run-workflow",
+                "selection",
+                "--config",
+                config.to_str().unwrap(),
+                "--input",
+                input.to_str().unwrap(),
+                "--session-cwd",
+                dir.path().to_str().unwrap(),
+            ])
+            .env(
+                "A2A_BRIDGE_ALLOW_FABLE",
+                if allow_fable { "1" } else { "0" },
+            )
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            succeeds,
+            "{model}/{mode}: {stderr}"
+        );
+        assert_eq!(
+            prompted.exists(),
+            succeeds,
+            "invalid selection reached the task prompt: {stderr}"
+        );
+        if succeeds {
+            assert!(
+                stderr.contains(model),
+                "progress must show configured model: {stderr}"
+            );
+        } else {
+            assert!(format!("{stderr}{}", String::from_utf8_lossy(&output.stdout)).contains(error));
+        }
     }
 }

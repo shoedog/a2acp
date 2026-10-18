@@ -60,12 +60,32 @@ impl RetryPolicy {
 pub struct WorkflowNode {
     pub id: NodeId,
     pub agent: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub prompt_template: String,
     pub inputs: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harvest_sanitization: Option<HarvestSanitizationMode>,
+}
+
+impl WorkflowNode {
+    pub fn overrides(&self) -> crate::domain::AgentOverride {
+        crate::domain::AgentOverride {
+            model: self.model.clone(),
+            effort: self.effort,
+            mode: self.mode.clone(),
+        }
+    }
+
+    pub fn effective_config(&self, entry: &crate::domain::AgentEntry) -> EffectiveConfig {
+        crate::domain::effective_config(entry, Some(&self.overrides()))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -129,7 +149,16 @@ pub fn workload_fingerprint_with_activation(
         push_field(&mut canonical, node.id.as_str());
         push_field(&mut canonical, node.agent.as_str());
         match configured_effective(&node.agent) {
-            Some(config) => {
+            Some(mut config) => {
+                if let Some(model) = &node.model {
+                    config.model = Some(model.clone());
+                }
+                if let Some(effort) = node.effort {
+                    config.effort = Some(effort);
+                }
+                if let Some(mode) = &node.mode {
+                    config.mode = Some(mode.clone());
+                }
                 canonical.push('1');
                 push_effective_config(&mut canonical, &config);
             }
@@ -280,6 +309,9 @@ mod tests {
 
     fn node(id: &str, agent: &str, inputs: &[&str]) -> WorkflowNode {
         WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse(id).unwrap(),
             agent: AgentId::parse(agent).unwrap(),
             prompt_template: format!("{{{{input}}}} {}", id),
@@ -287,6 +319,42 @@ mod tests {
             retry: None,
             harvest_sanitization: None,
         }
+    }
+
+    #[test]
+    fn old_nodes_read_and_node_selections_partition_workloads() {
+        let old: WorkflowNode =
+            serde_json::from_str(r#"{"id":"a","agent":"one","prompt_template":"go","inputs":[]}"#)
+                .unwrap();
+        assert!(old.model.is_none() && old.effort.is_none() && old.mode.is_none());
+        let mut graph = WorkflowGraph {
+            id: WorkflowId::parse("wf").unwrap(),
+            nodes: vec![old],
+            panel: None,
+            controls: None,
+        };
+        let defaults = || {
+            Some(EffectiveConfig {
+                model: Some("default".into()),
+                effort: Some(Effort::Low),
+                mode: None,
+            })
+        };
+        let initial = workload_fingerprint_with(&graph, |_| defaults());
+        graph.nodes[0].model = Some("kimi".into());
+        assert_ne!(initial, workload_fingerprint_with(&graph, |_| defaults()));
+        let model_only = workload_fingerprint_with(&graph, |_| defaults());
+        graph.nodes[0].effort = Some(Effort::High);
+        assert_ne!(
+            model_only,
+            workload_fingerprint_with(&graph, |_| defaults())
+        );
+        let with_effort = workload_fingerprint_with(&graph, |_| defaults());
+        graph.nodes[0].mode = Some("code".into());
+        assert_ne!(
+            with_effort,
+            workload_fingerprint_with(&graph, |_| defaults())
+        );
     }
 
     #[test]
@@ -356,6 +424,9 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("wf").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("a").unwrap(),
                 agent: AgentId::parse("x").unwrap(),
                 prompt_template: "t {{input}}".into(),
@@ -380,6 +451,9 @@ mod tests {
         let g = WorkflowGraph {
             id: WorkflowId::parse("panel").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("a").unwrap(),
                 agent: AgentId::parse("x").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -405,6 +479,9 @@ mod tests {
     #[test]
     fn retry_policy_rides_the_spec_snapshot_round_trip() {
         let node = WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("n1").unwrap(),
             agent: AgentId::parse("codex").unwrap(),
             prompt_template: "p".into(),

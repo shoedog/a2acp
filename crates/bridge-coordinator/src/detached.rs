@@ -77,6 +77,8 @@ pub enum FrameKind {
     },
     NodeStarted {
         node: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selection: Option<bridge_core::domain::EffectiveConfig>,
     },
     NodeFinished {
         node: String,
@@ -117,7 +119,10 @@ pub fn project_orch_frame(
     seq: i64,
 ) -> Option<WorkflowProgressFrame> {
     let kind = match kind {
-        OrchEventKind::NodeStarted { node } => FrameKind::NodeStarted { node: node.clone() },
+        OrchEventKind::NodeStarted { node, selection } => FrameKind::NodeStarted {
+            node: node.clone(),
+            selection: selection.clone(),
+        },
         OrchEventKind::NodeFinished {
             node,
             ok,
@@ -253,6 +258,13 @@ pub trait WorkflowSink: Send {
     async fn node_started(&mut self, _node: &str) -> Result<(), BridgeError> {
         Ok(())
     }
+    async fn node_started_with_selection(
+        &mut self,
+        node: &str,
+        _selection: Option<&bridge_core::domain::EffectiveConfig>,
+    ) -> Result<(), BridgeError> {
+        self.node_started(node).await
+    }
     async fn node_finished(
         &mut self,
         _node: &str,
@@ -319,7 +331,10 @@ async fn drain_workflow_inner<S: WorkflowSink>(
             continue;
         }
         let result = match item {
-            Ok(WorkflowEvent::NodeStarted { node }) => sink.node_started(node.as_str()).await,
+            Ok(WorkflowEvent::NodeStarted { node, selection }) => {
+                sink.node_started_with_selection(node.as_str(), selection.as_ref())
+                    .await
+            }
             Ok(WorkflowEvent::NodeFinished {
                 node,
                 ok,
@@ -689,11 +704,24 @@ impl WorkflowSink for DetachedProgressSink {
     // is only ever driven by the detached runner, which normalizes ANY drain `Err` to a
     // terminal `Failed` — so the parse error's disposition is moot on this path.
     async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
+        self.node_started_with_selection(node, None).await
+    }
+    async fn node_started_with_selection(
+        &mut self,
+        node: &str,
+        selection: Option<&bridge_core::domain::EffectiveConfig>,
+    ) -> Result<(), BridgeError> {
         let node_id = bridge_core::ids::NodeId::parse(node)?;
         let operation_id = self.operation_id()?;
         let seq = self
             .store
-            .record_node_started(&self.task, &node_id, &operation_id, now_ms())
+            .record_node_started_with_selection(
+                &self.task,
+                &node_id,
+                &operation_id,
+                now_ms(),
+                selection,
+            )
             .await?;
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
@@ -701,6 +729,7 @@ impl WorkflowSink for DetachedProgressSink {
             phase: Phase::Live,
             kind: FrameKind::NodeStarted {
                 node: node.to_string(),
+                selection: selection.cloned(),
             },
         });
         Ok(())
@@ -1565,7 +1594,10 @@ mod sink_tests {
         let a = NodeId::parse("a").unwrap();
         let b = NodeId::parse("b").unwrap();
         let events = vec![
-            Ok(WorkflowEvent::NodeStarted { node: a.clone() }),
+            Ok(WorkflowEvent::NodeStarted {
+                node: a.clone(),
+                selection: None,
+            }),
             Ok(WorkflowEvent::NodeFinished {
                 node: a.clone(),
                 ok: true,
@@ -1575,7 +1607,10 @@ mod sink_tests {
                 policy_trigger_json: None,
                 policy_trigger_barrier_result: None,
             }),
-            Ok(WorkflowEvent::NodeStarted { node: b.clone() }),
+            Ok(WorkflowEvent::NodeStarted {
+                node: b.clone(),
+                selection: None,
+            }),
             Ok(WorkflowEvent::NodeFinished {
                 node: b.clone(),
                 ok: true,
@@ -2023,7 +2058,10 @@ mod sink_tests {
 
         let a = NodeId::parse("a").unwrap();
         let events = vec![
-            Ok(WorkflowEvent::NodeStarted { node: a.clone() }),
+            Ok(WorkflowEvent::NodeStarted {
+                node: a.clone(),
+                selection: None,
+            }),
             Ok(WorkflowEvent::NodeFinished {
                 node: a.clone(),
                 ok: true,
@@ -2622,7 +2660,10 @@ mod sink_tests {
         // NodeStarted succeeds (record_node_started delegates to inner);
         // NodeFinished calls put_node_checkpoint_sequenced which always errors.
         let events = vec![
-            Ok(WorkflowEvent::NodeStarted { node: a.clone() }),
+            Ok(WorkflowEvent::NodeStarted {
+                node: a.clone(),
+                selection: None,
+            }),
             Ok(WorkflowEvent::NodeFinished {
                 node: a.clone(),
                 ok: true,
@@ -2849,6 +2890,9 @@ mod sink_tests {
         let graph = Arc::new(WorkflowGraph {
             id: WorkflowId::parse("w").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -6257,6 +6301,9 @@ mod resume_tests {
 
     fn panel_graph() -> Arc<WorkflowGraph> {
         let node = |id: &str, agent: &str, inputs: &[&str], prompt: &str| WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse(id).unwrap(),
             agent: AgentId::parse(agent).unwrap(),
             prompt_template: prompt.into(),
@@ -6290,6 +6337,9 @@ mod resume_tests {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("retry-resume").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("synth").unwrap(),
                 prompt_template: "resume {{input}}".into(),
@@ -6377,6 +6427,9 @@ mod resume_tests {
             id: WorkflowId::parse("two-turns").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("first").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "first {{input}}".into(),
@@ -6385,6 +6438,9 @@ mod resume_tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("second").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "second {{first}}".into(),
@@ -6589,6 +6645,9 @@ mod resume_tests {
 
     fn rich_race_graph() -> Arc<WorkflowGraph> {
         let node = |id: &str, agent: &str, inputs: &[&str]| WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse(id).unwrap(),
             agent: AgentId::parse(agent).unwrap(),
             prompt_template: "{{input}}".into(),
@@ -7284,6 +7343,9 @@ mod resume_tests {
             id: WorkflowId::parse("trigger-resume").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("root").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "root {{input}}".into(),
@@ -7292,6 +7354,9 @@ mod resume_tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: NodeId::parse("synth").unwrap(),
                     agent: AgentId::parse("synth").unwrap(),
                     prompt_template: "synth {{root}}".into(),
@@ -7449,6 +7514,9 @@ mod resume_tests {
         let graph = Arc::new(WorkflowGraph {
             id: WorkflowId::parse("trigger-reconcile").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("synth").unwrap(),
                 prompt_template: "only {{input}}".into(),
@@ -7636,6 +7704,9 @@ mod frame_tests {
         let graph = WorkflowGraph {
             id: WorkflowId::parse("code-review").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -7660,6 +7731,9 @@ mod frame_tests {
             id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
             nodes: vec![
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: bridge_core::ids::NodeId::parse("reviewer").unwrap(),
                     agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                     prompt_template: "{{input}}".into(),
@@ -7668,6 +7742,9 @@ mod frame_tests {
                     harvest_sanitization: None,
                 },
                 WorkflowNode {
+                    model: None,
+                    effort: None,
+                    mode: None,
                     id: bridge_core::ids::NodeId::parse("synth").unwrap(),
                     agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
                     prompt_template: "{{reviewer}}".into(),
@@ -7821,6 +7898,7 @@ mod frame_tests {
         let node = project_orch_frame(
             &OrchEventKind::NodeStarted {
                 node: "next".into(),
+                selection: None,
             },
             Phase::Live,
             2,

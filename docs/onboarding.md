@@ -119,7 +119,7 @@ All three are OPTIONAL and applied per session. Model and effort are
 agent advertises, then sets the requested value via `session/set_config_option`.
 
 **Discover the valid values without guessing.** `a2a-bridge models [--config <f>]
-[--agent <id>] [--json]` probes each configured agent live and prints its
+[--agent <id>] [--match <substring>]... [--json]` probes each configured agent live and prints its
 advertised models (+ effort levels + modes), so you know exactly what to put in a
 config or a per-request override. The same matrix rides the Agent Card as the
 `agent-models` extension (`capabilities.extensions[].params.agents`), probed at
@@ -307,9 +307,29 @@ dropping that request drops the local leg, which cancels its ACP prompt. A strea
 Served workflows ignore all three: their node turns follow the frozen workflow policy above and keep the
 workflow's 2-hour cutoff, whatever the client asked.
 
+### Workflow node selections
+
+Each `[[workflows.nodes]]` may set optional `model`, `effort`, and `mode` fields.
+Each present field overrides that agent's default independently; omitted fields inherit it.
+For example, two nodes can share `agent = "opencode"` while selecting different raw advertised
+model IDs. Served workflow requests cannot override these selections with request metadata.
+ACP and `container_rw` entries use their existing capability checks; `api` entries support only
+`model` and reject node `effort`/`mode` during configuration validation. Invalid effort names fail
+parsing. Unadvertised ACP models, invalid modes, and blocked Fable selections fail through the
+normal session configuration gates before the task prompt. The Fable authorization switch still
+applies, and enabling it does not bypass advertised-capability checks. Effort retains the existing
+supported-level fallback behavior.
+
+Node-start progress and the replayable journal carry the effective configured selection, which is
+configuration intent rather than confirmation of the provider's applied identity. Frozen admission
+and resume retain the same node selections. Use repeatable `models --match <substring>` filters to
+narrow advertised model IDs (case-insensitive OR), for example `models --agent opencode --match
+opencode-go/ --json`. Filters preserve other capability fields, failure records and exit status;
+no matches produce an empty model list for an available agent.
+
 ### Workflow preflight and fallback models
 
-`preflight = true` is optional and defaults off. When enabled on an agent entry, each workflow run sends one fixed smoke prompt before that agent's first real node turn: `Reply with exactly PONG and nothing else.` The bridge may try the next configured `fallback_models` entry only after resolution/configuration fails before prompt dispatch, or after prompt-open returns typed proof that the prompt was not accepted. Once prompt-open succeeds, an empty, non-`PONG`, cancelled, broken-stream, or cleanup-failed result is sticky for the run and is never replayed. The first model that replies exactly `PONG` is used for real workflow turns for that agent in the run; effort, mode, cwd, auth, sandbox, and MCP settings are otherwise unchanged.
+`preflight = true` is optional and defaults off. When enabled on an agent entry, each workflow run sends one fixed smoke prompt before the first real node turn for each distinct effective model/effort/mode selection: `Reply with exactly PONG and nothing else.` The bridge may try the next configured `fallback_models` entry only after resolution/configuration fails before prompt dispatch, or after prompt-open returns typed proof that the prompt was not accepted. Once prompt-open succeeds, an empty, non-`PONG`, cancelled, broken-stream, or cleanup-failed result is sticky for the run and is never replayed. The first model that replies exactly `PONG` is used for real workflow turns sharing that selection in the run; effort, mode, cwd, auth, sandbox, and MCP settings are otherwise unchanged.
 
 If every eligible candidate fails, or an accepted/possibly accepted smoke does not succeed, the node fails before the real prompt and the failure names the models attempted up to the acceptance barrier. Leave both keys absent for the previous no-preflight behavior.
 

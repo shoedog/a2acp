@@ -109,6 +109,9 @@ fn graph() -> Arc<WorkflowGraph> {
     Arc::new(WorkflowGraph {
         id: WorkflowId::parse("review").unwrap(),
         nodes: vec![WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("inspect").unwrap(),
             agent: AgentId::parse("reader").unwrap(),
             prompt_template: "{{input}}".into(),
