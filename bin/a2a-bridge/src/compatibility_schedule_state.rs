@@ -1067,12 +1067,208 @@ impl AuthorityStateCapability for AuthorityMutationLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::fd::{IntoRawFd as _, RawFd};
     use std::os::unix::fs::PermissionsExt as _;
 
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    /// Test-only supervision for children that deliberately retain inherited lock descriptors.
+    /// It bounds both the normal release path and panic/early-unwind cleanup so a broken fixture
+    /// cannot strand a test process or its pipe descriptors.
+    #[cfg(unix)]
+    struct ForkedPipeChild {
+        pid: libc::pid_t,
+        release_fd: Option<RawFd>,
+        release_closed: bool,
+    }
+
+    #[cfg(unix)]
+    impl ForkedPipeChild {
+        fn release_pipe() -> [RawFd; 2] {
+            // std creates close-on-exec descriptors, including during concurrent process spawning.
+            let (reader, writer) = std::io::pipe().unwrap();
+            [reader.into_raw_fd(), writer.into_raw_fd()]
+        }
+
+        fn blocked() -> Self {
+            let pipe = Self::release_pipe();
+            // SAFETY: the child only waits on the pipe and calls _exit, avoiding Rust teardown.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe {
+                    libc::close(pipe[1]);
+                    let mut byte = 0_u8;
+                    let _ = libc::read(pipe[0], &mut byte as *mut u8 as *mut libc::c_void, 1);
+                    libc::close(pipe[0]);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork blocked child");
+            // SAFETY: the parent only releases through the write end.
+            assert_eq!(unsafe { libc::close(pipe[0]) }, 0);
+            Self {
+                pid,
+                release_fd: Some(pipe[1]),
+                release_closed: false,
+            }
+        }
+
+        fn from_parent_write_end(pid: libc::pid_t, release_fd: RawFd) -> Self {
+            Self {
+                pid,
+                release_fd: Some(release_fd),
+                release_closed: false,
+            }
+        }
+
+        fn close_release_pipe(&mut self) {
+            if let Some(fd) = self.release_fd.take() {
+                // SAFETY: this test helper owns the parent write descriptor exactly once.
+                assert_eq!(unsafe { libc::close(fd) }, 0);
+                self.release_closed = true;
+            }
+        }
+
+        fn release_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), String> {
+            if let Some(fd) = self.release_fd {
+                // SAFETY: one byte releases the child, then the parent closes its writer.
+                let released = unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+                // Closing is required even after EPIPE; retain ownership until this point so
+                // Drop cannot lose the descriptor on the error return below.
+                let closed = unsafe { libc::close(fd) };
+                self.release_fd = None;
+                self.release_closed = closed == 0;
+                if released != 1 {
+                    return Err(format!("write release for child {} failed", self.pid));
+                }
+                if closed != 0 {
+                    return Err(format!("close release pipe for child {} failed", self.pid));
+                }
+            }
+            self.reap_by(std::time::Instant::now() + timeout, false)
+        }
+
+        fn reap_by(
+            &mut self,
+            deadline: std::time::Instant,
+            kill_on_timeout: bool,
+        ) -> Result<(), String> {
+            if self.pid <= 0 {
+                return Err("child supervision requires a positive pid".into());
+            }
+            let mut status = 0;
+            loop {
+                // SAFETY: `pid` is the one child created by this fixture.
+                let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                if result == -1 {
+                    return Err(format!(
+                        "waitpid child {} failed: {}",
+                        self.pid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if result == self.pid {
+                    self.pid = -1;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    if !kill_on_timeout {
+                        return Err(format!(
+                            "child {} did not exit before test deadline",
+                            self.pid
+                        ));
+                    }
+                    // SAFETY: the bounded fixture owns this stalled child.
+                    if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
+                        return Err(format!(
+                            "kill stalled child {} failed: {}",
+                            self.pid,
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while std::time::Instant::now() < reap_deadline {
+                        // SAFETY: this loop supervises only the child just sent SIGKILL.
+                        let reaped = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                        if reaped == -1 {
+                            return Err(format!(
+                                "reap killed child {} failed: {}",
+                                self.pid,
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        if reaped == self.pid {
+                            self.pid = -1;
+                            return Err(
+                                "child supervision deadline expired; child was killed and reaped"
+                                    .into(),
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    return Err(format!(
+                        "child {} ignored SIGKILL during bounded reap",
+                        self.pid
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForkedPipeChild {
+        fn drop(&mut self) {
+            self.close_release_pipe();
+            if self.pid > 0 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                if self.reap_by(deadline, true).is_err() {
+                    eprintln!("forked child cleanup failed during test unwind");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forked_pipe_supervision_refuses_nonpositive_pids() {
+        // Isolate the regression: the old waitpid(-1) must not consume another test's child.
+        const CHILD: &str = "A2A_TEST_INVALID_SUPERVISOR_PID";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "compatibility_schedule_state::tests::forked_pipe_supervision_refuses_nonpositive_pids",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for pid in [-1, 0] {
+            let mut child = ForkedPipeChild {
+                pid,
+                release_fd: None,
+                release_closed: false,
+            };
+            let error = child
+                .reap_by(std::time::Instant::now(), false)
+                .expect_err("a nonpositive pid must be refused before waitpid");
+            assert!(error.contains("positive pid"), "{error}");
+        }
     }
 
     fn create_production_root(operator_home: &Path) -> PathBuf {
@@ -1430,10 +1626,8 @@ mod tests {
         let authority = authority_root
             .try_authority_mutation("forked-refusal:authority")
             .unwrap();
-        let mut release_child = [-1; 2];
-        // SAFETY: the test owns this short-lived pipe and closes both ends after its child exits.
-        assert_eq!(unsafe { libc::pipe(release_child.as_mut_ptr()) }, 0);
-        let mut child_pid = -1;
+        let release_child = ForkedPipeChild::release_pipe();
+        let mut child: Option<ForkedPipeChild> = None;
         let refused = refused_root.try_owner_admission_with_acquired_owner_hook(
             "forked-refusal:owner",
             || {
@@ -1453,7 +1647,10 @@ mod tests {
                     }
                 }
                 assert!(pid > 0, "fork the inherited-descriptor holder");
-                child_pid = pid;
+                child = Some(ForkedPipeChild::from_parent_write_end(
+                    pid,
+                    release_child[1],
+                ));
                 // SAFETY: the parent no longer reads this pipe end.
                 assert_eq!(unsafe { libc::close(release_child[0]) }, 0);
             },
@@ -1474,17 +1671,11 @@ mod tests {
             .try_owner_admission("forked-refusal:after-release")
             .is_ok();
 
-        // SAFETY: release the only child created by this test and reap it before asserting.
-        assert_eq!(
-            unsafe { libc::write(release_child[1], b"x".as_ptr().cast(), 1) },
-            1
-        );
-        assert_eq!(unsafe { libc::close(release_child[1]) }, 0);
-        let mut child_status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(child_pid, &mut child_status, 0) },
-            child_pid
-        );
+        child
+            .as_mut()
+            .expect("the inherited-descriptor child")
+            .release_and_reap(std::time::Duration::from_secs(1))
+            .expect("normal child release must reap before the test returns");
 
         assert!(matches!(refused, Err(SchedulerStateError::LockBusy(_))));
         assert!(
@@ -1495,6 +1686,49 @@ mod tests {
             admits_after_release,
             "a fork-inherited descriptor from a refused admission must not prolong the owner lock"
         );
+
+        let mut stalled = ForkedPipeChild::blocked();
+        let diagnostic = stalled
+            .reap_by(
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+                true,
+            )
+            .expect_err("a deliberately held child must time out");
+        assert!(diagnostic.contains("deadline expired"), "{diagnostic}");
+        assert_eq!(stalled.pid, -1, "timed-out child must be reaped");
+
+        let early_unwind = ForkedPipeChild::blocked();
+        let early_pid = early_unwind.pid;
+        drop(early_unwind);
+        let mut status = 0;
+        // SAFETY: Drop killed and reaped the fixture child; ECHILD proves no child remains.
+        assert_eq!(
+            unsafe { libc::waitpid(early_pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+
+        let mut failed_release = ForkedPipeChild::blocked();
+        // SAFETY: this is the helper's own child; reaping it makes its pipe reader unavailable.
+        assert_eq!(unsafe { libc::kill(failed_release.pid, libc::SIGKILL) }, 0);
+        assert_eq!(
+            unsafe { libc::waitpid(failed_release.pid, &mut status, 0) },
+            failed_release.pid
+        );
+        failed_release.pid = -1;
+        assert!(
+            failed_release
+                .release_and_reap(std::time::Duration::from_secs(1))
+                .is_err(),
+            "a dead child must fail release"
+        );
+        // Observe the result of the owned close, never probe a descriptor number after release:
+        // another test thread is free to reuse that number immediately.
+        assert!(failed_release.release_closed);
+        assert!(failed_release.release_fd.is_none());
     }
 
     #[test]

@@ -255,6 +255,198 @@ fn run_offline_legacy_success(
     run_offline_workflow(advertise_v1, "", &[])
 }
 
+/// An explicit local cwd is admitted against the *resolved* configured root before any adapter
+/// (including a container warm-up) can start.  The adapter's startup marker is therefore a
+/// stronger regression signal than its eventual workflow result.
+#[cfg(unix)]
+#[test]
+fn local_run_workflow_canonical_cwd_admission_precedes_agent_spawn() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("root");
+    let child = root.join("child");
+    let outside = directory.path().join("outside");
+    let lookalike = directory.path().join("root-lookalike");
+    fs::create_dir_all(&child).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(outside.join("subdir")).unwrap();
+    fs::create_dir_all(outside.join("child")).unwrap();
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::create_dir_all(outside.join("target")).unwrap();
+    fs::create_dir_all(root.join("a/b/c")).unwrap();
+    fs::create_dir_all(&lookalike).unwrap();
+    let escaping_link = root.join("escaping-link");
+    std::os::unix::fs::symlink(&outside, &escaping_link).unwrap();
+    let combined_escape_link = root.join("combined-escape-link");
+    std::os::unix::fs::symlink(outside.join("subdir"), &combined_escape_link).unwrap();
+    let escaping_dotdot = root.join("..").join("outside");
+    let combined_escape_dotdot = combined_escape_link.join("..").join("child");
+    let missing_component_dotdot = root.join("missing").join("..").join("child");
+    // The original spelling resolves inside `root`, while `SessionCwd::parse` folds `..` before
+    // resolving symlinks and would execute outside it.
+    let parsed_escape_link = outside.join("parsed-escape-link");
+    std::os::unix::fs::symlink(root.join("sub"), &parsed_escape_link).unwrap();
+    let parsed_escape_after_link = parsed_escape_link.join("..").join("target");
+    // This variant stays lexically under `root` until its second `..`, but parse normalizes it to
+    // `root/..` while filesystem resolution of the original spelling lands at `root/a`.
+    let parsed_escape_root_link = root.join("parsed-escape-root-link");
+    std::os::unix::fs::symlink(root.join("a/b/c"), &parsed_escape_root_link).unwrap();
+    let parsed_escape_after_root_link = parsed_escape_root_link.join("..").join("..");
+    let root_alias = directory.path().join("root-alias");
+    std::os::unix::fs::symlink(&root, &root_alias).unwrap();
+    let alias_child = root_alias.join("child");
+    let alias_escape = root_alias.join("escaping-link");
+    use std::os::unix::ffi::OsStringExt as _;
+    let non_utf8_root = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
+    let non_utf8_outside = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"repo-\xfe".to_vec()));
+    let non_utf8_root_alias = directory.path().join("non-utf8-root-alias");
+    let non_utf8_outside_alias = directory.path().join("non-utf8-outside-alias");
+    // APFS refuses non-UTF-8 names with EILSEQ; Linux CI still covers that case.
+    let non_utf8_supported = match fs::create_dir(&non_utf8_root) {
+        Ok(()) => {
+            fs::create_dir(&non_utf8_outside).unwrap();
+            std::os::unix::fs::symlink(&non_utf8_root, &non_utf8_root_alias).unwrap();
+            std::os::unix::fs::symlink(&non_utf8_outside, &non_utf8_outside_alias).unwrap();
+            true
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => false,
+        Err(error) => panic!("create non-UTF-8 fixture: {error}"),
+    };
+
+    let adapter = directory.path().join("cwd-guard-acp");
+    let spawned = directory.path().join("adapter-spawned");
+    let delivered_cwd = directory.path().join("delivered-cwd");
+    let script = r#"#!/bin/sh
+touch '__SPAWNED__'
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -E 's/^\{"jsonrpc":"2.0","id":([^,]+),"method".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]},"id":%s}\n' "$id" ;;
+    *'"method":"session/new"'*) printf '%s\n' "$line" > '__DELIVERED_CWD__'; printf '{"jsonrpc":"2.0","result":{"sessionId":"cwd-guard"},"id":%s}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"cwd-guard","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FINAL"}}}}'
+      printf '{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":%s}\n' "$id" ;;
+  esac
+done
+"#
+    .replace("__SPAWNED__", spawned.to_str().unwrap())
+    .replace("__DELIVERED_CWD__", delivered_cwd.to_str().unwrap());
+    fs::write(&adapter, script).unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    let prompt = directory.path().join("prompt.md");
+    let input = directory.path().join("input.md");
+    let config = directory.path().join("a2a-bridge.toml");
+    fs::write(&prompt, "{{input}}").unwrap();
+    fs::write(
+        &input,
+        "---\ntask-type: freeform\n---\nprovider-free input\n",
+    )
+    .unwrap();
+
+    let run = |cwd: Option<&std::path::Path>, configured_root: Option<&std::path::Path>| {
+        let root = configured_root
+            .map(|path| format!("allowed_cwd_root = {path:?}\n"))
+            .unwrap_or_default();
+        fs::write(
+            &config,
+            format!(
+                "default = \"fake\"\n{root}[registry]\nallowed_cmds = [{adapter:?}]\n\
+                 [[agents]]\nid = \"fake\"\ncmd = {adapter:?}\npre_authenticated = true\n\
+                 [[workflows]]\nid = \"cwd-guard\"\n[[workflows.nodes]]\nid = \"only\"\n\
+                 agent = \"fake\"\nprompt_file = {prompt:?}\ninputs = []\n[server]\naddr = \"127.0.0.1:0\"\n",
+                adapter = adapter,
+                prompt = prompt,
+            ),
+        )
+        .unwrap();
+        let _ = fs::remove_file(&spawned);
+        let _ = fs::remove_file(&delivered_cwd);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"));
+        command
+            .args([
+                "run-workflow",
+                "cwd-guard",
+                "--input",
+                input.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .current_dir(directory.path());
+        if let Some(cwd) = cwd {
+            command.args(["--session-cwd", cwd.to_str().unwrap()]);
+        }
+        command.output().unwrap()
+    };
+
+    let mut rejected_cases = vec![
+        outside.as_path(),
+        lookalike.as_path(),
+        escaping_dotdot.as_path(),
+        escaping_link.as_path(),
+        alias_escape.as_path(),
+        combined_escape_dotdot.as_path(),
+        missing_component_dotdot.as_path(),
+        parsed_escape_after_link.as_path(),
+        parsed_escape_after_root_link.as_path(),
+    ];
+    if non_utf8_supported {
+        rejected_cases.push(non_utf8_outside_alias.as_path());
+    }
+    for rejected in rejected_cases {
+        let configured_root = if rejected == non_utf8_outside_alias {
+            non_utf8_root_alias.as_path()
+        } else if rejected == alias_escape {
+            root_alias.as_path()
+        } else {
+            root.as_path()
+        };
+        let output = run(Some(rejected), Some(configured_root));
+        assert!(!output.status.success(), "{rejected:?} unexpectedly ran");
+        assert!(
+            !spawned.exists(),
+            "{rejected:?} spawned an adapter: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--session-cwd"));
+    }
+    let missing_root = directory.path().join("missing-root");
+    let missing_cwd = root.join("missing-cwd");
+    for (cwd, configured_root) in [
+        (child.as_path(), missing_root.as_path()),
+        (missing_cwd.as_path(), root.as_path()),
+    ] {
+        let output = run(Some(cwd), Some(configured_root));
+        assert!(!output.status.success(), "{cwd:?} unexpectedly ran");
+        assert!(!spawned.exists(), "{cwd:?} spawned an adapter");
+    }
+
+    for (cwd, configured_root) in [
+        (Some(root.as_path()), Some(root.as_path())),
+        (Some(child.as_path()), Some(root.as_path())),
+        (Some(alias_child.as_path()), Some(root_alias.as_path())),
+        (Some(outside.as_path()), None),
+        (None, Some(root.as_path())),
+    ] {
+        let output = run(cwd, configured_root);
+        assert!(
+            output.status.success() && spawned.exists(),
+            "cwd={cwd:?}, root={configured_root:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(cwd) = cwd {
+            let session: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&delivered_cwd).unwrap()).unwrap();
+            assert_eq!(session["params"]["cwd"], cwd.to_str().unwrap());
+        }
+    }
+}
+
 /// One provider-free offline `run-workflow` against a fake ACP adapter, with `workflow_keys`
 /// added to the `[[workflows]]` table and `extra_args` to the command line.
 fn run_offline_workflow(

@@ -1496,7 +1496,9 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
             2 * 1024 * 1024,
             vec![0; 1024 * 1024],
         );
-        serial.deadline = Instant::now() + Duration::from_millis(80);
+        // Leave scheduler headroom before exercising the intentional pipe deadlock.  The
+        // assertion is about the selected I/O schedule and timeout, not a sub-100ms race.
+        serial.deadline = Instant::now() + Duration::from_secs(1);
         serial.guard_bypass = bypass;
         assert!(
             matches!(
@@ -1514,14 +1516,14 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
         &root,
     );
     let mut deadline = request(GitCommandV1::FsckStrict, vec![]);
-    deadline.deadline = Instant::now() + Duration::from_millis(80);
+    deadline.deadline = Instant::now() + Duration::from_secs(1);
     let started = Instant::now();
     assert!(matches!(
         runner.run(&root, &names(), deadline, || Ok(()), || Ok(())),
         Err(CustodyGitError::Timeout)
     ));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(3),
         "timeout must include inherited-pipe descendants"
     );
     let pid = fs::read_to_string(pid_file)
@@ -1529,7 +1531,7 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
         .trim()
         .parse::<u32>()
         .unwrap();
-    let gone_by = Instant::now() + Duration::from_secs(1);
+    let gone_by = Instant::now() + Duration::from_secs(3);
     let mut alive = true;
     while alive && Instant::now() < gone_by {
         alive = Command::new("/bin/sh")
@@ -1543,18 +1545,61 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
     }
     assert!(!alive, "process-group termination must leave no grandchild");
 
+    let orphan_pid_file = root.canonical_path().join("orphan-pid");
     let (_fixture, orphan_runner) = fixture_runner(
-        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) sleep 5 & echo $! > orphan-pid; exit 0;; esac\n",
+        "#!/bin/sh\ncase \"$*\" in *version*) echo 'git version 2.54.0';; *) sh -c 'echo $$ > orphan-pid; exec sleep 30' & while [ ! -s orphan-pid ]; do sleep 0.01; done; echo $$ > exited-leader-pid; exit 0;; esac\n",
         &root,
     );
     let mut orphan = request(GitCommandV1::FsckStrict, vec![]);
-    orphan.deadline = Instant::now() + Duration::from_millis(80);
+    orphan.deadline = Instant::now() + Duration::from_secs(1);
     let started = Instant::now();
     assert!(matches!(
         orphan_runner.run(&root, &names(), orphan, || Ok(()), || Ok(())),
         Err(CustodyGitError::Timeout)
     ));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let orphan_pid = fs::read_to_string(&orphan_pid_file)
+        .expect("the descendant must start before the timeout")
+        .trim()
+        .parse::<u32>()
+        .expect("the descendant pid");
+    let running = |pid: &str| {
+        // A killed orphan may remain a zombie until PID 1 reaps it; kill -0 alone is insufficient.
+        #[cfg(target_os = "linux")]
+        let state = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat.rsplit_once(')').unwrap().1.trim().to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("process-state probe: {error}"),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let state = String::from_utf8(
+            Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .expect("process-state probe")
+                .stdout,
+        )
+        .unwrap();
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    };
+    let leader_pid = fs::read_to_string(root.canonical_path().join("exited-leader-pid"))
+        .expect("the leader observed descendant startup before exiting");
+    assert!(
+        !running(leader_pid.trim()),
+        "the group leader must have exited"
+    );
+    let gone_by = Instant::now() + Duration::from_secs(3);
+    let mut orphan_alive = true;
+    while orphan_alive && Instant::now() < gone_by {
+        orphan_alive = running(&orphan_pid.to_string());
+        if orphan_alive {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(
+        !orphan_alive,
+        "process-group termination must leave no orphaned pipe holder"
+    );
 }
 
 #[test]

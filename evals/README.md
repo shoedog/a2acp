@@ -96,15 +96,12 @@ dollars. `--smoke` is the cheap sanity check (3 items, `duo` only: 3
 
 ### Local `run-workflow` vs `--serve`
 
-The runner always uses LOCAL `a2a-bridge run-workflow` (not `--serve`).
-Local `run-workflow` does **not** enforce `allowed_cwd_root` the way the
-served HTTP path does -- fine for local evals (the harness itself controls
-every `--session-cwd` it passes, always an item's own `fixture/` dir,
-resolved absolute and asserted to exist before the call). If a future runner
-variant drives eval cells through a running `serve` instance instead, it
-will need to either widen `allowed_cwd_root` to cover the taskset's fixture
-paths or accept that gate's rejection for out-of-root fixtures -- this
-harness's local-mode runner has no such restriction today.
+The runner always uses LOCAL `a2a-bridge run-workflow` (not `--serve`). When
+its config sets `allowed_cwd_root`, local runs now canonicalize and require
+each explicit `--session-cwd` to be beneath that root before any agent or
+warm-up can start. Keep the configured root broad enough to cover the
+taskset's resolved `fixture/` paths. A future runner variant using a running
+`serve` instance needs the same root coverage.
 
 `--session-cwd` MUST be an absolute path (`SessionCwd::parse` rejects a
 relative one outright) -- `harness/runner.py`'s `run_workflow()` resolves
