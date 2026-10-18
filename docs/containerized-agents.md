@@ -322,6 +322,25 @@ semantics differ). Minimum **podman ≥ 4.5** (netavark ≥ 1.6) for DNS on `--i
 two-line rule: add `"podman"` to `allowed_cmds` **and** `runtime = "podman"` to every `[agents.sandbox]`
 block **and** `[verify]`.
 
+For `[verify]`, Rust commands are classified before any container work, using only text before a bare
+`--`. Plain `cargo` commands share a target after local/path-package invalidation. Toolchain selectors,
+shell syntax (including unquoted glob characters), wrappers, assignments, `--manifest-path`, other
+`--config` or `-Z` options select isolated mode for the whole run. A visible `--target-dir`,
+`CARGO_TARGET_DIR=` assignment or
+`--config` value naming `target-dir` refuses verification. The receipt and `storage report` show the
+mode and reason. The bridge sets `CARGO_TARGET_DIR` inside the volume; it takes precedence over a
+clone's `.cargo/config*` `build.target-dir`. A wrapper that sets its own target internally is outside
+this guarantee: the bridge cannot see inside the wrapper.
+
+Isolated targets are fresh per run, removed at run end, and swept on next use after interruption under
+the cache lock. `CARGO_HOME` remains shared because Cargo does not mtime-check registry sources. Verify
+volumes are trimmed before and after verification to a retained 20 GiB limit; `storage reap
+--verify-cache --dry-run` previews maintenance and `--apply` applies it. Both mounts disable copy-up.
+The verify-cache lock is resolved from the OS account home, independent of `$HOME` and `A2A_LEASE_DIR`;
+unresolvable account homes refuse verification and maintenance. The supported deployment is one OS user
+per container daemon. Two users sharing one daemon are out of scope. Run leases retain their existing
+lookup.
+
 **2. Machine.** `podman` resolves via `PATH` (a launchd-launched `serve` needs `podman` on its `PATH`).
 
 ```bash
@@ -343,8 +362,9 @@ podman build -t a2a-egress-proxy:latest -f deploy/containers/proxy.Containerfile
 > **Per-repo cache volumes (verify + L3 Slice B impl-lsp).** `implement`/`verify` create per-source-repo
 > named volumes — `a2a-verify-cache-<hash>`, `a2a-impl-lsp-cache-<hash>` (warmed RA deps, mounted `:ro`),
 > `a2a-impl-lsp-target-<hash>` (RA's `CARGO_TARGET_DIR`). They are keyed on the **source repo** so they're
-> reused across runs (bounded to one set per repo), but nothing reaps them automatically and the target
-> cache grows over time. To reclaim disk: `docker volume rm $(docker volume ls -q | grep -E 'a2a-(verify-cache|impl-lsp)')`.
+> reused across runs (one set per repo). Verify volumes retain at most 20 GiB after successful maintenance;
+> impl-lsp volumes still grow over time. Use `storage reap --verify-cache` for verify maintenance. Unused
+> impl-lsp volumes can be removed explicitly with the container runtime.
 
 **4. Egress.** Use the podman script (NOT `docker compose`). **Re-run it after every `podman machine start`**
 — `--restart` does not survive a daemonless machine restart.

@@ -78,7 +78,8 @@ pub fn classify(attempt: u32, max_attempts: u32, v: &VerifyOutcome, r: &ReviewOu
     if verify_ok && review_ok {
         return LoopStep::Stop(StopReason::Success);
     }
-    let verify_actionable = matches!(v, VerifyOutcome::Ran(verdict) if !verdict.passed);
+    let verify_actionable = matches!(v, VerifyOutcome::Ran(verdict) if verdict.results.iter().any(|r|
+        r.gate && !r.ok && r.failure_class != Some(crate::verify::VerifyFailureClass::Runner)));
     let review_actionable = matches!(
         r,
         ReviewOutcome::Ran {
@@ -399,6 +400,27 @@ mod tests {
                 &ReviewOutcome::NotConfigured
             ),
             LoopStep::Stop(StopReason::Success)
+        );
+    }
+
+    #[test]
+    fn operator_runner_failures_stop_without_empty_code_repair_turns() {
+        let mut v = match ran_fail() {
+            VerifyOutcome::Ran(v) => v,
+            _ => unreachable!(),
+        };
+        v.results[0].failure_class = Some(VerifyFailureClass::Runner);
+        v.results[0].reach = VerifyReach::NotReached;
+        v.results[0].output = "cache lock unavailable".into();
+        assert!(crate::verify::failure_digest(&v, 1000).contains("cache lock unavailable"));
+        let v = VerifyOutcome::Ran(v);
+        assert_eq!(
+            classify(1, 3, &v, &rev(Verdict::Approve, 0)),
+            LoopStep::Stop(StopReason::NotActionable)
+        );
+        assert_eq!(
+            classify(1, 3, &v, &rev(Verdict::Reject, 0)),
+            LoopStep::Continue
         );
     }
 

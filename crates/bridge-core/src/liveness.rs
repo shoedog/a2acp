@@ -113,6 +113,102 @@ pub fn lease_dir() -> PathBuf {
     PathBuf::from(home).join(".a2a-bridge").join("leases")
 }
 
+/// Verify and maintenance share an OS-account namespace, independent of launch environment.
+/// Supported deployment: one OS user per container daemon. Never fall back to environment paths.
+pub fn verify_cache_lock_dir() -> std::io::Result<PathBuf> {
+    account_home(unsafe { libc::geteuid() }).map(|home| home.join(".a2a-bridge/verify-cache-locks"))
+}
+
+fn account_home(uid: libc::uid_t) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut capacity = 16 * 1024;
+    loop {
+        let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; capacity];
+        // SAFETY: writable outputs and buffer remain live through inspection of pw_dir.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && capacity < 1024 * 1024 {
+            capacity *= 2;
+            continue;
+        }
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Err(std::io::Error::other(
+                "verify cache: OS account home unavailable",
+            ));
+        }
+        // SAFETY: non-null result initializes passwd; pw_dir is used before buffer is dropped.
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_dir.is_null() {
+            return Err(std::io::Error::other(
+                "verify cache: OS account home unavailable",
+            ));
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(passwd.pw_dir) }.to_bytes();
+        let home = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+        if !home.is_absolute() {
+            return Err(std::io::Error::other(
+                "verify cache: OS account home must be absolute",
+            ));
+        }
+        return Ok(home);
+    }
+}
+
+#[cfg(test)]
+mod verify_cache_tests {
+    use super::*;
+
+    #[test]
+    fn verify_cache_lock_path_ignores_environment() {
+        let path = verify_cache_lock_dir().unwrap();
+        if let Some(expected) = std::env::var_os("A2A_TEST_CACHE_LOCK_PATH") {
+            assert_eq!(path, PathBuf::from(expected));
+            return;
+        }
+        for value in ["/tmp/cache-lock-env-a", "/tmp/cache-lock-env-b"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "liveness::verify_cache_tests::verify_cache_lock_path_ignores_environment",
+                ])
+                .env("HOME", value)
+                .env("A2A_LEASE_DIR", value)
+                .env("A2A_TEST_CACHE_LOCK_PATH", &path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "child did not run the selected test: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn verify_cache_missing_account_fails_closed() {
+        assert!(account_home(libc::uid_t::MAX).is_err());
+    }
+}
+
 /// Held for the owning process's life; the OS releases the flock when `_file` drops (clean OR crash). The
 /// file is removed on a clean drop; after a crash it persists with the lock FREE (the recovery signal).
 pub struct LeaseGuard {
