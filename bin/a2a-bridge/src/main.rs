@@ -8667,9 +8667,9 @@ fn storage_reap_cmd(args: &[String]) -> Result<(), BoxError> {
             cfg.storage.clone_reap_lookback
         ));
         report.notes.push(format!(
-            "fold receipts and preserved evidence live in `{}/{}` — a SIBLING of the clones, so they \
-             outlive the runs they describe (plan §7). They are Evidence class and are never \
-             auto-deleted.",
+            "fold receipts live in `{}/{}` — a SIBLING of the clones, so they outlive the runs they \
+             describe (plan §7). Payload archives are separate: `[evidence]` selects their storage \
+             location and retention policy.",
             sr::display_path(&verified),
             sr::RECEIPTS_DIR
         ));

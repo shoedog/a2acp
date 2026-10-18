@@ -2948,6 +2948,19 @@ mod tests {
         serde_json::from_str(&raw).unwrap()
     }
 
+    fn refresh_archive(f: &Fx) {
+        let (ck, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        bridge_controller::evidence::write_run_archive(&f.clone, &ck, "approved", &cfg.evidence)
+            .unwrap();
+    }
+
+    fn set_recorded_source(f: &Fx, source: PathBuf) {
+        let (mut ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        ck.source_repo = source;
+        bridge_controller::implement_resume::save_checkpoint(&f.clone, &ck).unwrap();
+        refresh_archive(f);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Containment — the D-1 gate, on live repositories
     // -----------------------------------------------------------------------------------------
@@ -2976,6 +2989,169 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // F1 — every ref, not just HEAD. Containment proves HEAD; deletion takes the whole object store.
     // -----------------------------------------------------------------------------------------
+
+    /// An owner disposition replaces the ref sweep, never the durable record of the refs it takes.
+    /// In particular, a tip outside HEAD's history must survive in the receipt after the clone is gone.
+    #[test]
+    fn owner_discard_records_the_complete_ref_inventory_including_a_rogue_tip() {
+        let f = fx();
+        let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        let branch = sr::git_str(&f.clone, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        git(&f.clone, &["checkout", "-qb", "rogue"]);
+        write(&f.clone.join("rogue-only"), "unlanded work\n");
+        git(&f.clone, &["add", "-A"]);
+        git(&f.clone, &["commit", "-qm", "rogue"]);
+        let rogue = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        git(&f.clone, &["checkout", "-q", &branch]);
+        git(&f.clone, &["tag", "supported-tag", &head]);
+        write(&f.clone.join("README.md"), "stashed inventory change\n");
+        git(&f.clone, &["stash", "push", "-qm", "inventory stash"]);
+        let stash = sr::git_str(&f.clone, &["rev-parse", "refs/stash^{commit}"]).unwrap();
+        let tag =
+            sr::git_str(&f.clone, &["rev-parse", "refs/tags/supported-tag^{commit}"]).unwrap();
+        let expected_inventory = vec![
+            RefFact {
+                refname: format!("refs/heads/{branch}"),
+                oid: Some(
+                    sr::git_str(
+                        &f.clone,
+                        &["rev-parse", &format!("refs/heads/{branch}^{{commit}}")],
+                    )
+                    .unwrap(),
+                ),
+                is_head: true,
+                is_ancestor_of_head: Some(true),
+            },
+            RefFact {
+                refname: "refs/heads/rogue".into(),
+                oid: Some(
+                    sr::git_str(&f.clone, &["rev-parse", "refs/heads/rogue^{commit}"]).unwrap(),
+                ),
+                is_head: false,
+                is_ancestor_of_head: Some(false),
+            },
+            RefFact {
+                refname: "refs/stash".into(),
+                oid: Some(stash),
+                is_head: false,
+                is_ancestor_of_head: Some(false),
+            },
+            RefFact {
+                refname: "refs/tags/supported-tag".into(),
+                oid: Some(tag),
+                is_head: true,
+                is_ancestor_of_head: Some(true),
+            },
+        ];
+
+        let license = license(&f, &[&f.run_id]);
+        let report = run_licensed(
+            &f,
+            &scan(&f.implement),
+            &FakeEnv::new(),
+            false,
+            0,
+            DEFAULT_CLONE_REAP_LOOKBACK,
+            Some(&license),
+        );
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted
+        );
+        let receipt = fold_receipt(&f);
+        let refs = receipt["ref_inventory"].as_array().unwrap();
+        assert_eq!(
+            receipt["ref_inventory"],
+            serde_json::to_value(expected_inventory).unwrap()
+        );
+        assert!(refs.iter().any(|r| {
+            r["refname"] == format!("refs/heads/{branch}")
+                && r["oid"] == head
+                && r["is_head"] == true
+                && r["is_ancestor_of_head"] == true
+        }));
+        assert!(refs.iter().any(|r| {
+            r["refname"] == "refs/heads/rogue"
+                && r["oid"] == rogue
+                && r["is_head"] == false
+                && r["is_ancestor_of_head"] == false
+        }));
+    }
+
+    /// The receipt is the only durable account after deletion. Pin its identity, custody and license
+    /// fields together so a future schema simplification cannot leave a plausible but incomplete record.
+    #[test]
+    fn owner_discard_receipt_preserves_identity_durability_and_license_fields() {
+        let f = fx();
+        let license = license(&f, &[&f.run_id]);
+        let (checkpoint, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        let tree = sr::git_str(&f.clone, &["show", "-s", "--format=%T", "HEAD"]).unwrap();
+        let chain = resolve_origin_root(&f.clone, &f.implement).unwrap();
+        let pin =
+            bridge_core::fs_custody::PinnedDirectoryV1::open(&f.implement, "receipt assertion")
+                .unwrap();
+        let scan_root_identity = bridge_core::fs_custody::root_identity_label(&pin);
+        let report = run_licensed(
+            &f,
+            &scan(&f.implement),
+            &FakeEnv::new(),
+            false,
+            0,
+            DEFAULT_CLONE_REAP_LOOKBACK,
+            Some(&license),
+        );
+        let reaped = item_for(&report, &f.clone);
+        assert_eq!(reaped.outcome, rp::ItemOutcome::Deleted);
+        let receipt = fold_receipt(&f);
+        assert_eq!(receipt["schema"], FOLD_RECEIPT_SCHEMA);
+        assert_eq!(receipt["run_id"], f.run_id);
+        assert_eq!(receipt["task_id"], checkpoint.task_id);
+        assert_eq!(receipt["branch"], checkpoint.branch);
+        assert_eq!(receipt["head"], head);
+        assert_eq!(receipt["tree"], tree);
+        assert_eq!(receipt["base"], checkpoint.base_commit);
+        assert_eq!(
+            receipt["base_ref"],
+            serde_json::to_value(checkpoint.base_ref).unwrap()
+        );
+        assert_eq!(receipt["clone_path"], f.clone.display().to_string());
+        assert_eq!(receipt["scan_root"], f.implement.display().to_string());
+        assert_eq!(receipt["scan_root_identity"], scan_root_identity);
+        assert_eq!(receipt["at_epoch_secs"], 1_700_000_000_u64);
+        assert_eq!(receipt["disposition"], DISPOSITION_DELETED);
+        assert_eq!(
+            receipt["logical_bytes"],
+            serde_json::to_value(reaped.logical_bytes).unwrap()
+        );
+        assert_eq!(
+            receipt["disk_bytes"],
+            serde_json::to_value(reaped.disk_bytes).unwrap()
+        );
+        assert_eq!(receipt["containment"]["verdict"], VERDICT_OWNER_DISPOSITION);
+        assert_eq!(
+            receipt["containment"]["authorized_by"],
+            license.authorized_by
+        );
+        assert_eq!(receipt["containment"]["reason"], license.reason);
+        assert_eq!(receipt["containment"]["list_file"], license.list_file);
+        assert_eq!(receipt["containment"]["list_sha256"], license.list_sha256);
+        assert_eq!(receipt["source_repo"], f.source.display().to_string());
+        assert_eq!(
+            receipt["origin_chain"],
+            serde_json::to_value(chain.hops).unwrap()
+        );
+        assert_eq!(
+            receipt["containment"]["matched_commit"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["containment"]["main_ref"], serde_json::Value::Null);
+        assert_eq!(receipt["durability"], license.durability());
+        assert!(receipt["gates"].as_array().unwrap().iter().any(|gate| {
+            gate.as_str()
+                .is_some_and(|gate| gate.contains("owner remove"))
+        }));
+    }
 
     // -----------------------------------------------------------------------------------------
     // Git state
@@ -4149,6 +4325,45 @@ mod tests {
     }
 
     #[test]
+    fn an_unrelated_terminal_origin_cannot_corroborate_a_clone_for_removal() {
+        let f = fx();
+        let parent = two_hop(&f);
+        let unrelated = f.root.join("unrelated-terminal");
+        std::fs::create_dir(&unrelated).unwrap();
+        git(&unrelated, &["init", "--initial-branch=main", "-q"]);
+        // Recreate the same tree without sharing ANY object history. Content equality must not
+        // substitute for the terminal lineage corroborator.
+        for path in ["README.md", ".gitignore", "src/lib.rs"] {
+            write(
+                &unrelated.join(path),
+                &std::fs::read_to_string(f.source.join(path)).unwrap(),
+            );
+        }
+        git(&unrelated, &["add", "-A"]);
+        git(&unrelated, &["commit", "-qm", "unrelated"]);
+        assert_eq!(
+            sr::git_str(&unrelated, &["show", "-s", "--format=%T", "HEAD"]).unwrap(),
+            sr::git_str(&f.clone, &["show", "-s", "--format=%T", "HEAD"]).unwrap()
+        );
+        git(
+            &parent,
+            &["remote", "set-url", "origin", unrelated.to_str().unwrap()],
+        );
+        let mut parent_ck = bridge_controller::implement_resume::load_checkpoint(&parent).unwrap();
+        parent_ck.source_repo = unrelated;
+        bridge_controller::implement_resume::save_checkpoint(&parent, &parent_ck).unwrap();
+        let mut items = scan(&f.implement);
+        items.retain(|item| item.path != parent.to_str().unwrap());
+        let report = run(&f, &items, &FakeEnv::new(), false);
+        assert!(matches!(
+            parked_reason(&report, &f.clone),
+            rp::ParkReason::NotOnSourceMain { detail, .. } if detail.contains("corrobor")
+        ));
+        assert!(f.clone.exists());
+        assert_remote(&f, true);
+    }
+
+    #[test]
     fn encoded_path_holders_without_process_records_keep_clones() {
         let long_prefix = "long-path-".repeat(20);
         for prefix in ["ordinary-", "nonascii-é-", long_prefix.as_str()] {
@@ -4602,6 +4817,360 @@ mod tests {
         }
     }
 
+    /// Alternative equivalence is bounded for reporting, never a deletion license. Exact provenance
+    /// remains valid however old it is because the trailers are the durable link to this run.
+    #[test]
+    fn lookback_exhaustion_parks_equivalence_but_not_exact_trailer_provenance() {
+        let f = fx();
+        let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        git(&f.source, &["update-ref", "refs/heads/main", &head]);
+        for n in 0..3 {
+            // Change EVERY path introduced by the run. The last commit in the one-commit window
+            // must not accidentally satisfy the changed-path equivalence probe by inheritance.
+            write(
+                &f.source.join("src/lib.rs"),
+                &format!("pub fn main_{n}() {{}}\n"),
+            );
+            write(&f.source.join(".gitignore"), &format!("/target-{n}\n"));
+            git(&f.source, &["add", "-A"]);
+            git(&f.source, &["commit", "-qm", "ordinary integration"]);
+        }
+        let short_evidence = bridge_controller::merge::classify_landing(&f.clone, &ck, &head, 1);
+        assert_eq!(short_evidence.confidence, "unknown", "{short_evidence:?}");
+        let short = run_with(&f, &scan(&f.implement), &FakeEnv::new(), false, 0, 1);
+        assert!(
+            matches!(parked_reason(&short, &f.clone), rp::ParkReason::NotOnSourceMain { verdict, .. } if verdict == "unknown")
+        );
+        assert!(f.clone.exists());
+
+        // A much larger window reaches the run's own commit on main, so it discloses an equal stable
+        // patch ID, but equivalence without exact trailers still cannot authorize removal.
+        let long_evidence = bridge_controller::merge::classify_landing(&f.clone, &ck, &head, 32);
+        assert_eq!(
+            long_evidence.confidence, "high-patch-equivalence",
+            "{long_evidence:?}"
+        );
+        assert_eq!(long_evidence.matched_commit.as_deref(), Some(head.as_str()));
+        assert!(!long_evidence.confirmed());
+        let long = run_with(&f, &scan(&f.implement), &FakeEnv::new(), false, 0, 32);
+        assert!(matches!(
+            item_for(&long, &f.clone).outcome,
+            rp::ItemOutcome::Parked { .. }
+        ));
+        assert!(f.clone.exists());
+
+        // Put an exact pair behind the same short window. Trailer history is intentionally unbounded.
+        git(
+            &f.source,
+            &[
+                "commit",
+                "--allow-empty",
+                "-qm",
+                &format!(
+                    "late provenance\n\nA2A-Run: {}\nA2A-Original: {head}",
+                    f.run_id
+                ),
+            ],
+        );
+        for _ in 0..3 {
+            git(
+                &f.source,
+                &["commit", "--allow-empty", "-qm", "later integration"],
+            );
+        }
+        assert!(bridge_controller::merge::classify_landing(&f.clone, &ck, &head, 1).confirmed());
+        let exact = run_with(&f, &scan(&f.implement), &FakeEnv::new(), false, 0, 1);
+        assert_eq!(item_for(&exact, &f.clone).outcome, rp::ItemOutcome::Deleted);
+    }
+
+    /// The branch spelling is fully qualified. A tag named `main` is not the source branch and cannot
+    /// make a trailer reachable from a branch that no longer carries it.
+    #[test]
+    fn a_tag_named_main_cannot_shadow_the_source_main_branch() {
+        let f = fx();
+        let old_main = sr::git_str(&f.source, &["rev-parse", "refs/heads/main"]).unwrap();
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        git(&f.source, &["tag", "main", &old_main]);
+        git(
+            &f.source,
+            &["update-ref", "refs/heads/main", &ck.base_commit],
+        );
+        let evidence = bridge_controller::merge::classify_landing(&f.clone, &ck, &head, 1);
+        assert!(
+            !evidence.confirmed(),
+            "a tag named main authorized deletion: {evidence:?}"
+        );
+        let report = run_with(&f, &scan(&f.implement), &FakeEnv::new(), false, 0, 1);
+        assert!(matches!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Parked { .. }
+        ));
+        assert!(f.clone.exists());
+    }
+
+    #[test]
+    fn origin_resolution_refuses_hosted_plain_and_leaf_symlink_origins() {
+        // A hosted URL is never fetched or otherwise treated as a local source.
+        let f = fx();
+        git(
+            &f.clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/source.git",
+            ],
+        );
+        assert!(matches!(
+            resolve_origin_root(&f.clone, &f.implement),
+            Err(rp::ParkReason::OriginNotLocal { .. })
+        ));
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(
+            matches!(
+                parked_reason(&report, &f.clone),
+                rp::ParkReason::OriginNotLocal { .. }
+            ),
+            "{report:?}"
+        );
+
+        // `git -C` must not discover the enclosing source repository through a plain child directory.
+        let f = fx();
+        let plain = f.source.join("not-a-repository");
+        std::fs::create_dir(&plain).unwrap();
+        git(
+            &f.clone,
+            &["remote", "set-url", "origin", plain.to_str().unwrap()],
+        );
+        set_recorded_source(&f, plain);
+        assert!(matches!(
+            resolve_origin_root(&f.clone, &f.implement),
+            Err(rp::ParkReason::OriginNotLocal { .. })
+        ));
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(matches!(
+            parked_reason(&report, &f.clone),
+            rp::ParkReason::OriginNotLocal { .. }
+        ));
+
+        // An invalid `.git` directory inside the real source must not borrow the enclosing history.
+        let f = fx();
+        let invalid_git = f.source.join("invalid-git-discovery");
+        std::fs::create_dir_all(invalid_git.join(".git")).unwrap();
+        git(
+            &f.clone,
+            &["remote", "set-url", "origin", invalid_git.to_str().unwrap()],
+        );
+        set_recorded_source(&f, invalid_git);
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(
+            matches!(
+                parked_reason(&report, &f.clone),
+                rp::ParkReason::NotOnSourceMain { verdict, detail }
+                    if verdict == "unknown" && detail.contains("not a git repository")
+            ),
+            "the invalid `.git` directory borrowed enclosing history: {report:?}"
+        );
+        assert!(f.clone.exists());
+        assert_remote(&f, true);
+
+        // A directory symlink at the leaf is rejected before its target can answer provenance.
+        let f = fx();
+        let alias = f.root.join("source-leaf-alias");
+        std::os::unix::fs::symlink(&f.source, &alias).unwrap();
+        git(
+            &f.clone,
+            &["remote", "set-url", "origin", alias.to_str().unwrap()],
+        );
+        assert!(matches!(
+            resolve_origin_root(&f.clone, &f.implement),
+            Err(rp::ParkReason::OriginNotLocal { .. })
+        ));
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(matches!(
+            parked_reason(&report, &f.clone),
+            rp::ParkReason::OriginNotLocal { .. }
+        ));
+    }
+
+    #[test]
+    fn in_root_origin_aliases_and_hop_limit_reach_the_terminal_or_limit_gate() {
+        let f = fx();
+        let parent = two_hop(&f);
+        let relative_parent = format!("../{}", parent.file_name().unwrap().to_str().unwrap());
+        git(&f.clone, &["remote", "set-url", "origin", &relative_parent]);
+        let mut items = scan(&f.implement);
+        items.retain(|item| item.path != parent.to_str().unwrap());
+        let report = run(&f, &items, &FakeEnv::new(), false);
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted,
+            "{report:?}"
+        );
+        assert_eq!(
+            fold_receipt(&f)["source_repo"],
+            f.source.display().to_string()
+        );
+        assert_eq!(
+            fold_receipt(&f)["origin_chain"].as_array().unwrap().len(),
+            2
+        );
+
+        let f = fx();
+        let parent = two_hop(&f);
+        let parent_alias = f.root.join("implement-alias");
+        std::os::unix::fs::symlink(&f.implement, &parent_alias).unwrap();
+        let alias_parent = format!(
+            "../../implement-alias/{}",
+            parent.file_name().unwrap().to_str().unwrap()
+        );
+        git(&f.clone, &["remote", "set-url", "origin", &alias_parent]);
+        let mut items = scan(&f.implement);
+        items.retain(|item| item.path != parent.to_str().unwrap());
+        let report = run(&f, &items, &FakeEnv::new(), false);
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted,
+            "{report:?}"
+        );
+        assert_eq!(
+            fold_receipt(&f)["source_repo"],
+            f.source.display().to_string()
+        );
+        assert_eq!(
+            fold_receipt(&f)["origin_chain"].as_array().unwrap().len(),
+            2
+        );
+
+        for additional_hops in [7usize, 8] {
+            let f = fx();
+            let parent = two_hop(&f);
+            let mut hops = Vec::new();
+            for n in 1..=additional_hops {
+                let hop = f.implement.join(format!("impl-{DEAD_PID}-hop-{n}"));
+                let out = Command::new("git")
+                    .args(["clone", "--no-hardlinks", "-q"])
+                    .arg(&f.source)
+                    .arg(&hop)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                hops.push(hop);
+            }
+            let parent_checkpoint =
+                bridge_controller::implement_resume::load_checkpoint(&parent).unwrap();
+            for hop in &hops {
+                let mut checkpoint = parent_checkpoint.clone();
+                let run_id = hop.file_name().unwrap().to_str().unwrap().to_string();
+                checkpoint.resume_id = run_id.clone();
+                checkpoint.task_id = run_id.clone();
+                checkpoint.clone_path = hop.clone();
+                checkpoint.branch = format!("implement/{run_id}");
+                checkpoint.current_commit = Some(sr::git_str(hop, &["rev-parse", "HEAD"]).unwrap());
+                bridge_controller::implement_resume::save_checkpoint(hop, &checkpoint).unwrap();
+            }
+            let chain = std::iter::once(parent.clone())
+                .chain(hops.clone())
+                .collect::<Vec<_>>();
+            for index in 0..chain.len() {
+                let next = chain.get(index + 1).unwrap_or(&f.source).clone();
+                git(
+                    &chain[index],
+                    &["remote", "set-url", "origin", next.to_str().unwrap()],
+                );
+                let mut checkpoint =
+                    bridge_controller::implement_resume::load_checkpoint(&chain[index]).unwrap();
+                checkpoint.source_repo = next;
+                checkpoint.clone_path = chain[index].clone();
+                bridge_controller::implement_resume::save_checkpoint(&chain[index], &checkpoint)
+                    .unwrap();
+            }
+            let mut items = scan(&f.implement);
+            items.retain(|item| item.path == f.clone.to_str().unwrap());
+            let report = run(&f, &items, &FakeEnv::new(), false);
+            if additional_hops == 7 {
+                assert_eq!(
+                    item_for(&report, &f.clone).outcome,
+                    rp::ItemOutcome::Deleted,
+                    "{report:?}"
+                );
+                assert_eq!(
+                    fold_receipt(&f)["source_repo"],
+                    f.source.display().to_string()
+                );
+            } else {
+                assert!(matches!(
+                    parked_reason(&report, &f.clone),
+                    rp::ParkReason::NotOnSourceMain { verdict, detail }
+                        if verdict == "unknown" && detail.contains("limit 8")
+                ));
+                assert!(f.clone.exists());
+                assert_remote(&f, true);
+            }
+        }
+    }
+
+    #[test]
+    fn unborn_head_parks_without_touching_the_clone_or_its_remote_ref() {
+        let f = fx();
+        git(&f.clone, &["checkout", "--orphan", "unborn"]);
+        git(&f.clone, &["rm", "-qrf", "."]);
+        assert!(sr::git_ro(&f.clone, &["status", "--porcelain"])
+            .unwrap()
+            .stdout
+            .is_empty());
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(matches!(
+            parked_reason(&report, &f.clone),
+            rp::ParkReason::UnbornHead { .. }
+        ));
+        assert!(f.clone.exists());
+        assert_remote(&f, true);
+    }
+
+    #[test]
+    fn dry_run_discloses_unexercised_publication_and_bad_archives_still_park() {
+        let f = fx();
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), true);
+        let item = item_for(&report, &f.clone);
+        assert_eq!(item.outcome, rp::ItemOutcome::Planned);
+        assert!(item.gates.iter().any(|g| {
+            g.contains("configured archive checked")
+                && g.contains("publication and removal not exercised")
+        }));
+        let rendered = render_text(&report);
+        assert!(
+            rendered.contains("configured archive checked"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("receipt publication and removal not exercised by dry run"),
+            "{rendered}"
+        );
+        assert!(report.receipts.is_empty() && report.intents.is_empty());
+
+        let f = fx();
+        let (ck, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let archive = cfg
+            .evidence
+            .path
+            .unwrap()
+            .join(bridge_controller::evidence::repo_key(&ck.source_repo).unwrap())
+            .join(format!("{}.tar.gz", f.run_id));
+        write(&archive, "corrupt archive");
+        let report = run(&f, &scan(&f.implement), &FakeEnv::new(), true);
+        assert!(
+            matches!(
+                parked_reason(&report, &f.clone),
+                rp::ParkReason::GitStateUnknown { detail } if detail.contains("invalid gzip header")
+            ),
+            "a corrupt archive did not disclose its shared-gate refusal: {report:?}"
+        );
+        assert!(f.clone.exists());
+    }
+
     #[test]
     fn patch_and_content_equivalence_are_reported_and_parked() {
         for content_only in [false, true] {
@@ -4745,6 +5314,25 @@ mod tests {
         assert_eq!(out.status.success(), present, "{reference}");
     }
 
+    // Removed-test reconciliation:
+    // - `owner_discard_records_the_complete_ref_inventory_including_a_rogue_tip` restores exact ref
+    //   inventory and rogue-branch discard; `owner_discard_receipt_preserves_identity_durability_and_license_fields`
+    //   restores the complete fold identity and owner-license record.
+    // - `listed_remove_deletes_only_listed_work_and_unspecified_unlanded_work_survives` restores mixed
+    //   listed/unlisted and isolated unspecified disposition handling.
+    // - `lookback_exhaustion_parks_equivalence_but_not_exact_trailer_provenance`,
+    //   `a_tag_named_main_cannot_shadow_the_source_main_branch`,
+    //   `origin_resolution_refuses_hosted_plain_and_leaf_symlink_origins`,
+    //   `an_unrelated_terminal_origin_cannot_corroborate_a_clone_for_removal`, and
+    //   `in_root_origin_aliases_and_hop_limit_reach_the_terminal_or_limit_gate` restore containment,
+    //   origin, canonical-boundary, and hop-limit cases; `unborn_head_parks_without_touching_the_clone_or_its_remote_ref`
+    //   restores the unborn case; and `dry_run_discloses_unexercised_publication_and_bad_archives_still_park`
+    //   restores rendering/disclosure.
+    // - `shared_gate_agrees_with_reap_for_all_custody_blockers` retains remote mismatch, disabled push,
+    //   dirty state, bad archive, side refs, index flags, nested repo, worktree, and ignored-output tests.
+    // Obsolete expectations deliberately remain absent: patch/tree equivalence, wider lookback, or a
+    // fallback branch never authorize deletion; an explicit owner discard may remove dirty work; and
+    // a fold receipt never receives a second payload archive.
     #[test]
     fn shared_gate_agrees_with_reap_for_all_custody_blockers() {
         for case in [
@@ -4908,6 +5496,138 @@ mod tests {
             item_for(&report, &f.clone).outcome,
             rp::ItemOutcome::Parked { .. }
         ));
+        assert_remote(&f, true);
+    }
+
+    /// A remove list is a narrow authorization. It must not turn similar work that was omitted from
+    /// the list into implicitly abandoned work, whether it appears beside a listed run or by itself.
+    #[test]
+    fn listed_remove_deletes_only_listed_work_and_unspecified_unlanded_work_survives() {
+        let f = fx();
+        git(
+            &f.source,
+            &[
+                "commit",
+                "--amend",
+                "--allow-empty",
+                "-qm",
+                "ordinary integration",
+            ],
+        );
+        write(&f.clone.join("listed-only"), "abandoned work\n");
+        git(&f.clone, &["add", "-A"]);
+        git(&f.clone, &["commit", "-qm", "abandoned listed work"]);
+        let (mut listed_ck, cfg) = recorded_config(&f.clone, &f.run_id).unwrap();
+        let listed_head = sr::git_str(&f.clone, &["rev-parse", "HEAD"]).unwrap();
+        listed_ck.current_commit = Some(listed_head.clone());
+        bridge_controller::implement_resume::save_checkpoint(&f.clone, &listed_ck).unwrap();
+        bridge_controller::custody_push::push_before_review_or_merge(
+            &f.clone,
+            &cfg.custody,
+            &mut listed_ck,
+            &listed_head,
+        );
+        bridge_controller::evidence::write_run_archive(
+            &f.clone,
+            &listed_ck,
+            "approved",
+            &cfg.evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            landing(&f).confidence,
+            "absent",
+            "the listed clone must need its explicit remove authorization"
+        );
+
+        let sibling_run = format!("impl-{DEAD_PID}-unlisted");
+        let sibling = f.implement.join(&sibling_run);
+        let out = Command::new("git")
+            .args(["clone", "--no-hardlinks", "-q"])
+            .arg(&f.source)
+            .arg(&sibling)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let sibling_branch = format!("implement/{sibling_run}");
+        git(&sibling, &["branch", "-m", &sibling_branch]);
+        write(&sibling.join("sibling-only"), "also abandoned work\n");
+        git(&sibling, &["add", "-A"]);
+        git(&sibling, &["commit", "-qm", "abandoned unlisted work"]);
+        let (mut sibling_ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        sibling_ck.resume_id = sibling_run.clone();
+        sibling_ck.task_id = sibling_run.clone();
+        sibling_ck.clone_path = sibling.clone();
+        sibling_ck.branch = sibling_branch;
+        sibling_ck.current_commit = Some(sr::git_str(&sibling, &["rev-parse", "HEAD"]).unwrap());
+        let sibling_head = sibling_ck.current_commit.clone().unwrap();
+        bridge_controller::implement_resume::save_checkpoint(&sibling, &sibling_ck).unwrap();
+        write(&sibling.join(".git/A2A_TASK.md"), "other task");
+        bridge_controller::custody_push::push_before_review_or_merge(
+            &sibling,
+            &cfg.custody,
+            &mut sibling_ck,
+            &sibling_head,
+        );
+        bridge_controller::evidence::write_run_archive(
+            &sibling,
+            &sibling_ck,
+            "approved",
+            &cfg.evidence,
+        )
+        .unwrap();
+        assert_eq!(
+            bridge_controller::merge::classify_landing(
+                &sibling,
+                &sibling_ck,
+                &sibling_head,
+                DEFAULT_CLONE_REAP_LOOKBACK,
+            )
+            .confidence,
+            "absent",
+            "the unlisted sibling must be equally abandoned"
+        );
+
+        let list = license(&f, &[&f.run_id]);
+        let report = run_licensed(
+            &f,
+            &scan(&f.implement),
+            &FakeEnv::new(),
+            false,
+            0,
+            DEFAULT_CLONE_REAP_LOOKBACK,
+            Some(&list),
+        );
+        assert_eq!(
+            item_for(&report, &f.clone).outcome,
+            rp::ItemOutcome::Deleted
+        );
+        assert!(matches!(
+            item_for(&report, &sibling).outcome,
+            rp::ItemOutcome::Parked { .. }
+        ));
+        assert!(sibling.exists());
+        let sibling_remote = format!("refs/heads/wip/{sibling_run}");
+        assert!(sr::git_ro(
+            &f.root.join("backup.git"),
+            &["show-ref", "--verify", &sibling_remote]
+        )
+        .unwrap()
+        .status
+        .success());
+
+        let f = fx();
+        let (ck, _) = recorded_config(&f.clone, &f.run_id).unwrap();
+        git(
+            &f.source,
+            &["update-ref", "refs/heads/main", &ck.base_commit],
+        );
+        let unspecified = run(&f, &scan(&f.implement), &FakeEnv::new(), false);
+        assert!(matches!(
+            item_for(&unspecified, &f.clone).outcome,
+            rp::ItemOutcome::Parked { .. }
+        ));
+        assert!(f.clone.exists());
         assert_remote(&f, true);
     }
 
