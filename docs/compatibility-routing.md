@@ -62,3 +62,27 @@ support gates require explicit operator selection and are not unattended daily l
 
 See [Compatibility scheduling foundation](compatibility-scheduling-foundation.md) for the local validators
 and the strict no-effect boundary.
+
+## OpenCode Go advisory routing (2026-10-18)
+
+These are exact OpenCode Go model IDs, not a support or live-usability claim. Use them only after an
+operator has checked the subscribed catalog and explicitly authorized the provider turn. The estimated
+monthly request counts are the provider's base-Go estimates and vary with actual token use; they are a
+budgeting signal, not a quality ranking. See OpenCode's [limits and privacy reference](https://opencode.ai/docs/go/)
+for the current catalog, limits, retention, and training terms.
+
+| Exact model ID | Suggested role | Estimated requests/month | Usage guidance |
+|---|---|---:|---|
+| `opencode-go/kimi-k3` | Independent bounded review | ~490 | Reserve for short, high-value review questions. |
+| `opencode-go/glm-5.3` | Independent bounded review | ~1,080 | Use for one scoped spec, plan, or code-review lens. |
+| `opencode-go/qwen3.8-max` | Independent bounded review | ~810 | Use for a bounded second opinion; avoid exploratory loops. |
+| `opencode-go/grok-4.7` | Independent bounded review | ~845 | Keep requests narrow and retain the review evidence. |
+| `opencode-go/kimi-k2.7-code` | Implementation candidate | ~6,750 | Use in a quarantine writer only with a task-specific budget and verification. |
+| `opencode-go/glm-5.2` | Implementation candidate | ~4,300 | Prefer a bounded edit/fix pass over an open-ended implementation session. |
+| `opencode-go/deepseek-v4-pro` | Implementation candidate | ~5,200 | Check current usage and retention terms before authorizing a longer implementation. |
+| `opencode-go/minimax-m3` | Implementation candidate | ~16,000 | Higher estimated headroom does not remove the need for a turn and token budget. |
+| `opencode-go/mimo-v2.6-pro` | Implementation candidate | ~16,300 | Use verification and review gates; do not infer quality from the tier. |
+
+Do not recommend or include Gemini 4 Argon Contributor or Muse Spark Contributor models in examples:
+the provider permits training on prompts and completions for those offerings. The table intentionally does
+not promote OpenCode Go to a compatibility gate; the current recorded OpenCode check has an expired key.

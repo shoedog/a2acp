@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g \
       @agentclientprotocol/claude-agent-acp@0.93.0 \
       @agentclientprotocol/codex-acp@2.2.2 \
+      opencode-ai@1.18.27 \
     && npm install \
       --prefix /usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp \
       --omit=dev --no-save --package-lock=false \
@@ -31,12 +32,14 @@ RUN test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/c
     && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")" = "0.162.1" \
     && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")" = "0.93.0" \
     && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")" = "0.3.300" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.300"
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.300" \
+    && test "$(opencode --version)" = "1.18.27"
 
 LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.2.2" \
       io.a2a-bridge.provenance.codex.agent-cli="@openai/codex=0.162.1" \
       io.a2a-bridge.provenance.claude.adapter="@agentclientprotocol/claude-agent-acp=0.93.0" \
       io.a2a-bridge.provenance.claude.agent-cli="@anthropic-ai/claude-agent-sdk=0.3.300" \
+      io.a2a-bridge.provenance.opencode.agent-cli="opencode-ai=1.18.27" \
       io.a2a-bridge.provenance.kiro.agent-cli="kiro-cli=2.24.1"
 
 # kiro-cli: install the LINUX build (the host's macOS binary can't run in this Linux image). Official

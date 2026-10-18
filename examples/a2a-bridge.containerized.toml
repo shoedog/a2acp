@@ -1,13 +1,14 @@
-# kiro = :ro containerized reader behind the egress lock; claude+codex reviewers run HOST-SIDE with prism
-# (codex hard read-only via sandbox_mode); impl = container_rw; + the non-process ollama.
+# kiro + OpenCode Go = :ro containerized readers behind the egress lock; claude+codex reviewers run HOST-SIDE
+# with prism (codex hard read-only via sandbox_mode); impl = container_rw; + the non-process ollama.
 # Run:  a2a-bridge serve --config examples/a2a-bridge.containerized.toml   (from the repo root)
 # Prereqs (see docs/containerized-agents.md):
 #   - docker compose -f deploy/containers/compose.egress.yaml up -d --build
 #   - the reader image built (deploy/containers/reader.Containerfile) — for the kiro :ro reader
-#   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
-#     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
+#   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex,opencode}; run
+#     `OPENCODE_API_KEY=... deploy/containers/sync-creds.sh opencode` for the Go-only OpenCode artifact,
+#     and mint Kiro auth once with `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
 #
-# MUST-FIX (review/implement): for the still-containerized agents (kiro :ro, impl :rw), allowed_cwd_root is
+# MUST-FIX (review/implement): for the still-containerized agents (kiro/OpenCode Go :ro, impl :rw), allowed_cwd_root is
 # OPT-IN and MUST equal the mount root, or they ship with NO cwd gate; identical-path mount makes the
 # session/new cwd resolve inside the container. (claude+codex reviewers are host-side — not gated by this.)
 
@@ -178,9 +179,9 @@ name = "test"
 cmd  = "npm test --if-present"   # honors the project's test script; no-op if absent
 
 [registry]
-# docker: the container runtime for the impl/kiro/verify sandboxes.
+# docker: the container runtime for the impl/kiro/opencode-go/verify sandboxes.
 # codex-acp + claude-agent-acp: host-side reviewer agents (codex/claude run without a sandbox block).
-allowed_cmds = ["docker", "codex-acp", "claude-agent-acp"]
+allowed_cmds = ["docker", "codex-acp", "claude-agent-acp", "opencode"]
 
 [server]
 addr = "127.0.0.1:8080"
@@ -245,6 +246,45 @@ egress  = "locked"
 network = "a2a-egress-internal"
 proxy   = "http://a2a-egress-proxy:8888"
 volumes = ["a2a-kiro-data:/root/.local/share"]
+
+# ── OpenCode Go: a dedicated API-key artifact is mounted at OpenCode's documented credential-store path.
+#    The pin uses the exact provider-qualified model ID. `pre_authenticated` suppresses OpenCode's
+#    interactive login request because the mounted auth store is already available inside the reader. ──
+# Tier 2 — container :ro + locked egress
+[[agents]]
+id   = "opencode-go"
+cmd  = "opencode"
+args = ["acp"]
+pre_authenticated = true
+model = "opencode-go/kimi-k3"
+[agents.sandbox]
+image   = "a2a-agent-reader:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "ro"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+no_proxy = "localhost,127.0.0.1,::1"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/opencode/auth.json:/root/.local/share/opencode/auth.json:ro"]
+
+# OpenCode Go can also implement in a quarantine clone after an operator creates a separate workflow.
+# It inherits the toolchain image, has no Git credential volume, and uses the same isolated Go credential store.
+# [[agents]]
+# id   = "opencode-go-impl"
+# kind = "container_rw"
+# cmd  = "opencode"
+# args = ["acp"]
+# pre_authenticated = true
+# model = "opencode-go/kimi-k2.7-code"
+# [agents.sandbox]
+# image   = "a2a-toolchain:latest"
+# mount   = "/Users/wesleyjinks/code"
+# access  = "rw"
+# egress  = "locked"
+# network = "a2a-egress-internal"
+# proxy   = "http://a2a-egress-proxy:8888"
+# no_proxy = "localhost,127.0.0.1,::1"
+# volumes = ["/Users/wesleyjinks/.config/a2a-creds/opencode/auth.json:/root/.local/share/opencode/auth.json:ro"]
 
 # ── impl: WRITE-capable containerized agent (kind="container_rw" PERMITS access="rw"). Under `implement`
 #    it runs WARM (one container + one ACP session across the edit+fix turns, reaped at the end — ADR-0024);
@@ -334,6 +374,25 @@ id = "review"
 agent = "codex"
 prompt = "review-sol-risk"
 inputs = []
+
+# An explicit independent OpenCode Go lens retains the existing Sol pass and sends both reports to synthesis.
+[[workflows]]
+id = "code-review-oc"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt = "review-sol-risk"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/review-implement-oc-synth.md"
+inputs = ["review", "opencode"]
 
 # Default implement-review variants all preserve the one-turn Sol/xhigh contract. Keeping the conventional
 # suffixes avoids silent fallback/warnings when adaptive depth selects light or thorough.
@@ -498,6 +557,39 @@ prompt_file = "../prompts/spec-review-synth.md"
 inputs = ["rigor", "soundness"]
 
 [[workflows]]
+id = "spec-review-oc"
+[[workflows.nodes]]
+id = "rigordraft"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "soundnessdraft"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness.md"
+inputs = []
+[[workflows.nodes]]
+id = "rigor"
+agent = "codex"
+prompt_file = "../prompts/spec-review-rigor-refine.md"
+inputs = ["rigordraft"]
+[[workflows.nodes]]
+id = "soundness"
+agent = "claude"
+prompt_file = "../prompts/spec-review-soundness-refine.md"
+inputs = ["soundnessdraft"]
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt_file = "../prompts/spec-review-rigor.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/spec-review-oc-synth.md"
+inputs = ["rigor", "soundness", "opencode"]
+
+[[workflows]]
 id = "plan-review"
 [[workflows.nodes]]
 id = "execdraft"
@@ -524,6 +616,39 @@ id = "synth"
 agent = "claude"
 prompt_file = "../prompts/plan-review-synth.md"
 inputs = ["exec", "coverage"]
+
+[[workflows]]
+id = "plan-review-oc"
+[[workflows.nodes]]
+id = "execdraft"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "coveragedraft"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage.md"
+inputs = []
+[[workflows.nodes]]
+id = "exec"
+agent = "codex"
+prompt_file = "../prompts/plan-review-exec-refine.md"
+inputs = ["execdraft"]
+[[workflows.nodes]]
+id = "coverage"
+agent = "claude"
+prompt_file = "../prompts/plan-review-coverage-refine.md"
+inputs = ["coveragedraft"]
+[[workflows.nodes]]
+id = "opencode"
+agent = "opencode-go"
+prompt_file = "../prompts/plan-review-exec.md"
+inputs = []
+[[workflows.nodes]]
+id = "synth"
+agent = "claude"
+prompt_file = "../prompts/plan-review-oc-synth.md"
+inputs = ["exec", "coverage", "opencode"]
 
 [[workflows]]
 id = "design"

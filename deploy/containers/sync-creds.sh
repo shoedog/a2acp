@@ -14,12 +14,12 @@
 # Run before serve / run-workflow / implement, e.g.:
 #     deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml
 #
-# Usage: sync-creds.sh [all|claude|codex|kiro]   (default: all)
+# Usage: sync-creds.sh [all|claude|codex|kiro|opencode]   (default: all)
 set -euo pipefail
 
 DEST="${A2A_CREDS_DEST:-$HOME/.config/a2a-creds}"   # override only for testing
 want="${1:-all}"
-case "$want" in all|claude|codex|kiro) ;; *) echo "usage: $(basename "$0") [all|claude|codex|kiro]" >&2; exit 1 ;; esac
+case "$want" in all|claude|codex|kiro|opencode) ;; *) echo "usage: $(basename "$0") [all|claude|codex|kiro|opencode]" >&2; exit 1 ;; esac
 
 sync_file() { # <agent> <host-src> <copy-filename>
   local agent="$1" src="$2" dst="$DEST/$1/$3"
@@ -93,6 +93,33 @@ if [ "$want" = all ] || [ "$want" = claude ]; then
 fi
 if [ "$want" = all ] || [ "$want" = codex ]; then
   sync_file codex "$HOME/.codex/auth.json" "auth.json"
+fi
+
+# OpenCode Go: the API key comes from the operator's environment, but OpenCode reads provider credentials
+# from ~/.local/share/opencode/auth.json. Write the Go and legacy provider entries to an isolated host artifact
+# and overwrite it in place: a bind mount retains the destination inode while a container is alive. The key is
+# passed over stdin to Python so it never appears in an argument, config, image layer, or status output.
+sync_opencode() {
+  local key="${OPENCODE_API_KEY:-}" dst="$DEST/opencode/auth.json" tmp
+  if [ -z "$key" ]; then
+    echo "skip   opencode  (OPENCODE_API_KEY is not set; no credential artifact written)"
+    return
+  fi
+  mkdir -p "$DEST/opencode"
+  chmod 700 "$DEST/opencode"
+  tmp="$(umask 077 && mktemp "$DEST/opencode/.auth.XXXXXX")"
+  printf '%s' "$key" | python3 -c 'import json, sys; key = sys.stdin.read(); credential = {"type": "api", "key": key}; print(json.dumps({"opencode-go": credential, "opencode": credential}))' > "$tmp"
+  if [ ! -f "$dst" ]; then
+    (umask 077 && : > "$dst")
+  fi
+  chmod 600 "$dst"
+  cat "$tmp" > "$dst"
+  rm -f "$tmp"
+  echo "synced opencode  <- OPENCODE_API_KEY (OpenCode Go credential; value withheld)"
+}
+
+if [ "$want" = all ] || [ "$want" = opencode ]; then
+  sync_opencode
 fi
 
 # kiro is DIFFERENT: its Linux container auth lives in the `a2a-kiro-data` named volume (minted
