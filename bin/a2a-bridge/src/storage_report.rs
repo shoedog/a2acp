@@ -3,10 +3,12 @@
 //! class, measures it, and reports who is still consuming it. It deletes nothing, pushes nothing, and
 //! fetches nothing.
 //!
-//! **The one state-changing exception, declared rather than hidden** ([`LOCK_PROBE_DISCLOSURE`]):
+//! **Coordination effects, declared rather than hidden** ([`LOCK_PROBE_DISCLOSURE`]):
 //! reading lock/lease liveness means TAKING an advisory `flock` and immediately releasing it, because
 //! there is no query-only flock API. A merge or resume that races that microsecond window sees a clean
-//! "already held" refusal and can retry. Nothing else here touches state.
+//! "already held" refusal and can retry. The composition root additionally measures verify volumes
+//! under their cache lock using an offline helper with a read-only payload mount. Cache contents are
+//! unchanged; container metadata and persistent coordination lock files can be created.
 //!
 //! Read-only discipline, enforced rather than assumed:
 //! - every git probe runs `git --no-optional-locks`, so `status` cannot refresh-and-rewrite
@@ -2150,13 +2152,22 @@ pub const STORAGE_USAGE: &str = "\
 usage: a2a-bridge storage report [--config <f>] [--json]
        a2a-bridge storage reap --build-targets [--dry-run] [--config <f>] [--json]
        a2a-bridge storage reap --clones [--dry-run] [--config <f>] [--json]
+       a2a-bridge storage reap --verify-cache (--dry-run | --apply) [--config <f>] [--json]
 
 `report` audits bridge-owned storage. READ-ONLY, and not a reaper: it deletes nothing, pushes nothing,
 and fetches nothing — it is the instrument the storage reapers are gated on. Its findings are
 OBSERVATIONS, never deletion authority: the reapers own that and re-probe at the destructive boundary.
 
 `reap` is DESTRUCTIVE (see `a2a-bridge storage reap --help`): it removes completed runs' build targets
-and per-run dependency caches, and nothing else, after re-checking every gate at the boundary.
+and per-run dependency caches after re-checking every gate at the boundary. The separate
+`--verify-cache` authority trims configured repository volumes under verify's exclusive cache lock.
+Rust plain cargo commands share artifacts after local-package invalidation. Wrappers/compounds and
+non-plain options use a fresh target inside the volume, cleaned at run end and swept on next use.
+Visible target overrides refuse before container work. Only command text before bare `--` is classified;
+a wrapper setting its own target internally is outside this guarantee. CARGO_HOME remains shared.
+The verify-cache lock uses the OS account home, independent of HOME and A2A_LEASE_DIR; an unresolved
+account home refuses verify/maintenance. Supported deployment is one OS user per container daemon;
+two users sharing one daemon are out of scope.
 
   report              walk this config's bridge-owned roots (`<allowed_cwd_root>/.a2a-implement` and,
                       when `[worktrees]` is enabled, its root), classify every item
@@ -2166,7 +2177,9 @@ and per-run dependency caches, and nothing else, after re-checking every gate at
                       containment: `on-source` for a clone (does the LIVE source repo contain HEAD —
                       S4's gate) or `on-origin` for a worktree (local remote-tracking refs as of the
                       last fetch; NO network, so it may overstate a deleted upstream branch). Also
-                      per-class totals, probe coverage, and data-volume free space.
+                      per-class totals, probe coverage, and data-volume free space. Configured verify
+                      volumes include runtime, measured bytes, 20 GiB limit, excess and errors in the
+                      `verify_caches` JSON array and text notes, with Rust cache mode and reason.
   --config <path>     registry config (default: ./a2a-bridge.toml); its `allowed_cwd_root` resolves the
                       implement root exactly as `a2a-bridge implement` does.
   --json              machine-readable output instead of the table.
@@ -2182,7 +2195,9 @@ has to infer it from the string's shape:
 
 ONE DECLARED SIDE EFFECT: reading lock/lease liveness takes an advisory flock and immediately releases
 it (there is no query-only flock API). A merge or resume racing that window sees a clean \"already
-held\" refusal and can retry. Nothing else touches state.
+held\" refusal and can retry. Verify-cache measurement also takes the shared cache lock and starts
+an offline helper container with a read-only payload mount; it requires Python 3 in the verify image.
+No cache payload bytes are changed by report or --dry-run.
 
 Symlinks are never followed out of a bridge-owned root, and nothing outside the resolved roots is ever
 listed. Container volumes are best-effort: an unreachable runtime is reported as a note, not a failure.";

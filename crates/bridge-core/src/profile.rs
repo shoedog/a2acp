@@ -85,6 +85,16 @@ impl LanguageProfile {
         }
     }
 
+    /// Bind Rust verification to the bridge-owned target inside its volume.
+    pub fn with_verify_target_dir(&self, target: String) -> Self {
+        let mut profile = self.clone();
+        profile
+            .verify_env
+            .retain(|(key, _)| key != "CARGO_TARGET_DIR");
+        profile.verify_env.push(("CARGO_TARGET_DIR".into(), target));
+        profile
+    }
+
     /// Construct from config-parsed parts. The private cache/env fields make this the only way the
     /// bin layer can build a profile.
     #[allow(clippy::too_many_arguments)]
@@ -282,5 +292,54 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_target_tests {
+    #[test]
+    fn verify_cache_target_env_overrides_clone_cargo_config() {
+        for config in ["config", "config.toml"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
+            std::fs::create_dir(dir.path().join("src")).unwrap();
+            std::fs::write(
+                dir.path().join("Cargo.toml"),
+                "[package]\nname='precedence_fixture'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+            std::fs::write(
+                dir.path().join(".cargo").join(config),
+                "[build]\ntarget-dir='internal-override'\n",
+            )
+            .unwrap();
+            let target = dir.path().join("volume/target");
+            let p = super::rust_profile().with_verify_target_dir(target.display().to_string());
+            let binding = p.cache_binding(super::CacheCtx::Verify, "", "cache");
+            let out = std::process::Command::new("cargo")
+                .args(["metadata", "--offline", "--no-deps", "--format-version=1"])
+                .current_dir(dir.path())
+                .envs(
+                    binding
+                        .env
+                        .iter()
+                        .filter(|(k, _)| k == "CARGO_TARGET_DIR")
+                        .cloned(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                metadata["target_directory"].as_str().unwrap(),
+                target.to_str().unwrap()
+            );
+            assert!(!dir.path().join("internal-override").exists());
+        }
     }
 }

@@ -66,6 +66,7 @@ mod smoke;
 mod storage_reap;
 mod storage_reap_clones;
 mod storage_report;
+mod storage_verify_cache;
 
 pub(crate) use bridge_controller::{
     implement, implement_resume, merge, resilient, review, turn, tweak, verify,
@@ -2349,11 +2350,19 @@ fn resume_lang_arg(resolved_lang: &Option<String>) -> LangArg {
     }
 }
 
-/// The real runner: spawn the container, capture stdout+stderr combined, return the exit code.
+/// Capture command diagnostics together, but keep cache helper protocols on stdout only.
 fn docker_runner(program: &str, argv: &[String]) -> std::io::Result<(i32, String)> {
     let out = std::process::Command::new(program).args(argv).output()?;
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    let protocol = argv.iter().any(|arg| arg == verify::CACHE_MAINTENANCE)
+        || argv
+            .first()
+            .is_some_and(|arg| arg == "ps" || arg == "volume");
+    if protocol {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    } else {
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
     Ok((out.status.code().unwrap_or(-1), combined))
 }
 
@@ -2406,7 +2415,16 @@ fn run_verify_step(
             // --resume` already holds the per-run operation lock when the loop reaches here, and
             // nothing acquires an operation lock while the cache-volume guard is alive (full analysis
             // on `verify::run_verify_serialized`).
-            let lock_dir = verify::cache_volume_lock_dir(std::path::Path::new(clone_cwd.as_str()));
+            let lock_dir =
+                match verify::cache_volume_lock_dir(std::path::Path::new(clone_cwd.as_str())) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        eprintln!("[implement] verify: cache lock home unavailable: {error}");
+                        return verify::cache_failure(format!(
+                            "cache lock home unavailable: {error}"
+                        ));
+                    }
+                };
             let outcome = verify::run_verify_serialized(
                 vcfg,
                 Some(profile),
@@ -2494,10 +2512,10 @@ fn warm_lsp_deps_step(
     eprintln!("[implement] lsp warm-deps: fetching deps into {cache_vol}");
     // F-1 item 2: this volume is SHARED by every run against this source repo (the S5 defect one volume
     // over — `warm_lsp_deps_step` wrote it with no lock). Serialize the container run per volume exactly
-    // like verify's cache-volume lock (same namespace/fallback rules via `cache_volume_lock_dir`, same
+    // like verify's cache-volume lock (same persistent-lock primitive, existing lease namespace, same
     // wait-not-fail + degrade-loudly contract), under the distinct `warm-` prefix so the two lock
     // families never collide.
-    let lock_dir = verify::cache_volume_lock_dir(clone);
+    let lock_dir = bridge_core::liveness::lease_dir();
     match verify::run_warm_fetch_serialized(&cache_vol, &docker_runner, &lock_dir, &program, &argv)
     {
         Ok((0, _)) => {
@@ -7874,6 +7892,9 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
     // command's own gate documentation (and `--clones --help` its class's), not the umbrella page.
     // Checking `--help` first here made both unreachable.
     if has_sub && args[0] == "reap" {
+        if args[1..].iter().any(|a| a == "--verify-cache") {
+            return storage_verify_cache::command(&args[1..]);
+        }
         return storage_reap_cmd(&args[1..]);
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -7987,6 +8008,42 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
     // by managed containers. An unreachable runtime is a NOTE, never a failure.
     let _runtimes = storage_runtime_pass(&raw, &config_path, &mut items, &mut notes);
 
+    let verify_caches = match storage_verify_cache::collect(&raw, &docker_runner, false) {
+        Ok(rows) => rows,
+        Err(e) => {
+            notes.push(format!("verify-cache measurements unavailable: {e}"));
+            Vec::new()
+        }
+    };
+    for usage in &verify_caches {
+        let existing = items.iter().position(|item| {
+            item.path == usage.volume
+                && item
+                    .note
+                    .as_ref()
+                    .is_some_and(|n| n.starts_with(&format!("{} volume", usage.runtime)))
+        });
+        let index = existing.unwrap_or_else(|| {
+            items.push(sr::ReportItem {
+                path: usage.volume.clone(),
+                source: sr::ItemSource::VolumeName,
+                class: sr::PayloadClass::DependencyCache,
+                checkout_kind: None,
+                run_id: None,
+                measured: sr::Measured::default(),
+                consumers: sr::LiveConsumers::default(),
+                git: None,
+                note: None,
+            });
+            items.len() - 1
+        });
+        let item = &mut items[index];
+        item.measured.logical_bytes = usage.logical_bytes;
+        item.measured.disk_bytes = usage.disk_bytes;
+        item.measured.errors = u64::from(usage.error.is_some());
+        item.note = Some(usage.note());
+        notes.push(usage.note());
+    }
     items.sort_by(|a, b| {
         (a.class, a.checkout_kind, &a.path).cmp(&(b.class, b.checkout_kind, &b.path))
     });
@@ -8011,7 +8068,9 @@ fn storage_cmd(args: &[String]) -> Result<(), BoxError> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let mut value = serde_json::to_value(&report)?;
+        value["verify_caches"] = serde_json::to_value(&verify_caches)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print!("{}", sr::render_text(&report));
     }
@@ -8154,7 +8213,7 @@ fn storage_runtime_pass(
             let Some(class) = sr::classify_volume(name) else {
                 continue;
             };
-            if !seen.insert(name.to_string()) {
+            if !seen.insert(format!("{runtime}:{name}")) {
                 continue;
             }
             items.push(sr::ReportItem {
@@ -14121,10 +14180,14 @@ esac
             }));
         let runtime = root.path().join("verify-runtime");
         // Each real verify invocation probes from a separate process while the writer is frozen.
-        std::fs::write(&runtime, format!(
-            "#!/bin/sh\n[ \"$#\" -eq 0 ] && exit 0\nA2A_TEST_CLONE_ENTRY_CONFIG='{}' A2A_TEST_CLONE_ENTRY_MODE=probe '{}' --exact cli_tests::clone_entry_child\n",
-            config.display(), std::env::current_exe().unwrap().display(),
-        )).unwrap();
+        std::fs::write(&runtime, format!(r#"#!/bin/sh
+[ "$#" -eq 0 ] && exit 0
+[ "$1" = ps ] && exit 0
+A2A_TEST_CLONE_ENTRY_CONFIG='{}' A2A_TEST_CLONE_ENTRY_MODE=probe '{}' --exact cli_tests::clone_entry_child >/dev/null || exit $?
+case "$*" in
+  *'remaining = before'*) printf '%s\n' '{{"before":0,"after":0,"proposed":0}}';;
+esac
+"#, config.display(), std::env::current_exe().unwrap().display())).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         warm_up_script(&runtime);
         let verify = Some(Ok(verify::VerifyConfig {

@@ -38,6 +38,7 @@ pub enum VerifyFailureClass {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyVerdict {
+    pub cache: Option<String>,
     pub results: Vec<VerifyResult>,
     pub passed: bool,
 }
@@ -45,7 +46,11 @@ pub struct VerifyVerdict {
 /// PURE. The verdict passes iff every GATE command succeeded (non-gate commands are reported only).
 pub fn aggregate(results: Vec<VerifyResult>) -> VerifyVerdict {
     let passed = results.iter().all(|r| !r.gate || r.ok);
-    VerifyVerdict { results, passed }
+    VerifyVerdict {
+        results,
+        passed,
+        cache: None,
+    }
 }
 
 /// PURE. Clamp captured output to ~`max` bytes, keeping the HEAD (early context: which command, the
@@ -70,12 +75,17 @@ pub fn truncate_output(s: &str, max: usize) -> String {
 
 /// PURE. The fix-turn digest: reached GATE failures that fail the verdict + drive `actionable`, each
 /// `### <name>` + its truncated output, followed by an explicit list of later gates that were not reached.
-/// Non-gate failures are reported in the hand-off but never re-prompted. Empty when no reached gate failed.
+/// Non-gate failures are reported in the hand-off but never re-prompted. Infrastructure failures keep
+/// their details even when configured commands were not reached; they do not imply code-repair work.
 pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
     let failed: Vec<&VerifyResult> = v
         .results
         .iter()
-        .filter(|r| r.gate && !r.ok && matches!(r.reach, VerifyReach::Reached { .. }))
+        .filter(|r| {
+            r.gate
+                && !r.ok
+                && (matches!(r.reach, VerifyReach::Reached { .. }) || r.failure_class.is_some())
+        })
         .collect();
     if failed.is_empty() {
         return String::new();
@@ -90,6 +100,12 @@ pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
             if let Some(class) = r.failure_class {
                 s.push_str(", ");
                 s.push_str(failure_class_label(class));
+            }
+            s.push(')');
+        } else {
+            s.push_str(" (not reached");
+            if let Some(class) = r.failure_class {
+                s.push_str(&format!("; {}", failure_class_label(class)));
             }
             s.push(')');
         }
@@ -119,7 +135,8 @@ pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
 /// PURE. The one-line verdict for the operator hand-off (stdout). Failing-command OUTPUT goes to
 /// stderr separately; this is the summary line.
 pub fn verdict_line(v: &VerifyVerdict) -> String {
-    let marks: Vec<String> = v.results.iter().map(result_mark).collect();
+    let mut marks: Vec<String> = v.results.iter().map(result_mark).collect();
+    marks.extend(v.cache.clone());
     if v.passed {
         format!("verify: PASS  ({})", marks.join(" · "))
     } else {
@@ -269,30 +286,11 @@ fn is_volume_name(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-/// Where the cache-volume lock lives for a run whose quarantine clone is `clone`.
-///
-/// `<implement root>/.operation-locks/` — the SAME namespace as the run operation locks
-/// (`implement_resume::acquire_operation_lock`) — whenever `clone`'s parent is an `.a2a-implement` root:
-/// it is a sibling of the clones (guarded clone reaping can never unlink a held lock inode) and it is the
-/// directory `storage report` already knows about. Any other shape (a verify outside an implement run)
-/// falls back to the host-global lease dir, which always exists as a namespace.
-///
-/// KNOWN SCOPE (disclosed, not closed): the cache volume is host-global (one Docker daemon), while this
-/// namespace is per-implement-root. Two implement roots on ONE host pointing at the same source repo would
-/// therefore key the same volume under two different lock directories and would not serialize. Deployment
-/// keeps a single `allowed_cwd_root` per host (it is the container mount anchor), so one root holds every
-/// run; if that ever stops holding, move this to `liveness::lease_dir()`, whose domain matches the volume's.
-pub fn cache_volume_lock_dir(clone: &std::path::Path) -> std::path::PathBuf {
-    match clone.parent() {
-        Some(root) if root.file_name() == Some(std::ffi::OsStr::new(IMPLEMENT_ROOT_DIR)) => {
-            root.join(crate::implement_resume::OPERATION_LOCK_DIR)
-        }
-        _ => bridge_core::liveness::lease_dir(),
-    }
+/// All implement roots share the OS-account verify-cache namespace. Cache locks are coordination state;
+/// callers must never unlink them, including after an interrupted verify.
+pub fn cache_volume_lock_dir(_clone: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    bridge_core::liveness::verify_cache_lock_dir()
 }
-
-/// The quarantine-clone root created by `implement` (`<allowed_cwd_root>/.a2a-implement`).
-const IMPLEMENT_ROOT_DIR: &str = ".a2a-implement";
 
 /// Take the exclusive per-cache-volume verify lock, WAITING (not failing) for any concurrent same-volume
 /// verify: a verify legitimately runs for minutes, so a `WouldBlock` refusal would strand real work.
@@ -319,7 +317,7 @@ pub fn acquire_cache_volume_lock(
 // `warm_lsp_deps_step` (bin main.rs) writes the per-repo warm LSP dep volume with NO lock — the exact
 // same "shared volume, unserialized container run" shape S5 closed for verify, on a DIFFERENT cache
 // volume (`[[languages]].warm_cache`, not `[verify].cache`). This section mirrors S5's lock verbatim —
-// same `cache_volume_lock_dir` namespace/fallback rules, same wait-not-fail contract, same
+// same wait-not-fail contract and lock primitives, with the existing lease namespace and
 // contended-note + degradation-arm semantics — under a DISTINCT `warm-` prefix. That prefix is ordinary
 // NAMESPACE SEPARATION for two independent, legitimately-concurrent lock families (a verify run and a
 // warm-deps fetch are expected to proceed at the same time when they hold DIFFERENT volumes) — it is
@@ -373,8 +371,8 @@ pub fn acquire_warm_cache_lock(
 /// Run ONE warm-deps fetch command (the injected `runner`, mirroring [`Runner`]) under the exclusive
 /// per-volume warm-cache lock, WAITING for a concurrent same-volume fetch rather than corrupting the
 /// shared cache. A lock that cannot be taken (unwritable namespace, no working `flock`, a non-volume-
-/// shaped name) degrades LOUDLY to an unserialized run rather than failing the fetch — same
-/// degradation-arm semantics as [`run_verify_serialized`].
+/// shaped name) currently degrades to an unserialized warm fetch. Verify cache access instead fails
+/// closed; warm-cache policy is outside this maintenance authority.
 pub fn run_warm_fetch_serialized(
     cache_vol: &str,
     runner: &Runner,
@@ -498,6 +496,302 @@ pub fn run_verify_recorded(
     VerifyOutcome::Ran(aggregate(results))
 }
 
+/// Classify the entire Rust run before any container work. Only visible command text is covered;
+/// a wrapper that changes its target internally is outside the isolation guarantee.
+pub fn rust_cache_mode(commands: &[bridge_core::profile::VerifyCommand]) -> Result<String, String> {
+    let mut isolated = None;
+    for command in commands {
+        // Retain only the shell words before an unquoted bare `--`. Quotes and escapes are
+        // conservative non-plain syntax, but still parsed here to locate that boundary correctly.
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut quoted = false;
+        let mut syntax = false;
+        for ch in command.cmd.chars().chain(std::iter::once(' ')) {
+            if escaped {
+                word.push(ch);
+                escaped = false;
+            } else if ch == '\\' && quote != Some('\'') {
+                escaped = true;
+                syntax = true;
+                quoted = true;
+            } else if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_some() {
+                word.push(ch);
+            } else if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                quoted = true;
+                syntax = true;
+            } else if ch.is_whitespace() {
+                if word == "--" && !quoted {
+                    break;
+                }
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                syntax |= ch == '\n' || ch == '\r';
+                quoted = false;
+            } else {
+                syntax |= ";&|$`><(){}*?[".contains(ch);
+                word.push(ch);
+            }
+        }
+        let option = |w: &str, flag: &str| w == flag || w.starts_with(&format!("{flag}="));
+        let visible = words.join(" ");
+        let target_override = (visible.contains("--config") && visible.contains("target-dir"))
+            || words
+                .iter()
+                .any(|w| w.contains("--target-dir") || w.contains("CARGO_TARGET_DIR="))
+            || words.iter().enumerate().any(|(i, w)| {
+                option(w, "--config")
+                    && (w.contains("target-dir")
+                        || words.get(i + 1).is_some_and(|v| v.contains("target-dir")))
+            });
+        if target_override {
+            return Err(format!("verify command {:?} ({}) refused: visible target override bypasses bridge cache control", command.name, command.cmd));
+        }
+        let plain = words.first().is_some_and(|w| w == "cargo")
+            && !syntax
+            && quote.is_none()
+            && !escaped
+            && !words.get(1).is_some_and(|w| w.starts_with('+'))
+            && !words.iter().any(|w| {
+                option(w, "--config") || option(w, "--manifest-path") || w.starts_with("-Z")
+            });
+        if !plain && isolated.is_none() {
+            isolated = Some(format!(
+                "cache: isolated (non-plain command: {})",
+                command.name
+            ));
+        }
+    }
+    Ok(isolated.unwrap_or_else(|| "cache: shared (plain commands)".into()))
+}
+
+/// Retained-size limit for the complete per-repository volume, including Cargo home and legacy
+/// targets. This is deliberately not a peak-build quota.
+pub const VERIFY_CACHE_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+fn cache_failure_result(message: String) -> Vec<VerifyResult> {
+    vec![VerifyResult {
+        name: "cache-safety".into(),
+        gate: true,
+        ok: false,
+        reach: VerifyReach::NotReached,
+        failure_class: Some(VerifyFailureClass::Runner),
+        output: message,
+    }]
+}
+
+pub fn cache_failure(message: String) -> VerifyOutcome {
+    VerifyOutcome::Ran(aggregate(cache_failure_result(message)))
+}
+
+fn checked_run(runner: &Runner, program: &str, argv: &[String]) -> std::io::Result<String> {
+    let (status, output) = runner(program, argv)?;
+    if status != 0 {
+        return Err(std::io::Error::other(format!(
+            "{program} exited {status}: {output}"
+        )));
+    }
+    Ok(output)
+}
+
+/// The caller holds the cache lock across this probe and every cache operation. Query ALL running
+/// consumers, including unmanaged containers and orphaned verifies whose bridge process died.
+pub fn cache_consumers_idle(runtime: &str, volume: &str, runner: &Runner) -> std::io::Result<()> {
+    if !is_volume_name(volume) {
+        return Err(std::io::Error::other("invalid cache volume"));
+    }
+    let out = checked_run(
+        runner,
+        runtime,
+        &[
+            "ps".into(),
+            "--filter".into(),
+            format!("volume={volume}"),
+            "--format".into(),
+            "{{.ID}}".into(),
+        ],
+    )?;
+    if !out.trim().is_empty() {
+        return Err(std::io::Error::other(format!(
+            "cache {volume}: consumers present; maintenance/verify deferred"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CacheMeasurement {
+    pub before: u64,
+    pub after: u64,
+    pub proposed: u64,
+    #[serde(default)]
+    pub logical_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Measurement and trimming use the same volume root, regardless of the profile's mount path or
+/// CARGO_TARGET_DIR. Coarse oldest-first top-level eviction includes historical lane directories;
+/// a large target can be removed whole. Cargo home is retained preferentially. No symlink is followed.
+/// Measurement failures are I/O errors. Partial removals retain measured before/after bytes with an
+/// explicit error in the result; callers must inspect it before reporting success. Accounting uses
+/// max(logical, allocated) per entry and includes allocated directory blocks.
+pub const CACHE_MAINTENANCE: &str = r#"
+import os, sys, stat, json, shutil
+root, limit, preview = sys.argv[1], int(sys.argv[2]), sys.argv[3] == 'preview'
+def measure(path):
+    m = os.lstat(path)
+    disk = m.st_blocks * 512
+    if stat.S_ISDIR(m.st_mode):
+        children = [measure(os.path.join(path, x)) for x in os.listdir(path)]
+        return (sum(x[0] for x in children), disk + sum(x[1] for x in children), disk + sum(x[2] for x in children))
+    if stat.S_ISREG(m.st_mode) or stat.S_ISLNK(m.st_mode):
+        return (m.st_size, disk, max(m.st_size, disk))
+    raise RuntimeError('unsupported cache entry: ' + path)
+entries = [(os.path.join(root, x), os.lstat(os.path.join(root, x))) for x in os.listdir(root)]
+measured = [(p, m, measure(p)[2]) for p, m in entries]
+logical, disk, before = measure(root)
+remaining = before
+proposed = 0
+error = None
+for p, m, n in sorted(measured, key=lambda e: (not os.path.basename(e[0]).startswith('.a2a-isolated-'), os.path.basename(e[0]) == 'cargo', e[1].st_mtime_ns, e[0])):
+    if remaining <= limit and not os.path.basename(p).startswith('.a2a-isolated-'):
+        continue
+    proposed += n
+    remaining -= n
+    if not preview:
+        try:
+            if stat.S_ISDIR(m.st_mode):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        except OSError as e:
+            error = str(e)
+            break
+after = measure(root)[2]
+if not preview and after > limit:
+    error = (error or '') + '; deferred excess bytes=' + str(after - limit)
+print(json.dumps(dict(before=before, after=after, proposed=proposed, logical_bytes=logical, disk_bytes=disk, error=error)))
+"#;
+
+/// Caller must own the cache lock and establish idle consumers, including for preview. `preview`
+/// mounts the payload read-only. The helper image must provide Python 3; a missing tool fails closed.
+pub fn maintain_cache(
+    cfg: &VerifyConfig,
+    volume: &str,
+    runner: &Runner,
+    preview: bool,
+) -> std::io::Result<CacheMeasurement> {
+    if !is_volume_name(volume) {
+        return Err(std::io::Error::other("invalid cache volume"));
+    }
+    let argv = vec![
+        "run".into(),
+        "--rm".into(),
+        "--network=none".into(),
+        "--mount".into(),
+        format!(
+            "type=volume,src={volume},dst=/cache,volume-nocopy{}",
+            if preview { ",readonly" } else { "" }
+        ),
+        "--entrypoint".into(),
+        "python3".into(),
+        cfg.image.clone(),
+        "-c".into(),
+        CACHE_MAINTENANCE.into(),
+        "/cache".into(),
+        VERIFY_CACHE_LIMIT_BYTES.to_string(),
+        if preview {
+            "preview".into()
+        } else {
+            "apply".into()
+        },
+    ];
+    let out =
+        checked_run(runner, cfg.runtime.as_deref().unwrap_or("docker"), &argv).map_err(|e| {
+            std::io::Error::other(format!(
+                "maintenance image {} must provide Python 3: {e}",
+                cfg.image
+            ))
+        })?;
+    let mut measurement: CacheMeasurement = serde_json::from_str(out.trim())
+        .map_err(|e| std::io::Error::other(format!("cache measurement unavailable: {e}")))?;
+    if preview && measurement.before != measurement.after {
+        return Err(std::io::Error::other("inconsistent cache measurement"));
+    }
+    if !preview && measurement.after > VERIFY_CACHE_LIMIT_BYTES && measurement.error.is_none() {
+        measurement.error = Some(format!(
+            "deferred excess bytes={}",
+            measurement.after - VERIFY_CACHE_LIMIT_BYTES
+        ));
+    }
+    Ok(measurement)
+}
+
+fn trim_cache(cfg: &VerifyConfig, volume: &str, runner: &Runner) -> std::io::Result<()> {
+    let measurement = maintain_cache(cfg, volume, runner, false)?;
+    match measurement.error {
+        Some(e) => Err(std::io::Error::other(format!(
+            "cache maintenance: {e}; retained bytes={}",
+            measurement.after
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Cargo supports relocated workspaces and trusts source mtimes, so every local/path package must be
+/// cleaned before the first command, even for unchanged bases. Metadata covers non-member path deps
+/// and build scripts as well as workspace members. Cargo itself owns artifact naming and deletion.
+/// Registry/git dependencies are immutable and remain reusable. Only plain commands use this path.
+pub const INVALIDATE_LOCAL: &str = r#"python3 - <<'A2A_INVALIDATE'
+import json, os, pathlib, subprocess
+manifests = {'Cargo.toml'} if pathlib.Path('Cargo.toml').is_file() else set()
+if not manifests:
+    raise RuntimeError('no Cargo manifest in supported verification scope')
+for manifest in sorted(manifests):
+    # Use the configured egress/offline policy: a cold verify Cargo home must be allowed to fetch
+    # immutable sources. All features include optional non-member path dependencies before any build.
+    resolved = subprocess.run(['cargo', 'metadata', '--format-version=1', '--locked', '--all-features', '--manifest-path', manifest], stdout=subprocess.PIPE)
+    if resolved.returncode:
+        raise SystemExit(resolved.returncode)
+    metadata = json.loads(resolved.stdout)
+    local = [p['id'] for p in metadata['packages'] if p['source'] is None]
+    target = pathlib.Path(metadata['target_directory']).resolve()
+    mount = pathlib.Path(os.environ.get('A2A_VERIFY_CACHE_ROOT', '/cache')).resolve()
+    coverage = 'in-volume; included in retained-size bound' if target.is_relative_to(mount) else 'EXTERNAL; outside retained-size bound and cross-volume locking'
+    print('verify cache: effective target=' + str(target) + '; ' + coverage, flush=True)
+    roots = [(None, target)]
+    if target.exists():
+        for p in target.iterdir():
+            if p.is_dir() and any((d / '.fingerprint').is_dir() for d in p.iterdir() if d.is_dir()):
+                roots.append((p.name, p))
+    for triple, root in roots:
+        profiles = [p.name for p in root.iterdir() if (p / '.fingerprint').is_dir()] if root.exists() else []
+        for profile in profiles:
+            args = ['cargo', 'clean', '--offline', '--locked', '--manifest-path', manifest, '--profile', 'dev' if profile == 'debug' else profile]
+            # Cleaning needs only the output directory, not the historical compilation settings.
+            # Supply an inheritance solely for cleanup so a removed/renamed custom profile remains
+            # cleanable without deleting immutable dependency artifacts or modifying the checkout.
+            if profile not in ('debug', 'release'):
+                args += ['--config', 'profile.' + json.dumps(profile) + '.inherits="dev"']
+            for package in local:
+                args += ['-p', package]
+            if triple:
+                args += ['--target', triple]
+            if local:
+                code = subprocess.call(args)
+                if code:
+                    raise SystemExit(code)
+A2A_INVALIDATE"#;
+
 /// [`run_verify_recorded`] with the same-repo serialization its shared cache volume requires: hold an
 /// exclusive flock named for `cache_vol` across the WHOLE container run (every configured command — cargo
 /// state written by command 1 is read by command 2), and release it on return.
@@ -518,10 +812,8 @@ pub fn run_verify_recorded(
 /// * The holder never awaits the waiter: it runs the container to completion, then releases. Waiting is
 ///   therefore bounded by the holder's own verify, not by any lock the waiter owns.
 ///
-/// A lock that cannot be TAKEN (unwritable namespace, a filesystem without working `flock`, a
-/// non-volume-shaped name) degrades LOUDLY to an unserialized run rather than failing the run: the risk it
-/// guards is concurrent same-repo verifies, while refusing here would strand a single run that has no
-/// contender at all. Contention itself never lands in this arm — that path waits.
+/// Lock failure refuses shared-cache verification. Contention waits; an unavailable lock is never
+/// evidence that no other verifier or maintenance operation is using the volume.
 #[allow(clippy::too_many_arguments)] // one more than `run_verify_recorded`: its lock namespace
 pub fn run_verify_serialized(
     cfg: &VerifyConfig,
@@ -541,21 +833,142 @@ pub fn run_verify_serialized(
             cfg, profile, clone, cache_vol, runner, max_bytes, recorder, run, owner,
         );
     }
-    let _cache_volume = match acquire_cache_volume_lock(lock_dir, cache_vol) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            eprintln!(
-                "[implement] verify: could not take the cache-volume lock in {} ({e}) — running \
-                 UNSERIALIZED; a concurrent verify of the same repository could corrupt the shared \
-                 {cache_vol} cache",
-                lock_dir.display()
-            );
-            None
+    let profile = profile.expect("checked above");
+    let cache_mode = if profile.id == "rust" {
+        match rust_cache_mode(&profile.verify_commands) {
+            Ok(mode) => Some(mode),
+            Err(error) => return cache_failure(error),
         }
+    } else {
+        None
     };
-    run_verify_recorded(
-        cfg, profile, clone, cache_vol, runner, max_bytes, recorder, run, owner,
-    )
+    let fail = |message| {
+        let mut verdict = aggregate(cache_failure_result(message));
+        verdict.cache = cache_mode.clone();
+        VerifyOutcome::Ran(verdict)
+    };
+    let _cache_volume = match acquire_cache_volume_lock(lock_dir, cache_vol) {
+        Ok(guard) => guard,
+        Err(e) => return fail(format!("cache lock: {e}")),
+    };
+    let isolated = cache_mode
+        .as_ref()
+        .is_some_and(|mode| mode.starts_with("cache: isolated"));
+    let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
+    let mount = binding
+        .mounts
+        .first()
+        .and_then(|m| m.split(':').nth(1))
+        .unwrap_or("/cache");
+    let target = if isolated {
+        let id: String = run
+            .instance_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        format!("{mount}/.a2a-isolated-{id}")
+    } else {
+        format!("{mount}/target")
+    };
+    let bound_profile = if profile.id == "rust" {
+        profile.with_verify_target_dir(target)
+    } else {
+        profile.clone()
+    };
+    let profile = &bound_profile;
+    let mut effective = cfg.clone();
+    effective.image = profile.image.as_deref().unwrap_or(&cfg.image).to_string();
+    let cfg = &effective;
+    let runtime = cfg.runtime.as_deref().unwrap_or("docker");
+    if let Err(e) = cache_consumers_idle(runtime, cache_vol, runner) {
+        return fail(e.to_string());
+    }
+    // Trim leftovers before use as well as after: SIGKILL can skip the latter boundary.
+    if let Err(e) = trim_cache(cfg, cache_vol, runner) {
+        return fail(e.to_string());
+    }
+    let invalidation_error = if profile.id == "rust" && !isolated {
+        let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
+        let mount = binding
+            .mounts
+            .first()
+            .and_then(|m| m.split(':').nth(1))
+            .unwrap_or("/cache");
+        let invalidate = format!(
+            "A2A_VERIFY_CACHE_ROOT='{}' {INVALIDATE_LOCAL}",
+            mount.replace('\'', "'\"'\"'")
+        );
+        let (prog, argv) = bridge_core::sandbox::compose_verify(
+            cfg.runtime.as_deref(),
+            profile.image.as_deref().unwrap_or(&cfg.image),
+            &cfg.egress,
+            clone,
+            &binding,
+            &invalidate,
+            &bridge_core::sandbox::a2a_name("verify", owner, &run.instance_id, "invalidate"),
+            &run.labels(
+                "verify",
+                "oneshot",
+                "invalidate",
+                owner,
+                Some(clone.as_str()),
+                Some(clone.as_str()),
+            )
+            .to_arg_pairs(),
+        );
+        match runner(&prog, &argv) {
+            Ok((0, out)) => {
+                eprintln!("{out}");
+                None
+            }
+            Ok((status, out)) => Some(VerifyResult {
+                name: "cache-preparation".into(),
+                gate: true,
+                ok: false,
+                reach: VerifyReach::NotReached,
+                // Cargo's source/lock errors remain repairable. Runtime/tool failures require the
+                // operator and must not spend empty code-fix turns.
+                failure_class: classify_verify_failure(status, &out, status != 101),
+                output: truncate_output(&format!("local artifact invalidation: {out}"), max_bytes),
+            }),
+            Err(e) => cache_failure_result(format!("local artifact invalidation: {e}")).pop(),
+        }
+    } else {
+        None
+    };
+    let mut outcome = match invalidation_error {
+        Some(result) => VerifyOutcome::Ran(aggregate(vec![result])),
+        None => run_verify_recorded(
+            cfg,
+            Some(profile),
+            clone,
+            cache_vol,
+            runner,
+            max_bytes,
+            recorder,
+            run,
+            owner,
+        ),
+    };
+    if let VerifyOutcome::Ran(verdict) = &mut outcome {
+        verdict.cache = cache_mode;
+    }
+    // A failed command still reaches maintenance. A surviving container (e.g. a runner disconnect)
+    // prevents it; the next use also refuses until that consumer has stopped.
+    let maintenance = cache_consumers_idle(runtime, cache_vol, runner)
+        .and_then(|()| trim_cache(cfg, cache_vol, runner));
+    match maintenance {
+        Ok(()) => outcome,
+        Err(e) => match outcome {
+            VerifyOutcome::Ran(mut verdict) => {
+                verdict.results.extend(cache_failure_result(e.to_string()));
+                let mut result = aggregate(verdict.results);
+                result.cache = verdict.cache;
+                VerifyOutcome::Ran(result)
+            }
+            _ => cache_failure(e.to_string()),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // 2 more than before F-1 item 1: the naming/labeling identity
@@ -595,6 +1008,222 @@ mod tests {
             },
             failure_class: (!ok).then_some(VerifyFailureClass::Command),
             output: String::new(),
+        }
+    }
+
+    #[test]
+    fn rust_cache_classification_and_override_refusal_precede_container_work() {
+        for cmd in [
+            "cargo test",
+            "cargo clippy -- -D warnings",
+            "cargo test -p app",
+            "cargo test -- --skip app*",
+            "cargo test -- --skip process::tests::drop_group_kills_descendants",
+        ] {
+            let mut p = profile(&[("test", true)], None);
+            p.verify_commands[0].cmd = cmd.into();
+            assert_eq!(
+                rust_cache_mode(&p.verify_commands).unwrap(),
+                "cache: shared (plain commands)"
+            );
+        }
+        for cmd in [
+            "make test",
+            "test.sh",
+            "cargo test && cargo build",
+            "VAR=value cargo test",
+            "cargo build --config net.offline=true",
+            "cargo -Zunstable-options test",
+            "cargo test --manifest-path other/Cargo.toml",
+            "cargo +stable test",
+            "cargo test -p app*",
+            "cargo test -p app?",
+            "cargo test -p [ab]pp",
+        ] {
+            let mut p = profile(&[("test", true)], None);
+            p.verify_commands[0].cmd = cmd.into();
+            assert_eq!(
+                rust_cache_mode(&p.verify_commands).unwrap(),
+                "cache: isolated (non-plain command: test)"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for cmd in [
+            "cargo test --target-dir /else",
+            "cargo test --target-dir=/else",
+            "CARGO_TARGET_DIR=/else cargo test",
+            "env CARGO_TARGET_DIR=/else cargo test",
+            r#"cargo test --config 'build.target-dir="/else"'"#,
+            "cargo test --config=build.target-dir=other",
+            "sh -c 'cargo test --target-dir /else'",
+            "sh -c 'cargo test --config build.target-dir=other'",
+        ] {
+            let mut p = profile(&[("wrapper", true), ("test", true)], None);
+            p.verify_commands[0].cmd = "make test".into();
+            p.verify_commands[1].cmd = cmd.into();
+            let outcome = run_verify_serialized(
+                &cfg(),
+                Some(&p),
+                &bridge_core::SessionCwd::parse("/repo").unwrap(),
+                "cache",
+                &|_, _| panic!("override must refuse before ANY container work"),
+                1000,
+                &bridge_core::attempt_activity::NoopAttemptRecorder,
+                dir.path(),
+                &test_run(),
+                "owner",
+            );
+            let v = unwrap_ran(outcome);
+            assert!(!v.passed);
+            assert!(v.results[0].output.contains(cmd), "{v:?}");
+            assert!(v.results[0].output.contains("visible target override"));
+        }
+    }
+
+    #[test]
+    fn toolchain_selected_cargo_runs_isolated_without_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = profile(&[("test", true)], None);
+        p.verify_commands[0].cmd = "cargo +stable test".into();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let runner = |_program: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            calls.borrow_mut().push(argv.to_vec());
+            if argv.iter().any(|argument| argument == CACHE_MAINTENANCE) {
+                return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+            }
+            assert!(
+                !argv.last().is_some_and(|command| {
+                    command.contains("cargo metadata") || command.contains("cargo clean")
+                }),
+                "toolchain-selected cargo must not run shared-cache preparation: {argv:?}"
+            );
+            Ok((0, String::new()))
+        };
+        let verdict = unwrap_ran(run_verify_serialized(
+            &cfg(),
+            Some(&p),
+            &bridge_core::SessionCwd::parse("/repo").unwrap(),
+            "cache",
+            &runner,
+            1000,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            dir.path(),
+            &test_run(),
+            "owner",
+        ));
+        assert!(verdict.passed, "{verdict:?}");
+        assert_eq!(
+            verdict.cache.as_deref(),
+            Some("cache: isolated (non-plain command: test)")
+        );
+        assert!(calls.borrow().iter().any(|argv| argv
+            .last()
+            .is_some_and(|command| command.contains("cargo +stable test"))));
+    }
+
+    #[test]
+    fn isolated_targets_are_fresh_swept_and_removed_even_on_command_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(cache.join("cargo")).unwrap();
+        std::fs::write(cache.join("cargo/keep"), "shared sources").unwrap();
+        let wrapper = dir.path().join("check");
+        std::fs::write(&wrapper, "#!/bin/sh\nset -eu\ncase \"$CARGO_TARGET_DIR\" in */.a2a-isolated-*) ;; *) exit 9;; esac\ntest -z \"$(ls -A \"$CARGO_TARGET_DIR\")\"\necho artifact > \"$CARGO_TARGET_DIR/artifact\"\n").unwrap();
+        std::fs::set_permissions(wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for cmd in ["./check", "true && ./check", "./check && false"] {
+            std::fs::create_dir_all(cache.join(".a2a-isolated-interrupted")).unwrap();
+            std::fs::write(cache.join(".a2a-isolated-interrupted/stale"), "old").unwrap();
+            let p = bridge_core::profile::LanguageProfile::from_parts(
+                "rust".into(),
+                "".into(),
+                "warm".into(),
+                "/cargo".into(),
+                cache.display().to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![
+                    (
+                        "CARGO_HOME".into(),
+                        cache.join("cargo").display().to_string(),
+                    ),
+                    (
+                        "CARGO_TARGET_DIR".into(),
+                        cache.join("old-target").display().to_string(),
+                    ),
+                ],
+                None,
+                vec![bridge_core::profile::VerifyCommand {
+                    name: "test".into(),
+                    cmd: cmd.into(),
+                    gate: true,
+                }],
+            );
+            let runner = |_: &str, args: &[String]| -> std::io::Result<(i32, String)> {
+                if args[0] == "ps" {
+                    return Ok((0, String::new()));
+                }
+                let out = if args.iter().any(|a| a == CACHE_MAINTENANCE) {
+                    std::process::Command::new("python3")
+                        .args(["-c", CACHE_MAINTENANCE])
+                        .arg(&cache)
+                        .args(["99999999", "apply"])
+                        .output()?
+                } else {
+                    assert!(
+                        !cache.join(".a2a-isolated-interrupted").exists(),
+                        "leftovers must be swept before execution"
+                    );
+                    assert!(!args.last().unwrap().contains(INVALIDATE_LOCAL));
+                    std::process::Command::new("sh")
+                        .args(["-c", args.last().unwrap()])
+                        .output()?
+                };
+                Ok((
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stdout).to_string()
+                        + &String::from_utf8_lossy(&out.stderr),
+                ))
+            };
+            let v = unwrap_ran(run_verify_serialized(
+                &cfg(),
+                Some(&p),
+                &bridge_core::SessionCwd::parse(&dir.path().display().to_string()).unwrap(),
+                "cache",
+                &runner,
+                2000,
+                &bridge_core::attempt_activity::NoopAttemptRecorder,
+                &dir.path().join("locks"),
+                &test_run(),
+                "owner",
+            ));
+            assert_eq!(v.passed, !cmd.ends_with("false"), "{v:?}");
+            assert!(verdict_line(&v).contains("cache: isolated (non-plain command: test)"));
+            assert_eq!(
+                std::fs::read_dir(&cache).unwrap().count(),
+                1,
+                "isolated targets must be removed after verification"
+            );
+            assert_eq!(
+                std::fs::read_to_string(cache.join("cargo/keep")).unwrap(),
+                "shared sources"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_preview_and_apply_disable_volume_copy_up() {
+        for preview in [true, false] {
+            let runner = |_: &str, args: &[String]| {
+                let mount = args.windows(2).find(|pair| pair[0] == "--mount").unwrap()[1]
+                    .split(',')
+                    .collect::<Vec<_>>();
+                assert!(mount.contains(&"volume-nocopy"), "{args:?}");
+                assert_eq!(mount.contains(&"readonly"), preview);
+                Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()))
+            };
+            maintain_cache(&cfg(), "cache", &runner, preview).unwrap();
         }
     }
 
@@ -1113,6 +1742,15 @@ mod tests {
         let label = label.to_string();
         let handle = std::thread::spawn(move || {
             let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+                if _argv.first().is_some_and(|a| a == "ps") {
+                    return Ok((0, String::new()));
+                }
+                if _argv.last().is_some_and(|a| a.contains(INVALIDATE_LOCAL)) {
+                    return Ok((0, String::new()));
+                }
+                if _argv.iter().any(|a| a == CACHE_MAINTENANCE) {
+                    return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+                }
                 log.lock().unwrap().push(format!("{label} enter"));
                 entered_tx.send(()).unwrap();
                 if park {
@@ -1232,10 +1870,9 @@ mod tests {
         );
     }
 
-    /// A lock namespace that cannot be created must not strand the run: it degrades to an unserialized
-    /// verify (loudly, on stderr) rather than refusing to verify at all.
+    /// An unavailable lock namespace must refuse shared-cache execution.
     #[test]
-    fn an_unusable_lock_namespace_still_runs_the_verify() {
+    fn an_unusable_lock_namespace_refuses_the_verify() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
@@ -1257,7 +1894,7 @@ mod tests {
             "owner9",
         );
         assert!(matches!(outcome, VerifyOutcome::Ran(_)));
-        assert_eq!(calls.get(), 1, "the verify still ran");
+        assert_eq!(calls.get(), 0, "unsafe verification must not run");
     }
 
     #[test]
@@ -1298,7 +1935,7 @@ mod tests {
     // `warm_lsp_deps_step` (bin main.rs) writes the per-repo warm LSP dep volume with NO lock — the
     // exact same "SHARED volume, unserialized container run" shape S5 fixed for verify, just on a
     // DIFFERENT cache volume. `run_warm_fetch_serialized` mirrors `run_verify_serialized`'s wait-not-fail
-    // contract and reuses `cache_volume_lock_dir`'s namespace/fallback rules verbatim, but under a
+    // contract and retains the existing lease namespace/fallback rules, under a
     // DISTINCT `warm-` prefix — ordinary namespace separation between two independent lock families, NOT
     // a safety net for a shared volume: if `warm_cache` and `[verify].cache` ever named the SAME volume,
     // these non-communicating locks would fail to serialize a concurrent verify + warm-deps fetch against
@@ -1475,18 +2112,14 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_dir_is_the_implement_root_namespace_else_the_lease_dir() {
+    fn the_lock_dir_is_shared_across_implement_roots() {
         assert_eq!(
-            cache_volume_lock_dir(std::path::Path::new(
-                "/Users/w/code/.a2a-implement/impl-1-abcd"
-            )),
-            std::path::Path::new("/Users/w/code/.a2a-implement/.operation-locks"),
-            "an implement run locks beside its own operation lock"
+            cache_volume_lock_dir(std::path::Path::new("/a/.a2a-implement/run")).unwrap(),
+            cache_volume_lock_dir(std::path::Path::new("/b/.a2a-implement/run")).unwrap()
         );
         assert_eq!(
-            cache_volume_lock_dir(std::path::Path::new("/Users/w/code/some-checkout")),
-            bridge_core::liveness::lease_dir(),
-            "a non-implement verify falls back to the host lease dir"
+            cache_volume_lock_dir(std::path::Path::new("/a")).unwrap(),
+            bridge_core::liveness::verify_cache_lock_dir().unwrap()
         );
     }
 
@@ -1540,5 +2173,453 @@ mod tests {
         let seen = seen.borrow();
         assert!(seen[0].iter().any(|a| a == "override:img"));
         assert!(seen[1].iter().any(|a| a == "img"));
+    }
+    /// FAIL-FIRST against 15f183f2 using the same run_verify_serialized API and injected runner:
+    /// Cargo reports local Fresh then rustc E0433 with the shared target; an empty target succeeds.
+    /// Cargo fixtures use path dependencies only. A registry-shaped sentinel verifies that package
+    /// cleaning leaves unrelated compiled artifacts intact; registry selection is also injected below.
+    #[test]
+    fn stale_local_artifacts_are_invalidated_without_clearing_unrelated_artifacts() {
+        use std::process::Command;
+        for distinct in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let setup = r#"
+import pathlib, subprocess, json, os, sys, shutil
+r=pathlib.Path(sys.argv[1]); p=r/'a'
+(p/'immutable/src').mkdir(parents=True)
+(p/'immutable/Cargo.toml').write_text('[package]\nname="immutable"\nversion="1.0.0"\nedition="2021"\n')
+(p/'immutable/src/lib.rs').write_text('pub fn value()->u32 { 7 }')
+(p/'Cargo.toml').write_text('[workspace]\nmembers=["local", "app"]\nexclude=["immutable"]\nresolver="2"\n[profile.custom]\ninherits="release"\n')
+for name in ['local','app']:
+    (p/name/'src').mkdir(parents=True)
+    (p/name/'Cargo.toml').write_text('[package]\nname="'+name+'"\nversion="0.1.0"\nedition="2021"\n'+ ('[dependencies]\nimmutable={path="../immutable"}\n' if name=='local' else '[dependencies]\nlocal={path="../local"}\n'))
+(p/'local/src/lib.rs').write_text('pub fn old()->u32 {immutable::value()}')
+(p/'app/src/main.rs').write_text('fn main() {println!("{}",local::new::works());}')
+(p/'local/build.rs').write_text('fn main() {println!("cargo:rerun-if-changed=input"); let s=std::fs::read_to_string("input").unwrap(); println!("cargo:rustc-env=INPUT={}",s.trim());}')
+(p/'local/input').write_text('A')
+env=dict(os.environ,CARGO_TARGET_DIR=str(r/'cache/target'),CARGO_INCREMENTAL='0',CARGO_TERM_COLOR='never')
+subprocess.run(['cargo','build','--offline','-p','local'],cwd=p,env=env,check=True)
+subprocess.run(['cargo','build','--offline','-p','local','--profile','custom'],cwd=p,env=env,check=True)
+if sys.argv[2] == 'distinct':
+    shutil.copytree(p,r/'b'); p=r/'b'
+(p/'local/src/lib.rs').write_text('pub mod new { pub fn works()->u32 { assert_eq!(env!("INPUT"),"B"); immutable::value() } }')
+(p/'local/input').write_text('B')
+for f in (p/'local').rglob('*'):
+    if f.is_file(): os.utime(f,(1500000000,1500000000))
+x=subprocess.run(['cargo','run','--offline','-p','app','-v'],cwd=p,env=env,capture_output=True,text=True)
+assert x.returncode != 0 and 'could not find `new` in `local`' in x.stderr, x.stderr
+assert 'Fresh local' in x.stderr, x.stderr
+(r/'stale-evidence').write_text(x.stderr)
+empty=dict(env,CARGO_TARGET_DIR=str(r/'empty'))
+x=subprocess.run(['cargo','run','--offline','-p','app'],cwd=p,env=empty,capture_output=True,text=True)
+assert x.returncode == 0 and x.stdout.strip() == '7', (x.stdout,x.stderr)
+"#;
+            let setup_out = Command::new("python3")
+                .args(["-c", setup])
+                .arg(temp.path())
+                .arg(if distinct { "distinct" } else { "common" })
+                .output()
+                .unwrap();
+            assert!(
+                setup_out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&setup_out.stderr)
+            );
+            let target = temp.path().join("cache/target");
+            let immutable = target.join("debug/deps/libregistry_fixture-aabb.rlib");
+            std::fs::write(&immutable, "compiled registry sentinel").unwrap();
+            let before = std::fs::metadata(&immutable).unwrap().modified().unwrap();
+            let root = temp.path().join(if distinct { "b" } else { "a" });
+            let mut p = profile(
+                &[
+                    ("run --offline -p app -v", true),
+                    ("run --offline -p app --profile custom -v", true),
+                ],
+                None,
+            );
+            // Map the whole volume to a disposable host directory; both commands stay shared.
+            p = bridge_core::profile::LanguageProfile::from_parts(
+                p.id,
+                p.fetch_cmd,
+                p.warm_cache_base,
+                "/cargo".into(),
+                temp.path().join("cache").display().to_string(),
+                vec![],
+                vec![],
+                vec![],
+                vec![
+                    ("CARGO_TARGET_DIR".into(), target.display().to_string()),
+                    ("CARGO_INCREMENTAL".into(), "0".into()),
+                    ("CARGO_NET_OFFLINE".into(), "true".into()),
+                ],
+                None,
+                p.verify_commands,
+            );
+            let output = std::cell::RefCell::new(String::new());
+            let runner = |_prog: &str, args: &[String]| -> std::io::Result<(i32, String)> {
+                if args.first().is_some_and(|a| a == "ps") {
+                    return Ok((0, String::new()));
+                }
+                // On base there is no maintenance/invalidation; this branch is never reached.
+                if args.iter().any(|a| a.contains("remaining = before")) {
+                    return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+                }
+                // CI exports CARGO_TERM_COLOR=always; the assertions match plain Cargo status text.
+                let out = Command::new("sh")
+                    .args(["-c", args.last().unwrap()])
+                    .env("CARGO_TERM_COLOR", "never")
+                    .output()?;
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                output.borrow_mut().push_str(&text);
+                Ok((out.status.code().unwrap_or(-1), text))
+            };
+            let result = run_verify_serialized(
+                &cfg(),
+                Some(&p),
+                &bridge_core::SessionCwd::parse(&root.display().to_string()).unwrap(),
+                "a2a-verify-cache-0123456789abcdef",
+                &runner,
+                16000,
+                &bridge_core::attempt_activity::NoopAttemptRecorder,
+                &temp.path().join("locks"),
+                &test_run(),
+                "owner9",
+            );
+            let verdict = unwrap_ran(result);
+            assert!(verdict.passed, "{distinct}: {verdict:?}");
+            assert!(verdict_line(&verdict).contains("cache: shared (plain commands)"));
+            let output = output.borrow();
+            assert_eq!(
+                std::fs::read_to_string(&immutable).unwrap(),
+                "compiled registry sentinel"
+            );
+            assert!(output.contains("Compiling local"), "{output}");
+            assert!(output.lines().any(|line| line.trim() == "7"), "{output}");
+            assert_eq!(
+                before,
+                std::fs::metadata(immutable).unwrap().modified().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_verify_still_trims_and_unknown_consumers_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let maintenance = std::cell::Cell::new(0);
+        let runner = |_p: &str, args: &[String]| -> std::io::Result<(i32, String)> {
+            if args.first().is_some_and(|a| a == "ps") {
+                return Ok((0, String::new()));
+            }
+            if args.iter().any(|a| a == CACHE_MAINTENANCE) {
+                maintenance.set(maintenance.get() + 1);
+                return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+            }
+            if args.last().is_some_and(|a| a.contains(INVALIDATE_LOCAL)) {
+                return Ok((0, String::new()));
+            }
+            Ok((1, "command failed".into()))
+        };
+        let result = run_verify_serialized(
+            &cfg(),
+            Some(&profile(&[("test", true)], None)),
+            &bridge_core::SessionCwd::parse("/repo").unwrap(),
+            "cache-0123456789abcdef",
+            &runner,
+            1000,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            dir.path(),
+            &test_run(),
+            "owner9",
+        );
+        assert!(!unwrap_ran(result).passed);
+        assert_eq!(maintenance.get(), 2);
+        for response in [
+            Ok((0, "running-id".into())),
+            Ok((1, "unknown".into())),
+            Err(std::io::Error::other("unavailable")),
+        ] {
+            let response = std::cell::RefCell::new(Some(response));
+            let runner = |_: &str, _: &[String]| response.borrow_mut().take().unwrap();
+            assert!(cache_consumers_idle("docker", "cache", &runner).is_err());
+        }
+    }
+
+    #[test]
+    fn cache_measurement_and_deletion_errors_are_not_success() {
+        for output in [
+            "not json",
+            r#"{"before":1,"after":999999999999,"proposed":0}"#,
+        ] {
+            let runner = |_: &str, _: &[String]| Ok((0, output.into()));
+            assert!(trim_cache(&cfg(), "cache", &runner).is_err());
+        }
+        let runner = |_: &str, _: &[String]| Ok((1, "permission denied".into()));
+        assert!(trim_cache(&cfg(), "cache", &runner).is_err());
+    }
+
+    #[test]
+    fn trim_bounds_legacy_and_custom_targets_without_touching_preview_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["legacy-lane", "custom-target", "cargo"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("payload"), [0_u8; 32]).unwrap();
+        }
+        // Symlink to unrelated storage is measured as a link and never followed.
+        let protected = tempfile::tempdir().unwrap();
+        std::fs::write(protected.path().join("keep"), "protected").unwrap();
+        std::os::unix::fs::symlink(protected.path(), dir.path().join("link")).unwrap();
+        let run = |mode: &str, limit: &str| {
+            let out = std::process::Command::new("python3")
+                .args(["-c", CACHE_MAINTENANCE])
+                .arg(dir.path())
+                .args([limit, mode])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice::<CacheMeasurement>(&out.stdout).unwrap()
+        };
+        let below = run("apply", "100000");
+        assert_eq!(below.before, below.after);
+        assert_eq!(below.proposed, 0);
+        // Derive the limit from the measured size: directory block accounting differs across
+        // filesystems (APFS directories occupy no blocks; ext4/overlay directories take 4 KiB).
+        let limit = (below.before - 64).to_string();
+        let preview = run("preview", &limit);
+        assert_eq!(preview.before, preview.after);
+        assert!(preview.proposed >= 64);
+        for name in ["legacy-lane", "custom-target", "cargo"] {
+            assert_eq!(
+                std::fs::read(dir.path().join(name).join("payload")).unwrap(),
+                [0_u8; 32]
+            );
+        }
+        let applied = run("apply", &limit);
+        assert_eq!(applied.before, preview.before);
+        assert!(applied.after <= below.before - 64);
+        assert_eq!(
+            std::fs::read_to_string(protected.path().join("keep")).unwrap(),
+            "protected"
+        );
+    }
+    #[test]
+    fn invalidation_selects_all_path_packages_and_leaves_registry_and_git_packages() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("custom-target");
+        for profile in ["debug", "custom", "triple/release"] {
+            std::fs::create_dir_all(target.join(profile).join(".fingerprint")).unwrap();
+        }
+        let metadata = serde_json::json!({
+            "target_directory": target,
+            "packages": [
+                {"id": "local@0.1.0", "source": null},
+                {"id": "nonmember-path@0.1.0", "source": null},
+                {"id": "registry-package@1.0.0", "source": "registry+fixture"},
+                {"id": "git-package@1.0.0", "source": "git+fixture"}
+            ]
+        });
+        std::fs::write(dir.path().join("Cargo.toml"), "fixture").unwrap();
+        let cargo = dir.path().join("cargo");
+        std::fs::write(
+            &cargo,
+            format!(
+                r#"#!/usr/bin/env python3
+import sys, json
+if sys.argv[1] == 'metadata':
+    assert '--offline' not in sys.argv, 'cold immutable source cache cannot resolve offline'
+    assert '--all-features' in sys.argv and '--manifest-path' in sys.argv
+    print({metadata:?})
+else:
+    with open({trace:?}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\n')
+"#,
+                metadata = metadata.to_string(),
+                trace = dir.path().join("trace").display().to_string()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", INVALIDATE_LOCAL])
+            .current_dir(dir.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("A2A_VERIFY_CACHE_ROOT", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("in-volume"));
+        let trace = std::fs::read_to_string(dir.path().join("trace")).unwrap();
+        assert_eq!(trace.lines().count(), 3, "{trace}");
+        for line in trace.lines() {
+            assert!(line.contains("local@0.1.0") && line.contains("nonmember-path@0.1.0"));
+            assert!(!line.contains("registry-package") && !line.contains("git-package"));
+        }
+        assert!(trace.contains("custom") && trace.contains("triple") && trace.contains("release"));
+    }
+    #[test]
+    fn preparation_cleans_removed_profiles_and_optional_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let optional = dir.path().join("optional");
+        for p in [&root, &optional] {
+            std::fs::create_dir_all(p.join("src")).unwrap();
+        }
+        let manifest = "[package]\nname='cache_scope'\nversion='0.1.0'\nedition='2021'\n[dependencies]\noptional_local={path='../optional',optional=true}\n";
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("{manifest}[profile.retired]\ninherits='dev'\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            optional.join("Cargo.toml"),
+            "[package]\nname='optional_local'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(optional.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+        let target = dir.path().join("target");
+        let cargo = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("cargo")
+                .args(args)
+                .current_dir(cwd)
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_HOME", dir.path().join("cold-home"))
+                .env("CARGO_NET_OFFLINE", "true")
+                .env("CARGO_INCREMENTAL", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        cargo(&root, &["build", "--offline", "--all-features"]);
+        cargo(
+            &root,
+            &[
+                "build",
+                "--offline",
+                "--all-features",
+                "--profile",
+                "retired",
+            ],
+        );
+        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(optional.join("src/lib.rs"), "pub fn added() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(feature=\"optional_local\")] pub fn use_new() { optional_local::added(); }\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", INVALIDATE_LOCAL])
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_HOME", dir.path().join("cold-home"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for profile in ["debug", "retired"] {
+            for entry in std::fs::read_dir(target.join(profile).join("deps")).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(!name.ends_with(".rlib"), "local artifact survived: {name}");
+            }
+        }
+        cargo(&root, &["build", "--offline", "--all-features"]);
+    }
+
+    #[test]
+    fn serialized_helpers_honor_image_override_and_surface_infrastructure_details() {
+        let dir = tempfile::tempdir().unwrap();
+        for override_image in [None, Some("override:img")] {
+            let p = profile(&[("test", true)], override_image);
+            let expected = override_image.unwrap_or("img");
+            let runner = |_: &str, args: &[String]| -> std::io::Result<(i32, String)> {
+                if args.first().is_some_and(|a| a == "ps") {
+                    return Ok((0, String::new()));
+                }
+                assert!(args.iter().any(|a| a == expected), "{args:?}");
+                if override_image.is_some() {
+                    assert!(!args.iter().any(|a| a == "img"));
+                }
+                if args.iter().any(|a| a == CACHE_MAINTENANCE) {
+                    return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+                }
+                Ok((0, String::new()))
+            };
+            let result = run_verify_serialized(
+                &cfg(),
+                Some(&p),
+                &bridge_core::SessionCwd::parse("/repo").unwrap(),
+                "cache",
+                &runner,
+                1000,
+                &bridge_core::attempt_activity::NoopAttemptRecorder,
+                dir.path(),
+                &test_run(),
+                "owner",
+            );
+            assert!(unwrap_ran(result).passed);
+        }
+        let runner = |_: &str, args: &[String]| -> std::io::Result<(i32, String)> {
+            if args.first().is_some_and(|a| a == "ps") {
+                return Ok((0, String::new()));
+            }
+            if args.iter().any(|a| a == CACHE_MAINTENANCE) {
+                return Ok((0, r#"{"before":0,"after":0,"proposed":0}"#.into()));
+            }
+            Ok((
+                101,
+                "Cargo.lock needs to be updated but --locked was passed".into(),
+            ))
+        };
+        let failed = unwrap_ran(run_verify_serialized(
+            &cfg(),
+            Some(&profile(&[("test", true)], None)),
+            &bridge_core::SessionCwd::parse("/repo").unwrap(),
+            "cache",
+            &runner,
+            1000,
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
+            dir.path(),
+            &test_run(),
+            "owner",
+        ));
+        assert_eq!(
+            failed.results[0].failure_class,
+            Some(VerifyFailureClass::LockSync)
+        );
+        assert!(failure_digest(&failed, 1000).contains("Cargo.lock needs to be updated"));
+        let failed = unwrap_ran(cache_failure("operator lock unavailable".into()));
+        assert!(failure_digest(&failed, 1000).contains("operator lock unavailable"));
+        assert!(failure_digest(&failed, 1000).contains("not reached; runner"));
+        let mut results = vec![r("build", true, true)];
+        results.extend(cache_failure_result("post-verify trim failed".into()));
+        assert!(failure_digest(&aggregate(results), 1000).contains("post-verify trim failed"));
     }
 }
