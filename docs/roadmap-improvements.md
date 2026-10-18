@@ -1,10 +1,10 @@
 # a2a-bridge — Improvements & New-Features Roadmap (proposal)
 
 **Created:** 2026-07-17
-**Reconciled:** 2026-07-25 against `origin/main` `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
+**Reconciled:** 2026-10-18 against `origin/main` `70e210cee4a45302f8d91a8d5f74afcc406236e1`
 **Status:** non-normative proposal. This complements — it does not replace —
 [`roadmap.md`](roadmap.md) (the priority cursor) and
-[`reliability-execution-roadmap.md`](reliability-execution-roadmap.md) (the active P0 program).
+[`reliability-execution-roadmap.md`](reliability-execution-roadmap.md) (the maintenance reliability record).
 Per project convention, GitHub Issues is the canonical intake; items here are linked into
 [`roadmap.md`](roadmap.md) only when actually scheduled. Issue stubs for the near-term items live in
 [`roadmap-issues/`](roadmap-issues/).
@@ -19,6 +19,21 @@ reliability roadmap's sequencing or completion claims.
 [`adr/`](adr/) on the original base plus ADR stubs 0033–0039 added by this PR (39 total),
 [`m4-observability-roadmap.md`](m4-observability-roadmap.md), and the `SSOT_AGENTS_BRIDGE_COORDINATION.md`
 cross-repo request (a working-tree coordination doc, not tracked on `main`).
+
+---
+
+## 2026-10-18 reconciliation snapshot
+
+The reliability program has moved to maintenance with no active slice. This table records the owner decisions;
+the reliability roadmap remains the historical evidence and reopen-trigger cursor.
+
+| Track | 2026-10-18 state | Next boundary |
+|---|---|---|
+| Reliability / R2f | **MAINTENANCE; remainder PARKED.** Activity liveness and session-leak fixes shipped; ADR-0041/R2f1b code is held unwired. | Reopen only for an unbounded hang/wedge, recurring long-lived-serve pre-turn `AgentCrashed`, or a practical ADR-0042 custody gap. |
+| R2g and H1-4 | **PARKED / re-scoped.** | After the next flight, a slim serve-swap lane covers validate + doctor, drain, restart, PONG, and rollback record. |
+| R3/R4 | R3d4/R3d5 scheduled canaries and R4 are **DEFERRED**; manual pinned/floating runs remain available. R3e OpenRouter and R3f OpenCode are **DONE in practice**. | Reopen scheduling when manual refresh misses upstream adapter/model drift; R4 retains the OpenCode provenance-label gap (#179). |
+| M4 Slice 3b | Resume rule **substantially met**; no slice is scheduled while the operator store is about 14 MB. | Re-spec only with a separately justified bounded-storage need. |
+| Next flight | H1-3 review-quality evaluation (research first), H1-2 cost/quota governance (spec first), then H0-3 plus #171/#173. | The slim serve-swap lane follows. |
 
 ---
 

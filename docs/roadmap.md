@@ -1,22 +1,26 @@
 # Current roadmap
 
-**Updated:** 2026-07-25
+**Updated:** 2026-10-18
 
 ## Priority order
 
-1. **P0 — bridge reliability and compatibility.** Make upstream agent, adapter, SDK, model, and
-   container changes detectable and diagnosable before they consume feature work. The active plan is
-   [`bridge-reliability.md`](bridge-reliability.md); resume implementation from the canonical
-   [`reliability execution roadmap`](reliability-execution-roadmap.md). R2f0a merged through
-   [PR #48](https://github.com/shoedog/a2acp/pull/48); R2f0b is the next unstarted slice. R2f completion is
-   followed by R2g stable ingress, the remaining R3d4/R3d5 scheduling and activation work, R3e/R3f provider
-   integrations, and R4 release promotion.
-2. **M4 observability — paused after Slice 3a.** Slice 3a merged in
-   [PR #19](https://github.com/shoedog/a2acp/pull/19). Slice 3b remains designed but unimplemented.
-   Resume from [`m4-observability-roadmap.md`](m4-observability-roadmap.md), not from an older Slice 3
-   revision.
+1. **H1-3 — review-quality evaluation across new reviewer models.** Research first: establish the
+   evaluation question, corpus, and judge method before choosing an implementation slice.
+2. **H1-2 — cost and quota governance.** Write the specification first, including provider-cost truth,
+   admission policy, and operator visibility.
+3. **H0-3 and verification reliability.** Enforce `allowed_cwd_root` for local `run-workflow`, and resolve
+   test flakes [#171](https://github.com/shoedog/a2acp/issues/171) and
+   [#173](https://github.com/shoedog/a2acp/issues/173).
+4. **Slim serve-swap lane.** Follow the next flight with validate + doctor, drain in-flight turns, restart,
+   PONG check, and a rollback record. It combines the useful deferred R2g work with H1-4.
 
-## Why reliability is first
+The reliability program is now in **maintenance**: it has no active slice. Its authoritative close-out and
+reopen conditions are in the [`reliability execution roadmap`](reliability-execution-roadmap.md).
+
+**M4 observability — no Slice 3b scheduled.** The resume rule is substantially met; the operator store is
+about 14 MB, so bounded-storage work is not currently scheduled.
+
+## Historical rationale: why reliability was first
 
 The bridge has recently paid the compatibility tax repeatedly:
 
@@ -28,9 +32,8 @@ The bridge has recently paid the compatibility tax repeatedly:
 - adapter packages, embedded agent CLIs, Rust protocol crates, and model catalogs change on different
   cadences.
 
-These are product-path failures, not incidental maintenance. The next work should establish explicit
-compatibility evidence, phase-specific errors, pinned and floating canaries, and release gates before
-adding more retention behavior.
+These were product-path failures, not incidental maintenance. The delivered work established the relevant
+compatibility evidence, phase-specific errors, pinned and floating lanes, and release-gate foundations.
 
 For the majority case—read-only work on trusted own repositories—the host path is first-class and the
 container is opt-in defense-in-depth. Reliability work must preserve that usable path while preventing
@@ -40,7 +43,7 @@ must also be audited.
 
 ## Resume rule for M4
 
-Resume Slice 3b only after the reliability program has at least:
+Slice 3b may resume only after the reliability program has at least:
 
 - isolated and dispositioned the Fable failure;
 - established a repeatable minimal host/container smoke harness;
@@ -51,7 +54,13 @@ Resume Slice 3b only after the reliability program has at least:
 There is no committed Slice 3c design. Slice 3b completes the original M4 bounded-storage goal; 3c is
 only a reserved decision point for separately justified administration or archival work.
 
-As of 2026-07-25, the isolation disposition, smoke harness, checked-in compatibility foundations, structured
-diagnostic groundwork, and R2f0a execution/attempt ledger have landed. The resume rule is still not satisfied:
-R2f0b and the remaining R2f liveness/takeover slices, R2g stable ingress, R3d4/R3d5 trusted-trigger activation,
-and R4 promotion remain unimplemented. Do not infer permission to resume M4 retention from the R2f0a merge alone.
+As of 2026-10-18, the five criteria are substantially met:
+
+- **Fable:** dispositioned by R1.
+- **Smoke harness:** delivered by R2c/R2d.
+- **Checked-in matrix:** delivered through R3a–R3d3.
+- **Phase-preserving errors:** delivered by R2b; issue #47 remains as the residual adapter-error projection gap.
+- **Pinned/floating lanes:** defined and manually runnable; scheduled activation is deferred.
+
+M4 Slice 3b remains designed but unscheduled because the operator store is about 14 MB. Slice 3c remains a
+reserved decision point for separately justified administration or archival work.
