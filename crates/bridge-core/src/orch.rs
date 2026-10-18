@@ -153,6 +153,8 @@ pub struct OrchEvent {
 pub enum OrchEventKind {
     NodeStarted {
         node: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<crate::domain::EffectiveConfig>,
     },
     NodeFinished {
         node: String,
@@ -326,7 +328,10 @@ mod tests {
             operation_id: crate::ids::OperationId::parse("op-t1").unwrap(),
             session: None,
             source: None,
-            kind: OrchEventKind::NodeStarted { node: "a".into() },
+            kind: OrchEventKind::NodeStarted {
+                node: "a".into(),
+                selection: None,
+            },
         };
         let j = serde_json::to_value(&started).unwrap();
         assert_eq!(j["kind"], "node_started");

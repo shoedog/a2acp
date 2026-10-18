@@ -226,6 +226,9 @@ impl DelegationPort for NoDelegation {
 /// codex/claude (no inputs) fan-in to synth (terminal).
 fn review_graph() -> Arc<WorkflowGraph> {
     let n = |id: &str, ag: &str, ins: &[&str], tpl: &str| WorkflowNode {
+        model: None,
+        effort: None,
+        mode: None,
         id: NodeId::parse(id).unwrap(),
         agent: AgentId::parse(ag).unwrap(),
         prompt_template: tpl.into(),
@@ -601,6 +604,9 @@ async fn write_ahead_barrier() {
         id: WorkflowId::parse("pipe").unwrap(),
         nodes: vec![
             WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("a").unwrap(),
                 agent: AgentId::parse("a").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -609,6 +615,9 @@ async fn write_ahead_barrier() {
                 harvest_sanitization: None,
             },
             WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("b").unwrap(),
                 agent: AgentId::parse("b").unwrap(),
                 prompt_template: "got {{a}}".into(),

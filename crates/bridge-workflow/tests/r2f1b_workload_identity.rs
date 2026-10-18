@@ -48,6 +48,9 @@ fn graph(node_id: &str) -> WorkflowGraph {
     WorkflowGraph {
         id: WorkflowId::parse("review").unwrap(),
         nodes: vec![WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse(node_id).unwrap(),
             agent: AgentId::parse("codex").unwrap(),
             prompt_template: "{{input}}".into(),

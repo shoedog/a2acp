@@ -311,6 +311,18 @@ fn workload_fingerprint(
         for input in inputs {
             push_bytes(&mut canonical, input.as_bytes());
         }
+        if node.model.is_some() || node.effort.is_some() || node.mode.is_some() {
+            push_bytes(&mut canonical, b"node_selection_v1");
+            let selection = crate::domain::EffectiveConfig {
+                model: node.model.clone(),
+                effort: node.effort,
+                mode: node.mode.clone(),
+            };
+            push_bytes(
+                &mut canonical,
+                &serde_json::to_vec(&selection).expect("selection serializes"),
+            );
+        }
         encode_retry(&mut canonical, node);
         push_bytes(
             &mut canonical,
@@ -457,6 +469,17 @@ impl WorkflowRunSpecV1 {
             let ordinal = u32::try_from(ordinal).map_err(|_| RunSpecError::InvalidNodeIdentity)?;
             if identity.node != PolicyNodeRefV1::from_node_id(ordinal, node.id.as_str())
                 || identity.selection.agent != node.agent
+                || node
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| identity.selection.effective_model.as_ref() != Some(model))
+                || node
+                    .effort
+                    .is_some_and(|effort| identity.selection.effective_effort != Some(effort))
+                || node
+                    .mode
+                    .as_ref()
+                    .is_some_and(|mode| identity.selection.effective_mode.as_ref() != Some(mode))
                 || validate_node_execution_identity_v1(identity).is_err()
             {
                 return Err(RunSpecError::InvalidNodeIdentity);

@@ -5524,6 +5524,18 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        self.record_node_started_with_selection(task, node, operation_id, ts, None)
+            .await
+    }
+
+    async fn record_node_started_with_selection(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        operation_id: &OperationId,
+        ts: i64,
+        selection: Option<&bridge_core::domain::EffectiveConfig>,
+    ) -> Result<i64, BridgeError> {
         let conn = self.conn.lock().unwrap();
         let tx = immediate_transaction(&conn)?;
         // Allocate seq by bumping last_event_seq.
@@ -5566,6 +5578,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             source: None,
             kind: bridge_core::orch::OrchEventKind::NodeStarted {
                 node: node.as_str().to_string(),
+                selection: selection.cloned(),
             },
         };
         insert_journal_event(&tx, task, &event)?;
@@ -15849,6 +15862,9 @@ mod tests {
         Arc::new(bridge_workflow::graph::WorkflowGraph {
             id: WorkflowId::parse("review").unwrap(),
             nodes: vec![bridge_workflow::graph::WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("root").unwrap(),
                 agent: AgentId::parse("reader").unwrap(),
                 prompt_template: prompt_template.into(),
@@ -19184,6 +19200,62 @@ mod tests {
                 && evs[1].seq == s2
         );
         assert_eq!(evs[0].operation_id.as_str(), "op-task-j");
+    }
+
+    #[tokio::test]
+    async fn node_selection_journal_roundtrip_is_backward_compatible() {
+        use bridge_core::domain::{EffectiveConfig, Effort};
+        use bridge_core::orch::OrchEventKind;
+        use bridge_core::task_store::TaskStore;
+        for store in [
+            Box::new(SqliteStore::open_in_memory().unwrap()) as Box<dyn TaskStore>,
+            Box::new(bridge_core::task_store::MemoryTaskStore::new()),
+        ] {
+            let task = TaskId::parse("selection-journal").unwrap();
+            store.create(&trec(task.as_str(), 1)).await.unwrap();
+            let op = OperationId::parse("selection-op").unwrap();
+            for (id, model) in [
+                ("a", "opencode-go/kimi-k3"),
+                ("b", "opencode-go/deepseek-v4-pro"),
+            ] {
+                let selection = EffectiveConfig {
+                    model: Some(model.into()),
+                    effort: Some(Effort::High),
+                    mode: Some("code".into()),
+                };
+                store
+                    .record_node_started_with_selection(
+                        &task,
+                        &NodeId::parse(id).unwrap(),
+                        &op,
+                        1,
+                        Some(&selection),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let journal = store.journal_from(&task, -1).await.unwrap();
+            assert_eq!(journal.len(), 2);
+            for (event, model) in journal
+                .iter()
+                .zip(["opencode-go/kimi-k3", "opencode-go/deepseek-v4-pro"])
+            {
+                let encoded = serde_json::to_string(event).unwrap();
+                let decoded: bridge_core::orch::OrchEvent = serde_json::from_str(&encoded).unwrap();
+                assert!(
+                    matches!(decoded.kind, OrchEventKind::NodeStarted { selection: Some(ref s), .. } if s.model.as_deref() == Some(model))
+                );
+            }
+        }
+        let old: OrchEventKind =
+            serde_json::from_str(r#"{"kind":"node_started","node":"a"}"#).unwrap();
+        assert!(matches!(
+            old,
+            OrchEventKind::NodeStarted {
+                selection: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

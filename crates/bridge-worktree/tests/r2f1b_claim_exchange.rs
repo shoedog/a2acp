@@ -61,6 +61,9 @@ fn graph() -> WorkflowGraph {
     WorkflowGraph {
         id: WorkflowId::parse("claim-exchange").unwrap(),
         nodes: vec![WorkflowNode {
+            model: None,
+            effort: None,
+            mode: None,
             id: NodeId::parse("node").unwrap(),
             agent: AgentId::parse("codex").unwrap(),
             prompt_template: "{{input}}".to_string(),

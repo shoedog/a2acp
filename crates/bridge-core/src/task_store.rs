@@ -734,6 +734,19 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         ts: i64,
     ) -> Result<i64, BridgeError>;
 
+    /// Record configuration intent with the start, atomically with its journal row.
+    /// Journal-capable stores override this; legacy implementations retain start behavior.
+    async fn record_node_started_with_selection(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        operation_id: &OperationId,
+        ts: i64,
+        _selection: Option<&crate::domain::EffectiveConfig>,
+    ) -> Result<i64, BridgeError> {
+        self.record_node_started(task, node, operation_id, ts).await
+    }
+
     /// Persist a node output checkpoint WITH a monotonic seq. Returns the seq.
     /// Removes the node's start row (the node is no longer "in progress").
     ///
@@ -1044,7 +1057,7 @@ pub fn fold_journal_to_snapshot(
 
     for event in events {
         match &event.kind {
-            crate::orch::OrchEventKind::NodeStarted { node } => {
+            crate::orch::OrchEventKind::NodeStarted { node, .. } => {
                 let node = NodeId::parse(node)?;
                 starts.retain(|(started, _seq)| started != &node);
                 starts.push((node, event.seq));
@@ -2349,6 +2362,18 @@ impl TaskStore for MemoryTaskStore {
         operation_id: &OperationId,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        self.record_node_started_with_selection(task, node, operation_id, ts, None)
+            .await
+    }
+
+    async fn record_node_started_with_selection(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        operation_id: &OperationId,
+        ts: i64,
+        selection: Option<&crate::domain::EffectiveConfig>,
+    ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
         let artifact_ms = self.retention_now_ms();
         {
@@ -2372,6 +2397,7 @@ impl TaskStore for MemoryTaskStore {
             source: None,
             kind: crate::orch::OrchEventKind::NodeStarted {
                 node: node.as_str().to_string(),
+                selection: selection.cloned(),
             },
         };
         self.journals
@@ -4468,7 +4494,13 @@ mod tests {
             kind,
         };
         let events = vec![
-            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(
+                1,
+                OrchEventKind::NodeStarted {
+                    node: "a".into(),
+                    selection: None,
+                },
+            ),
             ev(
                 2,
                 OrchEventKind::NodeFinished {
@@ -4480,7 +4512,13 @@ mod tests {
                     policy_trigger_json: None,
                 },
             ),
-            ev(3, OrchEventKind::NodeStarted { node: "b".into() }),
+            ev(
+                3,
+                OrchEventKind::NodeStarted {
+                    node: "b".into(),
+                    selection: None,
+                },
+            ),
         ];
         let scalars = JournalScalars {
             status: TaskRecordStatus::Working,
@@ -4520,8 +4558,20 @@ mod tests {
             kind,
         };
         let events = vec![
-            ev(1, OrchEventKind::NodeStarted { node: "a".into() }),
-            ev(4, OrchEventKind::NodeStarted { node: "a".into() }),
+            ev(
+                1,
+                OrchEventKind::NodeStarted {
+                    node: "a".into(),
+                    selection: None,
+                },
+            ),
+            ev(
+                4,
+                OrchEventKind::NodeStarted {
+                    node: "a".into(),
+                    selection: None,
+                },
+            ),
         ];
         let scalars = JournalScalars {
             status: TaskRecordStatus::Working,

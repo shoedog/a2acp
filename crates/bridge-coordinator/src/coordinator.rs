@@ -3802,6 +3802,9 @@ mod tests {
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse(id).unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),
@@ -5794,6 +5797,9 @@ mod tests {
         let graph = Arc::new(WorkflowGraph {
             id: WorkflowId::parse("code-review").unwrap(),
             nodes: vec![WorkflowNode {
+                model: None,
+                effort: None,
+                mode: None,
                 id: NodeId::parse("only").unwrap(),
                 agent: AgentId::parse("codex").unwrap(),
                 prompt_template: "{{input}}".into(),

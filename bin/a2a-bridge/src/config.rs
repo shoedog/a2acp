@@ -947,6 +947,12 @@ pub struct RetryToml {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowNodeToml {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<bridge_core::domain::Effort>,
+    #[serde(default)]
+    pub mode: Option<String>,
     pub id: String,
     pub agent: String,
     #[serde(default)]
@@ -2050,6 +2056,18 @@ impl RegistryConfig {
                         w.id, n.id, n.agent
                     )));
                 }
+                let agent = self
+                    .agents
+                    .iter()
+                    .find(|a| a.id == n.agent)
+                    .expect("known agent");
+                if agent.kind.as_deref() == Some("api") && (n.effort.is_some() || n.mode.is_some())
+                {
+                    return Err(ConfigError::Registry(format!(
+                        "workflow {} node {}: api supports model only; effort/mode overrides are unsupported",
+                        w.id, n.id
+                    )));
+                }
                 // E8a: a node's prompt comes from EXACTLY ONE source: registry id, prompt file,
                 // or inline text.
                 let tpl = match (&n.prompt, &n.prompt_file, &n.prompt_text) {
@@ -2097,6 +2115,9 @@ impl RegistryConfig {
                     }
                 };
                 nodes.push(WorkflowNode {
+                    model: n.model.clone(),
+                    effort: n.effort,
+                    mode: n.mode.clone(),
                     id: NodeId::parse(n.id.clone())
                         .map_err(|e| ConfigError::Registry(format!("node id {:?}: {e:?}", n.id)))?,
                     agent: AgentId::parse(n.agent.clone()).map_err(|e| {
@@ -5667,6 +5688,62 @@ harvest_sanitization=\"attested_prefix_v1\"
                     .unwrap()
                     .load_workflows(dir.path())
                     .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_node_selection_parsing_and_kind_validation() {
+        let config = |kind: &str, fields: &str| {
+            format!(
+                r#"
+            default = "one"
+            [[agents]]
+            id = "one"
+            kind = "{kind}"
+            [[workflows]]
+            id = "wf"
+            [[workflows.nodes]]
+            id = "a"
+            agent = "one"
+            prompt_text = "go"
+            {fields}
+            [server]
+            addr = "127.0.0.1:8080"
+        "#
+            )
+        };
+        for kind in ["acp", "container_rw"] {
+            let cfg = RegistryConfig::parse(&config(
+                kind,
+                "model = 'kimi'\neffort = 'high'\nmode = 'code'",
+            ))
+            .unwrap();
+            let nodes = cfg.load_workflows(std::path::Path::new(".")).unwrap();
+            let node = &nodes.values().next().unwrap().nodes[0];
+            assert_eq!(node.model.as_deref(), Some("kimi"));
+            assert_eq!(node.effort, Some(bridge_core::domain::Effort::High));
+            assert_eq!(node.mode.as_deref(), Some("code"));
+        }
+        assert!(RegistryConfig::parse(&config("acp", "effort = 'bogus'")).is_err());
+        for field in ["effort = 'high'", "mode = 'code'"] {
+            let cfg = RegistryConfig::parse(&config("api", field)).unwrap();
+            assert!(cfg
+                .load_workflows(std::path::Path::new("."))
+                .unwrap_err()
+                .to_string()
+                .contains("api supports model only"));
+        }
+        let cfg = RegistryConfig::parse(&config("api", "model = 'deepseek'")).unwrap();
+        assert_eq!(
+            cfg.load_workflows(std::path::Path::new("."))
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .nodes[0]
+                .model
+                .as_deref(),
+            Some("deepseek")
         );
     }
 
