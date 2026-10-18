@@ -1,7 +1,34 @@
 # Bridge reliability execution and handoff roadmap
 
-- **Program status:** active P0
-- **Current main lineage:** PR #126 merged the post-2B3a roadmap at `5d2a82c457e626b2a108063e1de6b13b94e97f92`.
+- **Program status:** **MAINTENANCE — no active reliability slice** (owner decision, 2026-10-18).
+- **Close-out decision:** R2f's remaining planned slices (R2f1b remainder, R2f2, R2f3a/b/c, and R2f4) are
+  **PARKED**. The shipped activity-liveness lane—PRs #139, #144, #147, and #149—provides a 30-minute silence
+  cutoff, work cutoff, heartbeat, and `TaskLiveness`; the session-leak fixes are PRs #129, #131, and #133.
+  Residuals remain: adapter-swallowed provider errors are still not surfaced before the cutoff (#47 and #24);
+  `INC-SHARED-WARM-CRASH` / `INC-SHARED-SESSION-CAPACITY` are mitigated by close-on-release and idle retirement
+  but their root cause is unproved; and `INC-VERIFY-STALL` is bounded by the silence cutoff but its root cause is
+  unknown. I2b remains parked. Reopen R2f only for a hang or wedge that cutoff + heartbeat do not bound, or a
+  recurrence of the long-lived-serve pre-turn `AgentCrashed` failure.
+- **Held code:** ADR-0041 capsule/restore code and the R2f1b inactive foundation are **HELD, unwired**; do not
+  delete them. #171's failing tests exercise held code. The owner may later extract it to a plugin crate or held
+  remote branch. Reopen only if practice exposes a gap in ADR-0042 push-based custody.
+- **Parked/deferred successors:** R2g stable ingress is **PARKED** and re-scoped into a later slim serve-swap
+  lane (validate + doctor, drain in-flight turns, restart, PONG check, rollback record), combined with H1-4 and
+  queued after the next flight. R3d4/R3d5 scheduled canaries are **DEFERRED**; manual pinned/floating runs remain
+  available, and an upstream adapter/model drift missed by the manual refresh process reopens them. R4 is
+  **DEFERRED**; OpenCode images still lack adapter-provenance labels (doctor warns; #179).
+- **Completed provider work:** R3e OpenRouter is **DONE in practice** as a `kind = "api"` agent. R3f OpenCode is
+  **DONE in practice** through PR #177 (containers, egress, credentials) and PR #178 (per-node model/effort/mode
+  and `models --match`). R2e remains **DEFERRED / policy-blocked**.
+- **Next flight (2026-10-18):** H1-3 review-quality evaluation across new reviewer models (research first),
+  H1-2 cost and quota governance (spec first), then H0-3 local `run-workflow` `allowed_cwd_root` plus flakes
+  #171/#173. The slim serve-swap lane follows.
+- **Merged since the prior cursor:** ADR-0042 PRs #153–#160 and #162; follow-ups #163/#165/#166; runtime
+  deadlines #168; claude-agent-acp 0.93.0 #170; lanes F #172, R #174, and V #175 (closes #146); OpenCode
+  #177/#178. Their merge commits are `44950581`, `6e09418c`, `0c164590`, `9151b745`, `8e0f1be6`, `19a35bdf`,
+  `aca0267a`, `a1f1663e`, `d4929484`, `b46b5d27`, `1fb1def3`, `15f183f2`, `f6f0dfeb`, `b1360f41`, `706ab2c4`,
+  `7012dfae`, `8d10e426`, and `70e210ce`.
+- **Prior cursor lineage (historical):** PR #126 merged the post-2B3a roadmap at `5d2a82c457e626b2a108063e1de6b13b94e97f92`.
   Its preceding code merge is `b7c85aee0440833380d9dab6804b406914644daa`, ADR-0041 Slice
   2B3a (the capsule reader) in PR #125, after its spec PR #124 (`b567d2d6`), the 2B3 design PR #123 (`abf74ad0`), and
   the ETXTBSY fixture fix in PR #122 (`e232288c`). Before that, Slice 2B2b2b2 merged in PR #121 (spec PR #120), and before that Slice 2B2b2b1 in PR #119 (spec PR #118 at `3e12ff53`), and before that Slice 2B2b2a in PR #117 (after its spec, PR #116 at `980eb52a`), and before that Slice 2B2b1 in PR #114, after the 2B2b1 spec (PR #113 at `f3a4c0a8`), docs PR #112 (`f16ca474`), and Slice 2B2 (PR
@@ -12,7 +39,7 @@
   (`edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`), 5A PR #101, 4J PR #100, 4I PR #99,
   the provider compatibility/runbook PR #98, OpenCode Go documentation PR #97, provider runtime-dispatch PR #96,
   provider refresh PRs #90-#95, and R2f1b 4H-2 PR #89.
-- **Completed through:** R2f1b 5B is **MERGED** by PR #102 at
+- **Prior program checkpoint (historical):** R2f1b 5B is **MERGED** by PR #102 at
   `edcda181ad94daad6ddaf9d3c9d4dd63fd2dce00`. Its approved storage-only code candidate is
   `6338bc1628fed52b772026b604a1bbdd710efa8c`; the final Sol/xhigh rereview recorded 0 WRONG and 3 SMELL,
   with full verification at 4,408 passed / 0 failed / 13 ignored / 726 filtered. The candidate remains
@@ -31,7 +58,7 @@
   2 h cap. Rollback limit (accepted by the owner): binaries older than `fbee12ae` cannot decode the new automatic
   run-policy rows; this is documented in the operator's SERVICE.md. Known tooling issue: #146, where concurrent
   implement verifies share a stale target; serialize them until it is fixed.
-- **Active slice:** **ADR-0042 push-based custody and evidence retention** (owner ruling 2026-10-15). ADR-0042
+- **Closed slice (historical record):** **ADR-0042 push-based custody and evidence retention** (owner ruling 2026-10-15). ADR-0042
   supersedes ADR-0041's capsule/restore custody: commits are protected by pushing the run branch at stable points,
   evidence is kept under a configurable local policy (defaults: spec plus final review summary, 30 days, 10 MiB
   per repository), and a clone is deleted only when its exact HEAD is on the remote and no unbacked state remains.
@@ -59,7 +86,7 @@
       - `storage reap --clones` should adopt the "HEAD on remote" check;
       - the deferred review smells listed in each PR.
     - **The operator serve is not yet on a release containing this work.**
-  - **Next:** no active slice. Owner to choose.
+  - **Next:** no active slice; see the 2026-10-18 maintenance decision above.
 - **Stopped slice:** **ADR-0041 Slice 2B3 (inert new-root restore and hidden-state proof).** Its design is
   `docs/superpowers/specs/2026-09-27-adr0041-slice2b3-restore-design.md` (PR #123). It has four serial children:
   2B3a reader → 2B3b Git plane → 2B3c payload plane → 2B3d record and joint fixture.
@@ -1622,7 +1649,8 @@ preserves exact running/warm ownership, and process deployment is split at an ap
 owner bound remains open;
 R3d may display a future read-only R2f health result but cannot perform operator lifecycle actions.
 
-R2f0p MERGED -> R2f0b MERGED + CI REPAIR GREEN -> R2f1a MERGED -> R2f1b INACTIVE FOUNDATION MERGED -> R2f1b REMAINING SLICES -> R2f2/3a/3b/3c/4 -> R2g stable ingress -> R3d4/R3d5 -> R3e/R3f -> R4 release promotion.
+R2f activity-liveness and session-leak fixes MERGED -> R2f remainder PARKED; ADR-0041/R2f1b held unwired ->
+R2g PARKED for a later slim serve-swap lane -> R3d4/R3d5 and R4 DEFERRED -> R3e/R3f DONE in practice.
 ```
 
 M4 Slice 3b/3c remains parked until the reliability exit gates in
@@ -1642,10 +1670,10 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0p MERGED AT `cc9e4ca` / R2f0a MERGED / R2f0b MERGED AT `4ffcd560` + CI REPAIR `2744cb1` GREEN / R2f1a MERGED AT `56334e9` / R2f1b INACTIVE V3 FOUNDATION MERGED AT `aedd2c2`** (31-second ACP and 6-second cancellation observable bounds; R2f1b adds the frozen 2-hour work cutoff and 2:01:10 terminal envelope only after preservation gates). | R2f1b [pre-slice-2 custody plan](superpowers/plans/2026-08-06-r2f1b-pre-slice-2-custody-plan.md), [focused boundary](superpowers/plans/2026-08-02-r2f1b-focused-boundary.md), [Opus closure record](superpowers/reviews/2026-08-06-r2f1b-opus-closure.md), and historical draft [Sol/xhigh closure review](superpowers/reviews/2026-08-02-r2f1b-sol-design-closure-review.md); R2f1a [focused boundary](superpowers/plans/2026-08-01-r2f1a-focused-boundary.md); R2f0b [focused boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md); [parallel-flight ADR](adr/0040-parallel-implementor-flight.md); [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md); [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md). | Owner decisions resolved (revision 3, 2026-08-07): execute Phase 0 storage slices S1–S5 and Track A gate slices A1–A4 as independent PRs; A5 fingerprint binding gates on `AutomaticR2f1b` construction, not slice-2 entry. Provider turns, automatic deadlines, release, deployment, and operator mutation remain separately authorized. |
-| R2g — stable ingress/release handoff | **QUEUED AFTER R2f / SCOPE BOUNDARY APPROVED / FOCUSED OWNER DESIGN NOT STARTED** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) | Stable local ingress, exact task/session/SSE affinity, side-by-side release promotion/rollback, safe store ownership, predecessor drain, and operator integration. No provider integration is mixed into this slice. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** by PR #37; R3d0–R3d3 **MERGED** by PRs #38/#40/#41/#42. R3d4 trusted triggers and R3d5 characterization/activation are **NOT STARTED**. R3e OpenRouter and R3f OpenCode are **NOT STARTED** and follow completed R3d. R3d3 remains default-off; no live compatibility gate or production state/iCloud/runtime/notification effect was part of it. | [R3 design/implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md), [R3d3 plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | After R2f/R2g, implement R3d4 triggers, R3d5 characterization/activation, R3e, then R3f; each keeps its own reviewed, default-off or separately authorized effect boundary. |
-| R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
+| R2f — phase-aware liveness/takeover | **PARKED.** Activity-liveness is shipped (PRs #139/#144/#147/#149) and session-leak fixes are shipped (#129/#131/#133); remaining R2f1b, R2f2, R2f3a/b/c, and R2f4 are parked. | Historical [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md) and [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md). | Reopen for an unbounded hang/wedge or a recurrent long-lived-serve pre-turn `AgentCrashed`; #47/#24, session-capacity root cause, and verify-stall root cause remain residuals. |
+| R2g — stable ingress/release handoff | **PARKED / RE-SCOPED.** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) is historical scope. | Later slim serve-swap lane: validate + doctor, drain, restart, PONG, rollback record; combined with H1-4 after the next flight. |
+| R3 — compatibility canaries | R3a–R3d3 **MERGED**. R3d4/R3d5 scheduled activation is **DEFERRED**; manual pinned/floating runs remain available. R3e OpenRouter and R3f OpenCode are **DONE in practice**. | [R3 design/implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md), [R3d3 plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md). | Reopen scheduled canaries for upstream adapter/model drift missed by manual refresh. |
+| R4 — reproducible release policy | **DEFERRED.** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md). | OpenCode images lack adapter-provenance labels; doctor warns (#179). |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
 compatibility, **2b** ACP lifecycle and safe evidence, **2c** production-owner/workflow authority, then
@@ -1935,6 +1963,11 @@ Next action:
 ```
 
 ## Current handoff
+
+- **2026-10-18 maintenance handoff:** There is no active reliability slice. Resume only from the close-out
+  decision at the top of this document: R2f has explicit reopen triggers; ADR-0041/R2f1b code is held unwired;
+  R2g is a later slim serve-swap lane; R3d4/R3d5 and R4 are deferred; R3e/R3f are done in practice. The next
+  flight is H1-3 research, H1-2 specification, and H0-3 plus #171/#173; serve swap follows.
 
 - R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
   at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c merged through PR #33 at
