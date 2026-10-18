@@ -4847,6 +4847,54 @@ impl RunWorkflowAttemptTiming {
     }
 }
 
+/// Parse an explicit local workflow cwd and, when configured, prove both the original path and
+/// the parsed execution path resolve beneath the resolved root. This is intentionally local-only:
+/// served and MCP requests retain their existing lexical admission rules.
+fn validate_local_session_cwd(
+    session_cwd: &Option<String>,
+    allowed_cwd_root: Option<&str>,
+) -> Result<Option<bridge_core::SessionCwd>, BoxError> {
+    let requested_session_cwd = session_cwd
+        .as_deref()
+        .map(bridge_core::SessionCwd::parse)
+        .transpose()
+        .map_err(|e| format!("run-workflow: invalid --session-cwd: {e:?}"))?;
+
+    let (Some(_), Some(configured_root)) = (requested_session_cwd.as_ref(), allowed_cwd_root)
+    else {
+        return Ok(requested_session_cwd);
+    };
+    let canonical_root = std::fs::canonicalize(configured_root).map_err(|error| {
+        format!("run-workflow: configured allowed_cwd_root cannot be resolved: {error}")
+    })?;
+    // Use the CLI spelling here, before `SessionCwd::parse` folds `..`: resolving
+    // `root/symlink/..` after that fold would inspect a different filesystem location.
+    let canonical_cwd = std::fs::canonicalize(
+        session_cwd
+            .as_deref()
+            .expect("an explicit requested cwd has its original argument"),
+    )
+    .map_err(|error| format!("run-workflow: --session-cwd cannot be resolved: {error}"))?;
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return Err("run-workflow: --session-cwd is outside configured allowed_cwd_root".into());
+    }
+    // `SessionCwd::parse` lexically folds `..`, which can produce a different location when an
+    // earlier component is a symlink. Check the exact parsed spelling that execution will use too.
+    let canonical_executed_cwd = std::fs::canonicalize(
+        requested_session_cwd
+            .as_ref()
+            .expect("an explicit requested cwd has its parsed form")
+            .as_str(),
+    )
+    .map_err(|error| format!("run-workflow: --session-cwd cannot be resolved: {error}"))?;
+    if !canonical_executed_cwd.starts_with(&canonical_root) {
+        return Err("run-workflow: --session-cwd is outside configured allowed_cwd_root".into());
+    }
+    // Resolve only for admission: sandbox mounts and ACP sessions must retain the caller's
+    // validated spelling, including an allowed root's symlink alias.
+    Ok(requested_session_cwd)
+}
+
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
@@ -4936,6 +4984,14 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let cfg = config::RegistryConfig::parse(&raw)
         .map_err(|e| format!("run-workflow: config parse error: {e}"))?;
 
+    // Local runs can warm a container_rw agent before building the registry.  Admit an explicit
+    // cwd while that path is still entirely provider-free, so an outside-root request cannot
+    // turn the warm-up into an agent/container effect.  Keep the original parsed cwd for the
+    // workflow: canonical paths are only the containment proof, not a change to direct-mode cwd
+    // semantics.
+    let requested_session_cwd =
+        validate_local_session_cwd(&session_cwd, cfg.allowed_cwd_root.as_deref())?;
+
     // Resolve prompt file base dir (same logic as `serve`).
     let base = config_path
         .parent()
@@ -5017,7 +5073,15 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // repo (the stamped --session-cwd), so the profile + warm are resolved once and applied to every
     // container_rw entry. Best-effort: any failure degrades to no in-container nav (Part A reports it).
     let verify_cfg_raw = cfg.verify.as_ref().map(|t| t.to_config());
-    let warm_repo: Option<std::path::PathBuf> = session_cwd.as_ref().map(std::path::PathBuf::from);
+    // With a root, use the same caller-spelled parsed cwd that admission returns and stamps into
+    // the workflow. Without a root retain the existing direct-mode spelling and behavior.
+    let warm_repo: Option<std::path::PathBuf> = if cfg.allowed_cwd_root.is_some() {
+        requested_session_cwd
+            .as_ref()
+            .map(|cwd| std::path::PathBuf::from(cwd.as_str()))
+    } else {
+        session_cwd.as_ref().map(std::path::PathBuf::from)
+    };
     let warm_profile = match warm_repo.as_ref() {
         Some(repo) => match select_profile(&cfg, &LangArg::Auto, repo) {
             Ok(p) => p,
@@ -5133,11 +5197,6 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
-    let requested_session_cwd = session_cwd
-        .as_deref()
-        .map(bridge_core::SessionCwd::parse)
-        .transpose()
-        .map_err(|e| format!("run-workflow: invalid --session-cwd: {e:?}"))?;
     let history_kind = if admission_cfg.store.is_some() {
         bridge_core::execution_policy::HistoryAllocationKindV1::Configured
     } else {

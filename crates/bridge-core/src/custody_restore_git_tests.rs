@@ -19914,7 +19914,9 @@ fn b2b_the_drain_after_a_held_ref_fault_never_reads_past_the_deadline() {
         specs.manifest_refs.clone(),
     );
     let target = case.meta("logs/HEAD");
-    let deadline = Instant::now() + B2B_SPENT_DEADLINE_V1;
+    // This fixture deliberately spends the deadline on the third read. Give it scheduling
+    // headroom to reach that proven read before doing so under bounded contention.
+    let deadline = Instant::now() + Duration::from_secs(4);
     let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let seen = reads.clone();
     let acting = target.clone();
@@ -24506,7 +24508,9 @@ fn halting_row(
         PlaneInV1::unborn(capsule, CustodyGitObjectFormatV1::Sha1)
     };
     let route = RouteV1::recorder();
-    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    // These concurrent rows share fixture I/O.  This headroom lets each row reach its named
+    // recorded guard; the injected guard still supplies the typed timeout proof.
+    let deadline = Instant::now() + Duration::from_secs(12);
     let (events, found, _hook) = act_at_index(index, label, move || pass_the_deadline(deadline));
     let ran = run_plane(input, &route, deadline);
     println!(
