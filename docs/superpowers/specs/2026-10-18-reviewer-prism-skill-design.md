@@ -59,170 +59,191 @@ records the authentication failure that motivated argv overrides. No native rout
 the exact host/container adapter separately. Do not install a whole plugin with hooks, extra MCP servers or permissions merely
 to deliver one Markdown skill.
 
-Freeze bounded UTF-8 skill bytes, ID and digest at admission. Resolve operator-selected regular files relative to their
-declaring config, never the checkout. Proposed limits: 32 KiB per skill / 64 KiB total. Missing, malformed or oversized selected
-skills fail before provider work; no network retrieval. Initially support instruction-only single files: no asset copying or
-script execution; relative references are not delivered. Validate frontmatter name/description and unique IDs.
+Freeze bounded UTF-8 skill bytes, ID and digest at admission. Resolve paths relative to the declaring config, not the session
+cwd; trust equals that config's prompt files. Mark checkout-resident sources `origin=checkout` in preview; recommend an
+operator-owned policy outside untrusted branches. Reject symlinks with no-follow open and a regular-file check. Limits remain
+32 KiB per skill / 64 KiB total; validate frontmatter name/description and unique IDs. Missing/malformed/oversized files fail
+before provider work. Instruction-only files: no retrieval, asset copying, script execution or delivered relative references.
 
-Append a clearly delimited “Attached skills” section after workflow template expansion, before dispatch; skill braces are
-literal, never workflow variables. Identify delivered MCP names, actual session checkout, and relevant tool-name conventions
-beside the unmodified body. Preserve task restrictions and output format. The skill is advisory procedure, not authority to
-edit, install, access the network or relax a sandbox. Cover workflow and direct-agent turns, implement initial/fix turns, and
-warm continuation; emit one attachment section per outgoing prompt, without mutating stored task input or reusing another
-session's rendered text. Record digest/size/delivery mode; never log source bytes or host paths by default. Changed skill
-content on resume requires explicit re-admission, not a silent change beneath a retained session or approved prompt. B has two
-workflow rendering paths (`crates/bridge-workflow/src/executor.rs:2932,3601`); a single CLI-only append would miss
-served/dispatcher paths. The common dispatch contract must cover each entrance.
+After template expansion, prepend exactly one attached-skills section as a separate leading `Part`, with per-prompt nonce
+boundaries; never re-expand skill braces or mutate stored input. Keep task, prior findings and output contracts last; brief lint
+still sees original input. Test forged headers/closing delimiters in reviewed input. State that the attached ID/digest supersedes
+installed copies of that ID. Identify delivered MCP names, session checkout and tool conventions beside the unchanged body.
+Skills remain advisory, with bounded discovery only: no added edit, network, installation or sandbox authority. Record digest,
+size, delivery mode and repeated-turn overhead, never source bytes or host paths by default. Keep full delivery each task turn;
+once-per-session text plus digest reminders is a deferred optimization requiring resumed-session equivalence tests.
+
+Composition belongs above `AgentBackend::prompt` at the production entrances: owned workflow execution (local and coordinator),
+implement initial edit, implement fix/resume, and direct coordinator run/continue. Include warm continuations. The dispatcher
+workflow route cited previously is test-only, not a second production entrance. Preflight PONG smoke, `/rename` mint prompts and
+the warm seed are excluded and must remain byte-identical with attachments enabled. Re-admit changed skills/policy on resume;
+never silently change a retained session's instructions.
+
+The existing implement task-file workaround keeps large Unicode task text out of containerized Claude prompts
+(`B:bin/a2a-bridge/src/main.rs:3975–3984`). PR 1b must gate the **complete composed initial and fix payload**, including feedback
+and maximum multibyte skills: either separately authorized same-environment exact-adapter evidence establishes supported
+bounds, or validated lane-specific admission limits reject unsupported combinations before send. Deterministic boundary and
+negative tests enforce the selected rule; fake adapters establish byte delivery, not real transport compatibility.
 
 ## 2. Generic configuration and binding
 
-Options: repeated per-agent entries, reusable bundles, or hard-coded Prism. **Start with `agents.skills`, then bundles.** Cost
-if wrong: excessive merge/session-identity complexity; exclude nested bundles and arbitrary inheritance.
+Start with `agents.skills`, then reusable bundles; exclude hard-coded Prism, nested bundles and arbitrary inheritance.
 
 | Proposed scope | Fields and meaning |
 |---|---|
-| `[[agents.skills]]` | `id`, `path`, `delivery="prompt"`; direct attachment, usable independently in PR 1. |
-| `[[attachments]]` | `id`; `skills` entries with the same shape; `mcp` entries with existing ADR-0028 fields. |
-| Agent or workflow node | `attachments=[IDs]`, optional `role`; explicit `attachments_disabled=true` suppresses inherited bundles. |
+| `[[agents.skills]]` | `id`, `path`, `delivery="prompt"`; independent per-agent attachment in PR 1a. |
+| `[[attachments]]` | `id`, skill entries, MCP entries with ADR-0028 fields in explicit `host` / `container` variants (optionally image-specific). |
+| Agent or workflow node | `attachments=[IDs]`, optional `role`; `attachments_disabled=true` suppresses inherited bundles. |
 | `attachment_defaults` | Role-to-bundle lists for `code-review`, `spec-review`, `plan-review`, `design`, `implement`. |
-| Operator policy file | Bundle definitions, defaults, exact workflow/node or agent selectors, optional provider delivery overrides. |
-| MCP lifecycle policy | Optional `warm` readiness tool/arguments/status selectors/deadline; resource reservation independent of warming; optional bounded retirement observer. |
+| Operator policy | Bundles/defaults, exact workflow/node or agent selectors, provider overrides; optional explicit `replaces_direct` names. |
+| MCP lifecycle | Optional readiness tool/args/status/deadline; independent resource reservation; bounded retirement observer. |
 
-Ship generic examples using a fictitious navigator. The operator's policy owns the Prism executable, `--repo {cwd} --shared`,
-compatible cache/refresh settings, skill path, tool aliases and readiness selectors. Do not vendor the Prism skill or add
-project-specific workflows under `examples/` (AGENTS.md:18–23).
+Ship generic navigator examples. The operator policy owns Prism's executable, `--repo {cwd} --shared`, cache/refresh settings,
+skill path, aliases and readiness selectors. Do not vendor the Prism skill or project-specific workflows under `examples/`.
+Resolve each MCP entry in the target execution namespace, including `container_rw` implementers and sandboxed readers. No variant
+means omit that MCP attachment with `unsupported_namespace`; the skill may still be sent with “no navigator in this session”.
+Preview namespace, selected variant, availability and omission reason; never substitute a host command into a container.
 
-An explicitly selected `--attachments-file` (or `A2A_BRIDGE_ATTACHMENTS_FILE`) supplies one operator policy across existing
-configs. Absent selection is byte-compatible behavior; no automatic scan of home directories. Select it once in the operator
-launcher/service, persist its resolved digest with the run, and apply it to local workflows, serve/MCP controllers, direct
-dispatch and implement/resume. No client request may supply new file paths, commands or bundles; it may select only already
-admitted roles/attachments. Resolution is deterministic: explicit disable wins; role defaults plus explicit bundle IDs form an
-ordered, deduplicated union; equal repeated definitions coalesce; conflicting MCP names or skill IDs fail validation. Direct
-entries do not silently override bundle contents. A new admission is needed to change policy on resume.
+One explicitly selected `--attachments-file` or `A2A_BRIDGE_ATTACHMENTS_FILE` supplies the central policy; no home-directory scan.
+No selection preserves byte-compatible behavior. Persist the resolved policy digest for local, served and implement/resume
+runs. Clients may select only admitted roles/attachments, never new file paths, commands or bundles. Explicit disable wins;
+role defaults plus explicit IDs form an ordered deduplicated union. Equal definitions coalesce; conflicting names/IDs refuse.
+Direct entries never silently override bundles. `replaces_direct` explicitly names the displaced direct MCP entries; preview
+both identities before staged enablement, preserving opt-out. Replacement still passes ordinary validation and authority gates.
 
-Resolve (including resource-limited omissions) before effective-entry validation, preflight and authority binding. Preserve
-command allowlists, secret handling, managed-loopback markers and native cwd restrictions. Include attachment content/delivery
-identity in affected session reuse and preflight keys; native process-bound MCP changes require a distinct adapter instance,
-never mutation of a shared live registry entry. Skill text cannot make an unsupported MCP transport supported. B's binder
-already freezes rendered MCP payloads (`crates/bridge-core/src/execution_policy.rs:2410–2442`); skill/default resolution must
-feed that boundary. The current continuation fingerprint covers agent/model/effort/mode/cwd only
-(`crates/bridge-core/src/session_fingerprint.rs:7–33`); add attachment identity rather than assuming coverage.
+Protect the tiered-review eval explicitly: add `--no-attachments`, suppressing direct skills and policy/bundle additions even
+when the launcher exports a policy; leave the eval's declared direct MCP configuration intact. The harness passes this by
+default. Attachment-enabled cells must explicitly declare their policy identity; every result records the effective policy
+digest (or explicit disabled identity), and integrity checks reject undeclared/mismatched policy. Snapshot current eval prompts
+before the eleven shipping prompts change; rebaselining is separately authorized, never an ambient side effect. Preserve the
+tools-off judge and deliberately non-navigating scaffolded/synthesis arms unless a cell explicitly changes its contract.
+
+Resolve namespace variants and validate candidates before preflight/authority binding; preserve command allowlists, secrets,
+managed-loopback markers and native cwd restrictions. Include skill, policy and MCP delivery identity in reuse/preflight keys.
+The binder freezes MCP payloads (`B:crates/bridge-core/src/execution_policy.rs:2402–2470`); PR 4 admits two validated candidates,
+with/without the optional resource-managed attachment, rather than editing frozen delivery at dispatch. Each has its own bound
+effect/digest and matching prompt availability metadata. Direct/implement turns use **agent-wide attachments only** until they
+adopt the V2 binder; client roles cannot change their MCP sets. Role defaults target their configured implement agent at admission.
+The continuation fingerprint currently lacks attachment identity (`B:crates/bridge-core/src/session_fingerprint.rs:7–33`);
+add it, and never mutate an existing registry entry to change a process-bound MCP set.
+
+Opus's supplied static OpenCode 1.18.27 inspection finds stdio translation into directory-scoped `sdk.mcp.add` registration,
+with ignored registration failures. Use one OpenCode process per effective MCP set (`EffectKeyedProcess`), not shared
+session-scoped registration across different sets. Model directory-scoped registration in isolation tests. Report delivery
+`unverified` until an exact-adapter conformance check demonstrates registration and absence of cross-role leakage; an ACP send
+alone proves neither. Continue explicit `mcp_delivery="acp"`; infer aliases only from the actual catalog.
 
 ## 3. Optional pre-warm and resource lifetime
 
-Options: operator pre-warm as today; raise adapter startup timeouts; or bridge-managed readiness before dispatch. **Recommend
-optional bridge-managed warming after delivery works.** Keep operator warming available; timeout inflation alone does not teach
-an agent to retry a `warming` result. Cost if wrong: extra delay, extra processes and retained GiBs without better reviews.
-Default warm off; initially propose a 180 s total deadline, bounded by the remaining run deadline, and 10 s retry interval. No
-provider calls or unbounded background retries.
+Warming defaults off; operator warming remains available. Keep the approved 180 s total budget, bounded by the remaining run
+deadline, with 10 s retry intervals and at most 18 attempts including the first. Begin at admission once the frozen checkout is
+available, or after clone/worktree creation; overlap spawn/preflight preparation where possible. Block only the first task
+prompt send for the remaining budget, never restart the clock. Exclude warm delay from turn-liveness/watchdog clocks and report
+it separately; the overall run deadline still applies. Cancellation does not send a prompt. PR 4 initially warms host namespaces
+only; container readiness is a named gap until a safe pre-existing execution namespace exists. Container attachments still pay
+resource reservations. The existing container LSP dependency warm is not MCP readiness and does not warm the source in lieu of a clone.
 
-Use the declared MCP command in the same execution namespace, canonical checkout, cache and environment as the eventual agent.
-Initialize a bridge-owned client, invoke a declared harmless readiness tool, and classify an explicitly configured structured
-response as ready/retryable/failed. Initialization alone is not readiness for lazy indexes. Cap attempts (18 including the
-first), response bytes and per-call time within one deadline; unknown/malformed responses degrade. Only configured retryable
-statuses retry; no retry on build failure. This is a generic MCP client contract, not a shell hook or hard-coded Prism protocol.
+Use the selected namespace variant, cache/environment and **frozen effective `{cwd}` string**, with no independent
+canonicalization. A bridge-owned MCP client invokes a declared harmless readiness tool; initialization alone is insufficient.
+Bound response size and per-call time within the single deadline. Only configured structured retryable statuses retry;
+malformed/unknown/build-failed responses degrade. No provider calls, shell hooks or unbounded background retries.
 
-Deduplicate one warm lease per checkout **and effective server identity** across simultaneous bridge runs; retain the client
-through agent connection/last-use so lazy shared state is not immediately retired. Prism's `--shared` lets agent shims join the
-same index; standalone servers would duplicate memory and must not advertise this optimization. P's identity includes canonical
-path, filesystem identity, analyzer build/protocol, cache base and refresh policy. One daemon per checkout is therefore a policy
-invariant: require the same effective identity for all attached Prism clients in a namespace; refuse conflicting managed
-attachment identities instead of silently launching another index. Host and container namespaces are separate pools unless
-socket/cache sharing is explicitly configured and verified; do not claim cross-pool sharing.
+Deduplicate warming by checkout plus effective server identity; retain the client through agent connection/last-use. Prism's
+`--shared` joins the same index; standalone servers cannot claim this optimization. Identity includes canonical path, filesystem
+identity, analyzer build/protocol, cache base and refresh policy. Require one compatible identity per checkout within a namespace;
+refuse conflicting managed identities. Host and container sharing leases remain separate unless socket/cache sharing is verified.
+Above these leases, **one aggregate reservation authority per operator memory-bearing host/runtime** enforces the two-checkout
+ceiling across namespaces. Independently resident namespace instances each consume a slot even when checkout paths match.
+Estimate 3 GiB per slot; accounting is not an RSS guarantee. Measure peaks before increasing the cap.
 
-A timeout/failure releases the warm client and records `unavailable`; dispatch continues with the skill's bounded
-retry/CLI/search fallback. Reuse a failed warm outcome for that run so every node does not repeat it. Cancellation releases
-owned clients and children; never kill an existing shared daemon or a sibling's client. At final lease release, close bridge
-clients; daemon idle retirement is the default (Prism defaults to 900 s). An opt-in identity-bound draining shutdown may shorten
-retention; Prism exposes pid/start-time guards and never disconnects a client (`P:src/bin/prism-mcp.rs:98–119`). Never use a
-broad process-name kill.
+Reserve before either warmer or agent MCP can spawn, including when warming is off. PR 4 freezes with/without-attachment
+candidates at admission. At dispatch, select the with-candidate only under an acquired or retained lease; otherwise select the
+without-candidate and journal `resource_limited`, candidate ID/digest and lease decision before provider work. Never patch a
+bound payload or bypass its digest check. Early warming acquires and retains the same reservation; an admission that starts no
+warmer may encounter saturation later. Preflight, process identity and session reuse must follow the selected candidate.
+Unbound direct/implement paths select from their frozen agent-wide candidates before slot creation; retained sessions keep their
+candidate and charged reservation. Do not remove MCP from a live session. A crash/replay must not resurrect an unleased candidate.
 
-TTL alone does not bound concurrent memory. Apply an operator-wide slot/reservation budget to **all managed attachments**, not
-only warmers, using cross-process leases in each execution namespace. Proposed initial pool: two distinct checkout identities,
-estimated 3 GiB each; this is admission accounting, not a hard RSS cap. Reserve before spawning either warmer or agent MCP. At
-saturation, omit that optional MCP attachment for the turn and report `resource_limited`; do not skip warming then let the agent
-start the same index unaccounted. Keep reservations while daemon retirement is unconfirmed; unknown ownership retains the slot.
-External daemons and CLI fallback builds are outside this bound; avoid automatic CLI indexing at saturation, use search instead.
-An optional allowlisted, read-only lifecycle-observer argv returns bounded identity/alive/unknown JSON; the operator supplies
-its server-specific mapping (Prism has `daemon-status`, `P:src/bin/prism-mcp.rs:76–95`). No observer means operator reconciliation before reclaiming
-slots; expiry alone is not proof. Validate this dependency before enabling the pool. Actual memory/build peaks must be measured
-before increasing the cap. Idle pooled adapter sessions can keep MCP clients alive: release them or count their reservations
-until adapter retirement confirms disconnection.
+A failed/timed-out warm records `unavailable`, closes its client and continues with bounded skill retry/search/CLI fallback
+while retaining any still-resident reservation; reuse that failure within the run. At saturation use search, never automatic
+CLI indexing outside the pool. External daemons/CLI builds remain outside managed accounting. Cancellation releases owned
+clients/children only, never shared daemons or sibling clients. Final client release allows idle retirement (Prism defaults to
+900 s); optional identity-bound draining shutdown must not disconnect clients. Never kill by process name.
 
-The existing LSP dependency warm (`B:bin/a2a-bridge/src/main.rs:5016–5074`) is not an MCP readiness facility: it targets
-selected container_rw agents. Extend dispatch preparation for actual selected agents/checkouts, including implement clones after
-creation and worktrees after allocation, rather than warming the source repo.
+Pool enablement requires a bounded allowlisted read-only lifecycle observer returning identity/alive/unknown; validate its
+availability. Reclaim after confirmed retirement, including crash recovery only when the holder is provably dead (PID plus
+start time) and an identity probe confirms no daemon. Unknown ownership/retirement retains the reservation and is visible in
+run summaries; TTL alone is not proof. Idle adapter clients remain charged until disconnection/retirement. Keep cross-process
+lease code `#[cfg(unix)]`; Windows reports pool management unsupported without breaking the non-unix build. Split PR 4 into
+accounting then readiness sub-slices so each can converge with warming off or operator pre-warming.
 
 ## 4. Review-role defaults and prompt migration
 
-Options: edit every config, infer review intent, or explicit roles plus central selectors. **Use explicit shipped-node roles and
-exact operator selectors for legacy configs.** One policy attaches bundles to review nodes and implement initial/fix turns.
-Custom configs need central mappings or agent-wide defaults; never infer intent from names containing “review”. Cost if wrong:
-missed reviews or expensive synth nodes. Preview the resolved workflow/node/agent/role/digest/MCP/delivery/cwd matrix and report
-unmatched selectors.
+Use explicit shipped-node roles and exact central legacy selectors, never inference from “review” in a name. One operator
+policy covers review nodes and agent-wide implement initial/fix attachments; custom configs need mappings or agent defaults.
+Preview workflow/node/agent/role/policy/skill/MCP/delivery/cwd, namespace, origin, conflicts and unmatched selectors before staged
+rollout. Resolve existing direct Prism conflicts via explicit replacement or per-config opt-out, not mass silent override.
 
-Eleven prompt files mention Prism at B, including the differently worded `prompts/review-sol-risk.md:5–8`. Replace duplication
-with a conditional generic pointer: “Follow attached navigation skills when relevant; if none are attached, use the permitted
-read-only tools.” Remove the contradictory “do not investigate absent tools” clause for declared attachments: allow bounded
-deferred-tool discovery, not environment troubleshooting. Keep review prohibitions and exploration budgets. Scope this exception
-explicitly: ToolSearch and the declared read-only MCP/CLI query are permitted, subject to deadline/resource limits; denial means
-fall back, not bypass. The delivered P skill supplies names (`mcp__plugin_prism_prism__nav_*`, `mcp__prism__nav_*`, bare Kiro
-names), wrong-checkout checks and retry guidance. OpenCode aliases must be reported from its actual tool catalog, not guessed.
-Preserve the no-skill path, and count a justified docs-only skip as success rather than demanding ceremonial calls.
+Replace the eleven duplicated Prism prompts, including `review-sol-risk.md`, with a conditional generic pointer to attached
+navigation skills and permitted read-only tools when absent. Preserve prohibitions, exploration budgets, prior findings and
+output formats. Permit bounded ToolSearch/deferred discovery and declared read-only MCP/CLI queries for attached navigators,
+subject to deadline/resource limits; denial means fallback, not environment troubleshooting or bypass. The P skill supplies
+aliases, wrong-checkout checks and retry guidance. Preserve the no-skill path. Justified docs-only skips are procedural successes,
+not useful-navigation successes; eligibility below prevents ceremonial calls or denominator drift.
 
 ## 5. Usage measurement from bridge events
 
-Options: grep titles now; structured optional event identity; or proxy every MCP call. **Recommend structured event identity
-plus an explicitly heuristic legacy report.** A full proxy gives stronger wire evidence but adds transport/lifecycle complexity;
-defer it unless adapters cannot expose identity. Cost if wrong: false adoption counts or an apparent zero caused by missing
-telemetry. Existing events retain title/status and call IDs, not server/tool identity
-(`B:crates/bridge-core/src/orch.rs:137–205`; ACP mapper `acp_backend.rs:6986–7018`).
+Use structured optional identity plus explicitly heuristic legacy reporting; defer a full transport proxy. Existing served
+events retain titles/status/call IDs, not reliable server/tool identity. Local `run-workflow` and `implement` currently drop tool
+events: `AttemptTelemetrySink::record` is empty (`B:crates/bridge-core/src/attempt_activity.rs:543–545`), used by
+`bin/a2a-bridge/src/main.rs:2995–3003,5311`. **Until PR 3's local sink is delivered and verified, the trial counts served runs only.**
 
-Add bounded optional server/tool identity at the ACP mapping seam, extracting only allowlisted fields from adapter-provided
-structured metadata/raw input; never persist arguments or raw output for this metric. X already renders MCP input as `{server,
-tool, arguments}` (`dist/index.js:29520–29524`); preserve only the first two. Use version-tested parsers for other adapters;
-absent identity stays unknown. Plugin aliases and bare Kiro names are not sufficient proof without a unique admitted catalog
-mapping. ToolSearch is discovery, not a Prism call. Warm-up calls are bridge-originated and excluded from agent counts.
+PR 3 adds a bounded identity-only persisting sink for local attempts, in a local journal keyed by `attempt_id`, preserving
+existing activity telemetry. Allowlist only node/session/turn/tool_call_id/server/tool/status per event; no arguments or raw
+output. Fake-adapter regressions must show a real MCP call through both local `run-workflow` and implement reaches the report.
+Retain optional identities through served journal/live/replay projections as well; local absence must never masquerade as zero.
 
-Persist through the existing journal (`B:crates/bridge-store/src/sqlite.rs:3656–3666`) and retain identity through
-live/served/replay projections. Count distinct `(run,node,session,turn,tool_call_id)` attempts; reconcile start, updates and
-terminal state without double counting retries/replay. Report attempted/completed/failed/unfinished, with incomplete coverage
-for truncated IDs or missing events; identical truncated IDs must not become exact counts. Also report identity coverage,
-attachment availability, skill digest and first-call latency. A completed call is not necessarily useful: a
-warming response can be protocol-successful. Readiness/usefulness remains unknown unless bounded structured status is available;
-CLI use and reviewer-reported skips are separate fields.
+At the ACP seam, extract bounded server/tool identity only from allowlisted structured fields with version-tested parsers.
+Aliases/bare Kiro names need a unique admitted catalog mapping; otherwise identity is unknown. ToolSearch is discovery, not a
+Prism call; bridge-originated warm calls are excluded. Count distinct `(run,node,session,turn,tool_call_id)` attempts and reconcile
+start/update/terminal/replay without double counting. Truncated/colliding IDs or missing events mean incomplete coverage, not
+exact counts. Report attempted/completed/failed/unfinished, identity coverage, attachment availability, skill/policy digests and
+first-call latency. Protocol completion does not prove usefulness: warming may succeed as a protocol call. Preserve unknown
+readiness/usefulness unless bounded status or owner-reviewed result evidence supports it; CLI use and skips remain separate.
 
-Collect ten consecutive eligible reviews; record role/provider/diff class/version, covering all four adapters and spec/code
-review or naming gaps. Compare a fixed prior sample with the same classifier and legacy uncertainty. Report sessions with
-identified navigation calls, useful-result evidence, timeouts, justified skips, elapsed time and context overhead. Owner judges
-relevance; counts do not prove quality or causality. Provisional target: useful navigation in 8/10 eligible sessions, with
-delivery/coverage recorded for all ten.
+Freeze eligibility/classifier before collection: a review needing repository navigation is eligible regardless of delivery
+failure or unknown telemetry. Owner-validated docs-only/irrelevant skips are procedural successes outside the denominator; log
+all screened reviews and continue until ten consecutive **eligible navigation reviews** are collected. Do not select on call
+success. Require useful navigation in at least 8/10, with delivery/coverage for all ten; unknown stays unknown and cannot count
+as demonstrated usefulness. Compare a fixed prior sample under the same classifier with legacy uncertainty. Publish per-adapter
+rows for Claude/Codex/Kiro/OpenCode, with at least one eligible session each or a named gap; also show role/diff class/version,
+spec/code coverage, useful-result evidence, timeouts, skips, elapsed time and context overhead. Owner judges relevance; the
+aggregate threshold cannot hide an unsupported adapter or establish quality/causality.
 
-## 6. Four bounded PR slices
+## 6. Bounded PR slices and persisted compatibility
 
 Cap each slice at **two review rounds**; disclose bounded extensions for converging closed findings, otherwise return to design
-without restarting. Require same-environment fail-before/pass-after regressions, negative/edge cases, full workspace test totals
-and CONTRIBUTING.md:26–31,47–62 gates. Report unavailable platform/container checks.
+without restarting. Implementation gates: same-environment fail-before/pass-after regressions, negative/edge cases, full workspace
+totals and CONTRIBUTING gates; name unavailable platform/container checks. No provider turn is needed for deterministic tests.
 
-1. **Per-agent prompt skills.** Own skill parsing/freezing and shared dispatch composition, including warm implement/fix and
-   both workflow routes; keep current MCP configuration. Value alone: existing MCP agents receive the maintained skill instead
-   of relying on installed home files. Tests: exact body reaches four fake adapters; missing/oversized/malformed skill; literal
-   template braces; no cwd writes; direct/served/workflow/implement paths; continuation digest change; duplicate prevention;
-   no-config byte parity.
-2. **Bundles, role policy and prompt pointers.** Own effective attachment resolution and binding before validation/preflight,
-   policy persistence, generic examples and eleven prompts. Exclude warming and metrics. Tests: old configs inherit via one
-   policy; opt-out/conflicts/unknown selectors; source-to-clone/worktree cwd; two roles sharing an agent cannot leak MCP state;
-   resume drift; OpenCode explicit delivery; Kiro sandbox refusal; managed-loopback/secret checks still run. Migration output
-   proves every selected role is covered.
-3. **Event identity and ten-review report.** Own optional event fields, ACP extraction and journal/projection report. Exclude
-   transport proxying. Tests: adapter fixtures identify real calls, title/ToolSearch false positives, bare-name collision,
-   updates/replay/repeated IDs across sessions, missing starts, truncated IDs, old journals, failed/warming results and secret
-   arguments absent from output. Unknown coverage stays unknown.
-4. **Optional warm leases and admission limits.** Own readiness client and per-namespace resource lifecycle; reuse attachment
-   bindings. Exclude native skill delivery and arbitrary shutdown hooks. Tests: fake MCP warming→ready,
-   malformed/failure/timeout/cancel, concurrent same-checkout single warm, distinct clones, shared namespace mismatch, saturated
-   pool, retained adapter clients, crash recovery and sibling-safe release. No real provider needed for regressions; separately
-   authorize exact-adapter/live adoption trials.
+| Slice | Owned behavior and acceptance (later slices must not widen earlier scope) |
+|---|---|
+| **1a: parse/freeze + workflow** | Skill parsing/freezing, owned workflow composition and attachment fingerprint; current MCP unchanged. Four fake adapters receive exact bodies; local/served route parity, braces, forged delimiters, duplicate prevention, bad/oversized files, no cwd writes, unchanged smoke/rename/seed and no-config bytes. |
+| **1b: implement + direct** | Initial edit/fix/resume, direct run/continue and warm continuation composition; agent-wide attachments only. Complete-payload compatibility gate, boundary/negative tests, changed-digest refusal and unchanged prior findings/output contract. No claim of real transport conformance from fakes. |
+| **2: bundles + roles** | Namespace variants, central policy/binding/preview, staged direct replacement, eleven prompt pointers and eval isolation/snapshots. Test host-only bundle on container_rw implementer and sandboxed reader (`unsupported_namespace`), valid container variant, clone/worktree cwd, opt-out/conflicts/selectors/resume drift. Model directory-scoped OpenCode registration; mixed-role/shared-agent draft/refine/synthesis graph cannot leak MCP or lose findings/contracts. Keep Kiro sandbox refusal, loopback and secret gates. |
+| **3: usage** | Optional ACP identity, local identity-only sink, served journal/projections and ten-review report. Test both local production paths, adapter fixtures, title/ToolSearch false positives, bare-name collisions, updates/replay/repeated IDs across sessions, missing starts/truncation, old journals, failed/warming calls, and absence of secret arguments. Unknown stays unknown. |
+| **4a: accounting** | Two frozen candidates, journaled lease selection, aggregate authority, retirement and unix-only crash recovery. Saturate between admission/dispatch: degraded run, no ConfigMismatch or unaccounted spawn. Three container namespaces and host/container overlap: third resident instance limited; cover cancellation, unknown retirement, retained clients, replay and sibling-safe release. |
+| **4b: readiness** | Optional host MCP warm client on 4a accounting; frozen cwd, overlap and first-send budget. Test warming→ready, malformed/failure/timeout/cancel, one warm per identical checkout, distinct clones, namespace mismatch, no liveness-clock charge or repeated budget. No native skills/arbitrary shutdown hooks; container warming deferred. |
+
+Enumerate persisted changes explicitly; old-record tests are acceptance gates, not optional migration follow-up:
+
+| Store / owner | New state and old-record test |
+|---|---|
+| Encoded workflow run spec / 1a, extended by 2 | Frozen skill IDs/bytes/digests/delivery, then resolved policy/roles/namespace variants. Old records decode as no attachments; replay adds no ambient policy and needs no source-file reread. |
+| Session fingerprint / 1a; direct consumers 1b | Attachment content/delivery identity in mint/reuse state and any serialized projection. Old state remains attachment-free; attaching or changing a digest requires re-admission, never silent reuse. |
+| Implement checkpoint / 1b, extended by 2 | Frozen agent-wide skills, then policy/namespace identity. Old checkpoints resume attachment-free; drift rejects before provider work or requires explicit re-admission. |
+| Tool journal/projections + local attempt journal / 3 | Optional identity fields and versioned local rows. Old events remain readable with unknown identity/coverage; missing local journals stay unknown. |
+| Frozen delivery candidates + dispatch journal / 4a | Candidate effects/digests and selected candidate/lease decision. Old single-candidate records replay unchanged; never synthesize optional delivery from current policy or replay a stale lease as live. |
 
 ## Conflicts and owner decisions
 
@@ -243,7 +264,34 @@ and CONTRIBUTING.md:26–31,47–62 gates. Report unavailable platform/container
   transport migration pending an exact-adapter conformance test, which would establish or refute runtime equivalence. Skill
   delivery does not depend on changing this route.
 
-Owner decisions: (1) accept prompt-first delivery and defer native optimizations; (2) opt into one operator policy with explicit
-legacy-role mappings; (3) accept provisional 180 s warming / two-checkout reservations or choose different limits; (4) authorize
-a separately bounded ten-review trial and agree eligibility/8-of-10 criteria. No implementation, live trial, full-suite
-execution or publication is authorized by this design task.
+Fixed owner decisions: prompt-first delivery; one central role policy with explicit legacy mappings; optional 180 s warming
+and aggregate two-checkout reservations; a separately bounded ten-review trial with 8-of-10 useful navigation. This fold does
+not authorize implementation, provider turns, a live trial, full-suite execution or publication; the controller commits.
+
+## Round-1 review fold
+
+Both supplied reviews: APPROVE WITH FIXES. Classifications below are retained; design remedies are future acceptance gates,
+not claims that implementation defects or adapter compatibility have already been tested.
+
+| Finding | Change |
+|---|---|
+| Opus W1 — WRONG / MATERIAL | §5 / PR 3: identity-only local sink and both-path regression; served-only trial until verified. |
+| Opus W2 — WRONG / MATERIAL | §§2–3 / 4a: freeze two deliveries, lease-select/journal at dispatch; intervening saturation regression. |
+| Opus W3 — WRONG / MATERIAL | §2 / PR 2: namespace variants, unsupported_namespace omission and container implementer/reader tests. |
+| Opus S1 — SMELL / MATERIAL | §2 / PR 2: eval --no-attachments, declared policy digest/integrity gate and prompt snapshots; explicit rebaseline. |
+| Opus S2 — SMELL / MATERIAL | §2 / PR 2: OpenCode process per MCP set; directory-scoped fake; unverified pending conformance. |
+| Opus S3 — SMELL / MATERIAL | §2 / PR 1b: agent-wide attachments for direct/implement until V2 binding. |
+| Opus S4 — SMELL / MATERIAL | §1 / PRs 1a–1b: production entrance inventory; byte-identical smoke, rename and seed exclusions. |
+| Opus S5 — SMELL / MATERIAL | §1 / PR 1a: leading Part plus nonce boundaries; forged-input regression; preserve output contract. |
+| Opus S6 — SMELL / MATERIAL | §§2,4 / PR 2: conflict preview, explicit replaces_direct or opt-out, staged rollout. |
+| Opus S7 — SMELL / MATERIAL | §3 / 4b: admission/clone warm, frozen cwd, overlap, first-send remaining budget, separate clocks; host-first. |
+| Opus S8 — SMELL / MATERIAL | §3 / 4a: required observer, proven-dead holder plus absent-daemon reclaim, visible retention; unix-only leases. |
+| Opus S9 — SMELL / MATERIAL | §6: PR 1a/1b split and explicit persisted-schema/old-record matrix. |
+| Opus S10 — SMELL / MATERIAL | §5: per-adapter rows, at least one eligible session each or named gap, unchanged 8/10 threshold. |
+| Opus S11 — SMELL / IMMATERIAL | §1: config-equivalent trust, checkout origin preview, external policy recommendation and no-follow files. |
+| Opus S12 — SMELL / IMMATERIAL | §§1,5: report repetition overhead; once-per-session optimization considered and explicitly deferred. |
+| Opus S13 — SMELL / IMMATERIAL | §1: attached ID/digest supersedes installed same-ID skill. |
+| Sol S1 — SMELL / MATERIAL | §1 / PR 1b: full initial/fix multibyte payload gate; validated admission bounds or exact-adapter evidence. |
+| Sol S2 — SMELL / MATERIAL | §3 / 4a–4b: aggregate ceiling above namespace leases; three-container/overlap regression; split accounting/readiness. |
+| Sol S3 — SMELL / MATERIAL | §5: predeclared eligibility; justified skips outside denominator; unknown is not zero or demonstrated usefulness. |
+| Sol source-check recommendations | §§1,2,6: preserve lint/input/findings/contracts and mixed-role graph; named runtime gaps, unchanged safety gates. |
