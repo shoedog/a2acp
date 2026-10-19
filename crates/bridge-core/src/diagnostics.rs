@@ -93,6 +93,12 @@ pub enum DiagnosticFailureClass {
     ContainerCredentials,
     Timeout,
     Overloaded,
+    QuotaExhausted,
+    RegionRestricted,
+    BillingFailure,
+    RateLimited,
+    /// Legacy aggregate for persisted diagnostics produced before the typed
+    /// upstream causes were introduced. New provider classification never emits it.
     ProviderLimit,
     Persistence,
     Canceled,
@@ -100,7 +106,7 @@ pub enum DiagnosticFailureClass {
 }
 
 impl DiagnosticFailureClass {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 21] = [
         Self::Config,
         Self::Authentication,
         Self::Model,
@@ -114,6 +120,10 @@ impl DiagnosticFailureClass {
         Self::ContainerCredentials,
         Self::Timeout,
         Self::Overloaded,
+        Self::QuotaExhausted,
+        Self::RegionRestricted,
+        Self::BillingFailure,
+        Self::RateLimited,
         Self::ProviderLimit,
         Self::Persistence,
         Self::Canceled,

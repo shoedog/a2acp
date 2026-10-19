@@ -88,7 +88,10 @@ use bridge_core::process::{
     DurableProcessFlightAttemptV3, DurableProcessFlightV3, OwnedProcessTreeV1, ProcessStderrCursor,
     ProcessStderrRing, ProcessStderrSnapshot,
 };
-use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
+use bridge_core::provider::{
+    classify_acp_error_data, classify_opencode_go_region_message, AcpProviderProvenance,
+    ProviderEvidence,
+};
 use bridge_core::reaper::{
     production_reap_fn, ContainerStartState, ReapController, ReapFailure, ReapFn,
 };
@@ -1289,6 +1292,40 @@ impl std::fmt::Debug for AcpProcessFlightRouteV3 {
     }
 }
 
+/// Adapter identity comes from the executable selected for this connection,
+/// independently of any requested model or provider error prose.
+fn is_opencode_adapter(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("opencode")
+}
+
+fn classify_prompt_provider_error(
+    opencode_adapter: bool,
+    effective_model: Option<&str>,
+    error: &AcpError,
+) -> ProviderEvidence {
+    let evidence = classify_acp_error_data(
+        error.code == ErrorCode::AuthRequired,
+        error.data.as_ref(),
+        diagnostic_timestamp_ms(),
+    );
+    // -32099 is the adapter's generic server error. Every other ACP code and
+    // any data (including empty, malformed or conflicting data) is structured
+    // evidence and cannot be overridden by prose.
+    if opencode_adapter
+        && effective_model.is_some_and(|model| model.starts_with("opencode-go/"))
+        && error.code == ErrorCode::Other(-32_099)
+        && error.data.is_none()
+    {
+        classify_opencode_go_region_message(AcpProviderProvenance::OpenCodeGo, &error.message)
+            .unwrap_or(evidence)
+    } else {
+        evidence
+    }
+}
+
 /// Static configuration for an ACP agent connection.
 ///
 /// `mode` drives a HARD `session/set_mode` after each `session/new` (a rejected
@@ -1300,6 +1337,11 @@ impl std::fmt::Debug for AcpProcessFlightRouteV3 {
 pub struct AcpConfig {
     /// Registry id of the agent this config belongs to, used in operator-facing diagnostics.
     pub agent_id: String,
+    /// The configured inner ACP executable. This remains the adapter provenance
+    /// when a sandbox composes the executable behind a runtime such as Docker.
+    /// Direct spawn callers may leave it unset, in which case `spawn` records
+    /// its program as the inner executable for backwards compatibility.
+    pub adapter_command: Option<String>,
     /// Absolute working directory the agent runs sessions in. The guarded host-fallback seam uses an
     /// OS object-addressed absolute path after the child process cwd is descriptor-pinned.
     pub cwd: PathBuf,
@@ -1444,6 +1486,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             agent_id: String::new(),
+            adapter_command: None,
             cwd: PathBuf::from("."),
             model: None,
             mode: None,
@@ -3093,6 +3136,8 @@ pub struct AcpBackend {
     /// connection); `Option` only so the `cx()`/`updates()` accessors have a
     /// clean error seam if a future constructor ever leaves it unset.
     conn: Option<AcpConn>,
+    /// Trusted executable provenance; never inferred from a model name.
+    opencode_adapter: bool,
     /// The spawned `OwnedProcessTreeV1` capability, held for the backend lifetime so
     /// ordinary drop reaches the process flight instead of a raw child backstop.
     /// `Some` on the `spawn`/`from_child` paths (we own the child); `None` on
@@ -4537,6 +4582,13 @@ impl AcpBackend {
         retain_pinned_cwd_fd_after_exec: bool,
         process_flight: Option<DurableProcessFlightV3>,
     ) -> Result<Self, BridgeError> {
+        // `cmd` is the actual process program. For sandboxed entries it is the
+        // runtime (for example Docker), while adapter provenance must remain
+        // bound to the configured inner executable.
+        let config = AcpConfig {
+            adapter_command: config.adapter_command.or_else(|| Some(cmd.to_string())),
+            ..config
+        };
         let redactor = config.diagnostic_redactor.clone();
         let lifecycle = AcpLifecycle::new(observer.clone(), redactor.clone(), None);
         lifecycle
@@ -5325,6 +5377,10 @@ impl AcpBackend {
                 .map(ContainerReap::legacy_controller)
         });
         Ok(Self {
+            opencode_adapter: config
+                .adapter_command
+                .as_deref()
+                .is_some_and(is_opencode_adapter),
             conn: Some(AcpConn {
                 cx,
                 agent_capabilities: resp.agent_capabilities,
@@ -7524,6 +7580,8 @@ impl AcpBackend {
         terminal_evidence: Arc<dyn TerminalEvidenceSink>,
     ) -> Result<BackendStream, BridgeError> {
         let config_snapshot = self.session_config_snapshot(session)?;
+        // Adapter identity is frozen at spawn, independently of session model overrides.
+        let opencode_adapter = self.opencode_adapter;
         #[cfg(test)]
         {
             let hook = self
@@ -7605,6 +7663,12 @@ impl AcpBackend {
         // Acquire the turn lock as an OWNED guard so it can move into the driver
         // task and be held for the whole streamed turn (released on drop there).
         let turn_guard: OwnedMutexGuard<()> = Arc::clone(&entry.turn_lock).lock_owned().await;
+        let provider_effective_model = self.session_catalogs.lock().ok().and_then(|catalogs| {
+            catalogs
+                .get(session)
+                .and_then(|caps| caps.current_model.clone())
+        });
+
         // A caller can pass the first fence check and then queue behind a turn
         // that escalates the shared connection. Revalidate after acquiring the
         // lock so that queued caller cannot dispatch onto a killed/fenced agent.
@@ -8261,16 +8325,17 @@ impl AcpBackend {
                     let (class, code, summary, causes, retry_after_ms, reset_at_ms) = match failure
                     {
                         PromptDriverFailure::Sdk(error) => {
+                            let evidence = classify_prompt_provider_error(
+                                opencode_adapter,
+                                provider_effective_model.as_deref(),
+                                &error,
+                            );
                             let ProviderEvidence {
                                 class,
                                 code,
                                 retry_after_ms,
                                 reset_at_ms,
-                            } = classify_acp_error_data(
-                                error.code == ErrorCode::AuthRequired,
-                                error.data.as_ref(),
-                                diagnostic_timestamp_ms(),
-                            );
+                            } = evidence;
                             (
                                 class,
                                 code,
@@ -12337,6 +12402,7 @@ mod tests {
         drop(child);
 
         let backend = AcpBackend {
+            opencode_adapter: false,
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             stderr_ring: None,
@@ -14871,14 +14937,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_prompt_structured_provider_limit_preserves_bounded_hints() {
+    async fn observed_prompt_structured_rate_limit_preserves_bounded_hints() {
         let rec = Recorder::new("agent-sess-PROMPT-LIMIT");
         rec.fail_prompt.store(true, Ordering::SeqCst);
         let reset_at_ms = diagnostic_timestamp_ms() + 60_000;
         *rec.prompt_error.lock().await = Some(
             AcpError::new(-32_099, "opaque provider rejection").data(serde_json::json!({
-                "code": "usage_limit_reached",
-                "error": {"type": "rate_limit_error"},
+                "code": "rate_limit_error",
                 "retry_after_ms": 1234,
                 "reset_at_ms": reset_at_ms
             })),
@@ -14896,10 +14961,10 @@ mod tests {
 
         let error = stream.next().await.unwrap().unwrap_err();
         let BridgeError::AgentFailure { diagnostic } = &error else {
-            panic!("structured provider limit must remain an AgentFailure");
+            panic!("structured rate limit must remain an AgentFailure");
         };
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ProviderLimit);
-        assert_eq!(diagnostic.code().as_str(), "upstream.provider_limit");
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::RateLimited);
+        assert_eq!(diagnostic.code().as_str(), "upstream.rate_limited");
         assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
         assert!(diagnostic.prompt_may_have_been_accepted());
         let serialized = serde_json::to_value(diagnostic).unwrap();
@@ -14907,6 +14972,113 @@ mod tests {
         assert_eq!(serialized["reset_at_ms"], reset_at_ms);
         assert!(!error.is_transient());
         assert!(!diagnostic.class().is_container_fallback_class());
+    }
+
+    #[test]
+    fn opencode_adapter_identity_is_independent_of_model() {
+        assert!(is_opencode_adapter("/resolved/bin/opencode"));
+        assert!(is_opencode_adapter("opencode"));
+        assert!(!is_opencode_adapter("/resolved/bin/codex-acp"));
+        assert!(!is_opencode_adapter("opencode-wrapper"));
+    }
+
+    #[tokio::test]
+    async fn prompt_region_classification_requires_inner_adapter_model_and_unstructured_error() {
+        for (command, model, error, expected) in [
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires Global regions"),
+                DiagnosticFailureClass::RegionRestricted,
+            ),
+            (
+                "/resolved/codex-acp",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires Global regions"),
+                DiagnosticFailureClass::Unknown,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(
+                    ErrorCode::AuthRequired.into(),
+                    "This Go model requires Global regions",
+                ),
+                DiagnosticFailureClass::Authentication,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires Global regions")
+                    .data(serde_json::json!({"code":"rate_limit_error"})),
+                DiagnosticFailureClass::RateLimited,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires Global regions")
+                    .data(serde_json::json!({"code":"rate_limit_error", "type":"invalid_api_key"})),
+                DiagnosticFailureClass::Unknown,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires Global regions")
+                    .data(serde_json::json!({})),
+                DiagnosticFailureClass::Unknown,
+            ),
+            (
+                "/resolved/opencode",
+                "other-model",
+                AcpError::new(-32_099, "This Go model requires Global regions"),
+                DiagnosticFailureClass::Unknown,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(-32_099, "This Go model requires global regions"),
+                DiagnosticFailureClass::Unknown,
+            ),
+            (
+                "/resolved/opencode",
+                "opencode-go/kimi-k3",
+                AcpError::new(
+                    ErrorCode::InvalidParams.into(),
+                    "This Go model requires Global regions",
+                ),
+                DiagnosticFailureClass::Unknown,
+            ),
+        ] {
+            let rec = Recorder::new("agent-sess-REGION");
+            rec.fail_prompt.store(true, Ordering::SeqCst);
+            *rec.model_config_values.lock().await = vec!["default".into(), model.into()];
+            *rec.prompt_error.lock().await = Some(error);
+            let backend = connect_recording_with(
+                rec,
+                AcpConfig {
+                    // The recorder has no process. Supply the same configured
+                    // inner executable that production preserves when a
+                    // sandbox composes an outer runtime program.
+                    adapter_command: Some(command.into()),
+                    model: Some(model.into()),
+                    ..test_config()
+                },
+            )
+            .await;
+            let mut stream = backend
+                .prompt(&bkey("bridge-REGION"), vec![])
+                .await
+                .unwrap();
+            let BridgeError::AgentFailure { diagnostic } =
+                stream.next().await.unwrap().unwrap_err()
+            else {
+                panic!("prompt failure must retain a diagnostic");
+            };
+            assert_eq!(diagnostic.class(), expected, "{command} {model}");
+            if expected == DiagnosticFailureClass::RegionRestricted {
+                assert_eq!(diagnostic.code().as_str(), "upstream.region_restricted");
+            }
+        }
     }
 
     #[tokio::test]
@@ -15283,6 +15455,7 @@ mod tests {
     #[tokio::test]
     async fn synchronous_missing_connection_is_pre_dispatch_and_not_accepted() {
         let backend = AcpBackend {
+            opencode_adapter: false,
             conn: None,
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
@@ -20123,6 +20296,7 @@ mod tests {
         drop(child);
 
         let backend = AcpBackend {
+            opencode_adapter: false,
             conn: None,
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             stderr_ring: None,
@@ -23334,6 +23508,7 @@ mod tests {
     #[tokio::test]
     async fn observed_pre_dispatch_cancel_and_release_failures_are_not_accepted() {
         let backend = AcpBackend {
+            opencode_adapter: false,
             conn: None,
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,

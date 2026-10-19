@@ -807,6 +807,10 @@ pub fn classify_failure(e: &BridgeError) -> FailureClass {
             }
             crate::diagnostics::DiagnosticFailureClass::Timeout => FailureClass::TimedOut,
             crate::diagnostics::DiagnosticFailureClass::Overloaded
+            | crate::diagnostics::DiagnosticFailureClass::QuotaExhausted
+            | crate::diagnostics::DiagnosticFailureClass::RegionRestricted
+            | crate::diagnostics::DiagnosticFailureClass::BillingFailure
+            | crate::diagnostics::DiagnosticFailureClass::RateLimited
             | crate::diagnostics::DiagnosticFailureClass::ProviderLimit => FailureClass::Overloaded,
             crate::diagnostics::DiagnosticFailureClass::Persistence
             | crate::diagnostics::DiagnosticFailureClass::Canceled

@@ -418,6 +418,22 @@ fn every_diagnostic_class_has_a_bounded_metrics_mapping() {
         (DiagnosticFailureClass::Timeout, FailureClass::TimedOut),
         (DiagnosticFailureClass::Overloaded, FailureClass::Overloaded),
         (
+            DiagnosticFailureClass::QuotaExhausted,
+            FailureClass::Overloaded,
+        ),
+        (
+            DiagnosticFailureClass::RegionRestricted,
+            FailureClass::Overloaded,
+        ),
+        (
+            DiagnosticFailureClass::BillingFailure,
+            FailureClass::Overloaded,
+        ),
+        (
+            DiagnosticFailureClass::RateLimited,
+            FailureClass::Overloaded,
+        ),
+        (
             DiagnosticFailureClass::ProviderLimit,
             FailureClass::Overloaded,
         ),

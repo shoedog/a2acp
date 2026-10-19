@@ -17,11 +17,10 @@ pub fn provider_token_class(token: &str) -> Option<DiagnosticFailureClass> {
     Some(match token {
         "insufficient_quota"
         | "quota_exceeded"
-        | "billing_hard_limit_reached"
         | "usage_limit_reached"
-        | "usage_limit_exceeded"
-        | "rate_limit_exceeded"
-        | "rate_limit_error" => DiagnosticFailureClass::ProviderLimit,
+        | "usage_limit_exceeded" => DiagnosticFailureClass::QuotaExhausted,
+        "billing_hard_limit_reached" => DiagnosticFailureClass::BillingFailure,
+        "rate_limit_exceeded" | "rate_limit_error" => DiagnosticFailureClass::RateLimited,
         "overloaded_error"
         | "server_overloaded"
         | "capacity_exceeded"
@@ -39,6 +38,10 @@ pub fn provider_code(class: DiagnosticFailureClass) -> &'static str {
         DiagnosticFailureClass::Authentication => "upstream.authentication",
         DiagnosticFailureClass::Model => "upstream.model",
         DiagnosticFailureClass::Overloaded => "upstream.overloaded",
+        DiagnosticFailureClass::QuotaExhausted => "upstream.quota_exhausted",
+        DiagnosticFailureClass::RegionRestricted => "upstream.region_restricted",
+        DiagnosticFailureClass::BillingFailure => "upstream.billing_failure",
+        DiagnosticFailureClass::RateLimited => "upstream.rate_limited",
         DiagnosticFailureClass::ProviderLimit => "upstream.provider_limit",
         DiagnosticFailureClass::Config
         | DiagnosticFailureClass::Protocol
@@ -54,6 +57,30 @@ pub fn provider_code(class: DiagnosticFailureClass) -> &'static str {
         | DiagnosticFailureClass::Canceled
         | DiagnosticFailureClass::Unknown => "upstream.unknown",
     }
+}
+
+/// A provenance marker supplied by the adapter, not untrusted provider prose.
+/// The OpenCode Go region message is deliberately recognized only for this
+/// exact adapter/model family and only when structured classification did not
+/// already establish a contradictory cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpProviderProvenance {
+    Other,
+    OpenCodeGo,
+}
+
+pub fn classify_opencode_go_region_message(
+    provenance: AcpProviderProvenance,
+    message: &str,
+) -> Option<ProviderEvidence> {
+    (provenance == AcpProviderProvenance::OpenCodeGo
+        && message == "This Go model requires Global regions")
+        .then_some(ProviderEvidence {
+            class: DiagnosticFailureClass::RegionRestricted,
+            code: provider_code(DiagnosticFailureClass::RegionRestricted),
+            retry_after_ms: None,
+            reset_at_ms: None,
+        })
 }
 
 fn values_at_paths<'a>(data: &'a serde_json::Map<String, Value>, key: &str) -> Vec<&'a Value> {
@@ -171,8 +198,8 @@ mod tests {
             json!({"error": {"type": "usage_limit_reached"}}),
         ] {
             let evidence = classify_acp_error_data(false, Some(&data), NOW_MS);
-            assert_eq!(evidence.class, DiagnosticFailureClass::ProviderLimit);
-            assert_eq!(evidence.code, "upstream.provider_limit");
+            assert_eq!(evidence.class, DiagnosticFailureClass::QuotaExhausted);
+            assert_eq!(evidence.code, "upstream.quota_exhausted");
         }
         for data in [
             json!({"message": "usage_limit_reached"}),
@@ -228,7 +255,7 @@ mod tests {
             json!({"code": "usage_limit_reached", "reset_at_ms": NOW_MS + MAX_PROVIDER_RETRY_AFTER_MS as i64 + 1}),
         ] {
             let evidence = classify_acp_error_data(false, Some(&data), NOW_MS);
-            assert_eq!(evidence.class, DiagnosticFailureClass::ProviderLimit);
+            assert_eq!(evidence.class, DiagnosticFailureClass::QuotaExhausted);
             assert_eq!(evidence.retry_after_ms, None);
             assert_eq!(evidence.reset_at_ms, None);
             assert_eq!(evidence.code, "upstream.retry_metadata_invalid");
@@ -243,7 +270,7 @@ mod tests {
             "error": {"retry_after_ms": 1}
         });
         let evidence = classify_acp_error_data(false, Some(&data), NOW_MS);
-        assert_eq!(evidence.class, DiagnosticFailureClass::ProviderLimit);
+        assert_eq!(evidence.class, DiagnosticFailureClass::QuotaExhausted);
         assert_eq!(evidence.retry_after_ms, None);
         assert_eq!(evidence.code, "upstream.retry_metadata_invalid");
     }
@@ -255,5 +282,33 @@ mod tests {
         assert_eq!(evidence.class, DiagnosticFailureClass::Unknown);
         assert_eq!(evidence.retry_after_ms, Some(1000));
         assert_eq!(evidence.code, "upstream.unknown");
+    }
+
+    #[test]
+    fn opencode_go_region_mapping_requires_exact_provenance_and_message() {
+        assert!(matches!(
+            classify_opencode_go_region_message(
+                AcpProviderProvenance::OpenCodeGo,
+                "This Go model requires Global regions"
+            ),
+            Some(ProviderEvidence {
+                class: DiagnosticFailureClass::RegionRestricted,
+                code: "upstream.region_restricted",
+                ..
+            })
+        ));
+        for (provenance, message) in [
+            (
+                AcpProviderProvenance::Other,
+                "This Go model requires Global regions",
+            ),
+            (
+                AcpProviderProvenance::OpenCodeGo,
+                "prefix This Go model requires Global regions",
+            ),
+            (AcpProviderProvenance::OpenCodeGo, "region restriction"),
+        ] {
+            assert!(classify_opencode_go_region_message(provenance, message).is_none());
+        }
     }
 }

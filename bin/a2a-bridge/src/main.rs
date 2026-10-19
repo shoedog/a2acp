@@ -812,6 +812,7 @@ fn acp_spawn_inputs_with_cwd_binding(
     child_env_remove.dedup();
     let acp = bridge_acp::acp_backend::AcpConfig {
         agent_id: entry.id.as_str().to_string(),
+        adapter_command: entry.cmd.clone(),
         cwd,
         model: entry.model.clone(),
         mode: entry.mode.clone(),
@@ -1293,6 +1294,7 @@ fn container_rw_cfg_from_entry(
     })?;
     Ok(bridge_container::ContainerRwConfig {
         sandbox: sb,
+        adapter_command: cmd.clone(),
         cmd,
         args: entry.args.clone(),
         mcp: entry.mcp.clone(),
@@ -15441,6 +15443,47 @@ esac
         let wd = acp.watchdog.as_ref().expect("watchdog is forwarded");
         assert_eq!(wd.idle_timeout, std::time::Duration::from_secs(30));
         assert_eq!(wd.hard_wall_clock, std::time::Duration::from_secs(600));
+    }
+
+    #[test]
+    fn sandboxed_acp_spawn_inputs_preserve_the_inner_adapter_command() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().to_string_lossy().into_owned();
+        let runtime = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut entry = acp_entry("opencode-reader");
+        entry.cmd = Some("opencode".into());
+        entry.sandbox = Some(SandboxConfig {
+            runtime: Some(runtime.clone()),
+            image: "img".into(),
+            mount: mount.clone(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run0".into(),
+            host: "h".into(),
+            lease: "/l/run0.lock".into(),
+            start: "0".into(),
+        };
+
+        let (program, argv, acp) = acp_spawn_inputs(
+            &entry,
+            std::path::PathBuf::from(&mount),
+            &temp.path().join("a2a.toml"),
+            &run,
+        )
+        .unwrap();
+
+        assert_eq!(program, runtime);
+        assert_ne!(program, "opencode");
+        assert!(argv.iter().any(|arg| arg == "opencode"));
+        assert_eq!(acp.adapter_command.as_deref(), Some("opencode"));
     }
 
     #[test]

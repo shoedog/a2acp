@@ -74,6 +74,7 @@ pub mod reaper;
 pub mod remote_request_flight;
 pub mod resource_flight;
 pub mod retained_resource_flight;
+pub mod routing;
 #[cfg(unix)]
 pub mod run_identity;
 pub mod run_spec;
