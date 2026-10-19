@@ -2,6 +2,7 @@
 //! and final result. Separate from `SessionStore` (ephemeral routing state) by
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
+pub use crate::accounting::{UsageAttemptV1, UsageQueryV1, UsageSummaryV1};
 use crate::error::BridgeError;
 use crate::harvest::{
     HarvestAuditBundleV1, HarvestAuditCommit, HarvestAuditStore, HarvestAuditStoreError,
@@ -461,6 +462,22 @@ pub enum DetachedTerminalCas {
 
 #[async_trait::async_trait]
 pub trait TaskStore: HarvestAuditStore + Send + Sync {
+    async fn start_usage_attempt_v1(&self, _row: &UsageAttemptV1) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    async fn update_usage_attempt_v1(
+        &self,
+        _id: &str,
+        _dispatched: bool,
+        _usage: Option<crate::orch::UsageSnapshot>,
+        _finalized: bool,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    async fn usage_summary_v1(&self, _query: &UsageQueryV1) -> Result<UsageSummaryV1, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     /// Freeze the policy-trigger durability lane this primary store can actually own.
     /// Ephemeral and compatibility stores default to the explicit offline-unavailable
     /// path; a durable implementation must opt in together with its atomic V2 writer.
