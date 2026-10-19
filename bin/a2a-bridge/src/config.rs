@@ -743,6 +743,9 @@ fn canonicalize_lenient_session_cwd(path: &Path) -> Result<bridge_core::SessionC
 #[serde(deny_unknown_fields)]
 pub struct WorkflowToml {
     pub id: String,
+    /// Preserve revisions for local `run-workflow` reviews. Implement review steps are always reviews.
+    #[serde(default)]
+    pub review: bool,
     #[serde(default)]
     pub task_class: Option<String>,
     #[serde(default)]
@@ -2939,6 +2942,21 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
 #[cfg(test)]
 mod metrics_config_tests {
     use super::*;
+
+    #[test]
+    fn review_history_defaults_on_and_allows_explicit_opt_out() {
+        let base = "default='x'\n[[agents]]\nid='x'\ncmd='echo'\n[server]\n";
+        for custody in [
+            "",
+            "[custody]",
+            "[custody]\nreview_history=true",
+            "[custody]\nreview_history=false",
+        ] {
+            let cfg = RegistryConfig::parse(&format!("{base}\n{custody}")).unwrap();
+            assert_eq!(cfg.custody.review_history, !custody.contains("false"));
+            assert!(cfg.custody.push);
+        }
+    }
 
     #[test]
     fn metrics_defaults_off_with_prometheus_exporter_and_turn_log_true() {

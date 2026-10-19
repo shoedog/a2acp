@@ -320,6 +320,7 @@ description = "one-line smoke reply prompt"
 # broader E8b registry/partial migration.
 [[workflows]]
 id = "code-review"
+review = true
 [[workflows.nodes]]
 id = "correctness"
 agent = "codex"
@@ -340,6 +341,7 @@ inputs = ["correctness", "architecture"]
 #    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
 [[workflows]]
 id = "implement-review"
+review = true
 [[workflows.nodes]]
 id = "reviewer_codex"
 agent = "codex"
@@ -360,6 +362,7 @@ inputs = ["reviewer_codex", "reviewer_claude"]
 #    Faster + cheaper than the full two-reviewer workflow; same synth contract (VERDICT: APPROVE|REJECT). ──
 [[workflows]]
 id = "implement-review-light"
+review = true
 [[workflows.nodes]]
 id = "reviewer"
 agent = "codex"
@@ -375,6 +378,7 @@ inputs = ["reviewer"]
 # implement-review-thorough: 2 reviewers each draft→refine → synth (the large-diff tier). Reuses the
 # standard reviewer + synth prompts; the refine pass re-reads the diff line-by-line. Slice attached.
 id = "implement-review-thorough"
+review = true
 [[workflows.nodes]]
 id = "reviewer_codex_draft"
 agent = "codex"
@@ -446,6 +450,7 @@ inputs = []
 
 [[workflows]]
 id = "spec-review"
+review = true
 [[workflows.nodes]]
 id = "rigordraft"
 agent = "codex"
@@ -474,6 +479,7 @@ inputs = ["rigor", "soundness"]
 
 [[workflows]]
 id = "plan-review"
+review = true
 [[workflows.nodes]]
 id = "execdraft"
 agent = "codex"

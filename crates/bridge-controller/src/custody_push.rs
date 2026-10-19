@@ -16,6 +16,7 @@ unsafe extern "C" {
 #[serde(default, deny_unknown_fields)]
 pub struct CustodyConfig {
     pub push: bool,
+    pub review_history: bool,
     pub remote: String,
     pub ref_prefix: String,
     pub delete_remote_on_merge: bool,
@@ -25,6 +26,7 @@ impl Default for CustodyConfig {
     fn default() -> Self {
         Self {
             push: true,
+            review_history: true,
             remote: "origin".into(),
             ref_prefix: "wip/".into(),
             delete_remote_on_merge: true,
@@ -67,7 +69,7 @@ pub struct CustodyState {
     pub last_error: Option<String>,
 }
 
-fn git() -> Command {
+pub(crate) fn git() -> Command {
     let mut cmd = Command::new("git");
     // Ambient repository selection must not make the scratch repo read clone config.
     for (key, _) in std::env::vars_os() {
@@ -103,7 +105,7 @@ fn git() -> Command {
 
 // Do not retain or render Git's opaque diagnostics: they can contain credentials,
 // helper output, rewritten URLs, and server-supplied secrets.
-fn bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+pub(crate) fn bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
     use bridge_core::control_command::{output_until, ControlError, OutputPolicy, StreamPolicy};
     output_until(
         &mut cmd,
@@ -307,6 +309,59 @@ fn destination(source: &Path, clone: &Path, cfg: &CustodyConfig) -> Result<Desti
             .into(),
         url,
     })
+}
+
+/// Create-only publication: an equal existing ref recovers an interrupted push, never replaces it.
+pub fn push_review_history(
+    clone: &Path,
+    source: &Path,
+    cfg: &CustodyConfig,
+    run: &str,
+    invocation: u64,
+    sha: &str,
+) -> Result<(String, String), String> {
+    cfg.validate()?;
+    if run.is_empty()
+        || !run.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || !matches!(sha.len(), 40 | 64)
+        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("invalid review history identity".into());
+    }
+    let reference = format!("refs/review-history/{run}/{invocation}");
+    let dest = destination(source, clone, cfg)?;
+    let timeout = Duration::from_secs(cfg.push_timeout_secs);
+    let scratch = Scratch::new(clone, timeout)?;
+    let mut cmd = git();
+    cmd.arg("-C")
+        .arg(&scratch.0)
+        .args(["push", "--no-verify", "--no-follow-tags", "--porcelain"])
+        .arg(format!("--force-with-lease={reference}:"))
+        .arg("--")
+        .arg(&dest.url)
+        .arg(format!("{sha}:{reference}"));
+    let _out = bounded(cmd, timeout)?;
+    let mut cmd = git();
+    cmd.arg("-C")
+        .arg(&scratch.0)
+        .args(["ls-remote", "--refs", "--"])
+        .arg(&dest.url)
+        .arg(&reference);
+    let out = bounded(cmd, timeout)?;
+    if !out.status.success()
+        || !String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == format!("{sha}\t{reference}"))
+    {
+        return Err("review history publication failed (collision or transport refusal)".into());
+    }
+    let remote = dest
+        .identity
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    Ok((reference, remote))
 }
 
 /// Best effort; persist the result before handing control to a reviewer or merge.
@@ -876,6 +931,233 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn review_history_refuses_hidden_worktree_bytes_and_missing_origin() {
+        let f = Fixture::new();
+        let file = f.clone.join("tracked");
+        std::fs::write(&file, "committed").unwrap();
+        run(&f.clone, &["add", "tracked"]);
+        run(
+            &f.clone,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "tracked",
+            ],
+        );
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            run(&f.clone, &["update-index", flag, "tracked"]);
+            std::fs::write(&file, "hidden edit").unwrap();
+            assert!(crate::evidence::review_head(&f.clone).is_err(), "{flag}");
+            std::fs::write(&file, "committed").unwrap();
+            run(
+                &f.clone,
+                &["update-index", "--no-assume-unchanged", "tracked"],
+            );
+            run(&f.clone, &["update-index", "--no-skip-worktree", "tracked"]);
+        }
+        assert!(crate::evidence::review_head(&f.clone).is_ok());
+        std::fs::remove_file(crate::implement_resume::checkpoint_path(&f.clone)).unwrap();
+        run(&f.clone, &["remote", "remove", "origin"]);
+        assert!(crate::implement_resume::workflow_review_checkpoint(&f.clone).is_err());
+    }
+
+    #[test]
+    fn review_history_is_create_only_and_recovers_matching_refs() {
+        for format in ["sha1", "sha256"] {
+            let mut f = Fixture::with_object_format(format);
+            f.cfg.push = false; // Ordinary custody and review history are independent.
+            let sha = f.head();
+            let (reference, _) =
+                push_review_history(&f.clone, &f.source, &f.cfg, "impl-test", 1, &sha).unwrap();
+            push_review_history(&f.clone, &f.source, &f.cfg, "impl-test", 1, &sha).unwrap();
+            f.commit(true);
+            assert!(
+                push_review_history(&f.clone, &f.source, &f.cfg, "impl-test", 1, &f.head())
+                    .is_err()
+            );
+            assert_eq!(run(&f.remote, &["rev-parse", &reference]), sha);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_history_namespace_rejection_and_timeout_refuse_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        f.cfg.push_timeout_secs = 1;
+        let hook = f.remote.join("hooks/pre-receive");
+        for body in ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nsleep 30\n"] {
+            std::fs::write(&hook, body).unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result =
+                push_review_history(&f.clone, &f.source, &f.cfg, "impl-test", 1, &f.head());
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("publication failed") || error.contains("timeout"),
+                "{error}"
+            );
+            assert!(run(&f.remote, &["for-each-ref", "refs/review-history/"]).is_empty());
+        }
+    }
+
+    #[test]
+    fn review_history_labels_survive_resume_amend_oversize_and_archive_failure() {
+        use crate::evidence::*;
+        let mut f = Fixture::new();
+        std::fs::write(f.clone.join(".git/A2A_TASK.md"), "task").unwrap();
+        let cfg = EvidenceConfig {
+            path: Some(f._root.path().join("evidence")),
+            include: vec!["transcripts".into()],
+            max_bytes_per_repo: 65536,
+            ..Default::default()
+        };
+        let sha_a = f.head();
+        let first =
+            begin_revision_review(&f.clone, &f.ck, &f.cfg, &cfg, "implement-review", 1, &sha_a)
+                .unwrap();
+        // Interrupted invocation remains incomplete; the same loop attempt and SHA get a new identity.
+        let second =
+            begin_revision_review(&f.clone, &f.ck, &f.cfg, &cfg, "implement-review", 1, &sha_a)
+                .unwrap();
+        assert_ne!(first, second);
+        let blocked = EvidenceConfig {
+            path: Some(f._root.path().join("blocked")),
+            ..cfg.clone()
+        };
+        std::fs::write(blocked.path.as_ref().unwrap(), "not a directory").unwrap();
+        assert!(finish_revision_review(
+            &f.clone,
+            &f.ck,
+            &blocked,
+            second,
+            true,
+            "VERDICT: REJECT\nSUMMARY: repair A"
+        )
+        .is_err());
+        // A completed label exists locally, but the old archive cannot authorize cleanup.
+        assert!(verify_archive(&f.clone, &f.ck, &sha_a, &cfg, "reviewing")
+            .unwrap_err()
+            .to_string()
+            .contains("unarchived"));
+        assert!(begin_revision_review(
+            &f.clone,
+            &f.ck,
+            &f.cfg,
+            &blocked,
+            "implement-review",
+            1,
+            &sha_a
+        )
+        .is_err());
+        // Recover a fully serialized write interrupted before its atomic rename.
+        let journal = f.clone.join(".git/a2a-bridge/review-history.json");
+        std::fs::rename(&journal, journal.with_extension("json.tmp")).unwrap();
+        assert!(verify_archive(&f.clone, &f.ck, &sha_a, &cfg, "reviewing").is_err());
+        f.commit(true);
+        let sha_b = f.head();
+        f.ck.current_commit = Some(sha_b.clone());
+        let third =
+            begin_revision_review(&f.clone, &f.ck, &f.cfg, &cfg, "implement-review", 2, &sha_b)
+                .unwrap();
+        finish_revision_review(
+            &f.clone,
+            &f.ck,
+            &cfg,
+            third,
+            true,
+            "VERDICT: APPROVE\nSUMMARY: repaired B",
+        )
+        .unwrap();
+        let dir = f.clone.join(".git/a2a-bridge/codex-sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut x = 123456789u64;
+        let noise: Vec<u8> = (0..200000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        std::fs::write(dir.join("large"), noise).unwrap();
+        let path = write_run_archive(&f.clone, &f.ck, "merged", &cfg).unwrap();
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(path).unwrap(),
+        ));
+        let mut manifest = None;
+        for entry in tar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().as_ref() == Path::new("manifest.json") {
+                manifest = Some(serde_json::from_reader::<_, Manifest>(&mut entry).unwrap());
+            }
+        }
+        let m = manifest.unwrap();
+        assert!(m.dropped.iter().any(|d| d.reason == "over_cap"));
+        assert_eq!(m.review_history.len(), 3);
+        assert_eq!(m.review_history[0].status, "incomplete");
+        assert_eq!(m.review_history[0].verdict, "Inconclusive");
+        assert_eq!(m.review_history[1].reviewed_sha, sha_a);
+        assert_eq!(m.review_history[1].verdict, "Reject");
+        assert_eq!(m.review_history[1].findings_summary, "repair A");
+        assert_eq!(m.review_history[2].reviewed_sha, sha_b);
+        assert_eq!(m.review_history[2].verdict, "Approve");
+        for record in m.review_history {
+            assert_eq!(
+                run(&f.remote, &["rev-parse", &record.reference]),
+                record.reviewed_sha
+            );
+        }
+        verify_merged_archive(&f.clone, &f.ck, &sha_b, &cfg).unwrap();
+    }
+
+    #[test]
+    fn standalone_review_without_checkpoint_has_durable_labels_and_rejects_dirty_checkout() {
+        use crate::evidence::*;
+        let f = Fixture::new();
+        std::fs::remove_file(crate::implement_resume::checkpoint_path(&f.clone)).unwrap();
+        run(
+            &f.clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("file://{}", f.source.display()),
+            ],
+        );
+        let ck = crate::implement_resume::workflow_review_checkpoint(&f.clone)
+            .unwrap()
+            .unwrap();
+        // The checkpoint records the canonical source path (`/var` is a symlink to `/private/var` on macOS).
+        assert_eq!(ck.source_repo, f.source.canonicalize().unwrap());
+        let cfg = EvidenceConfig {
+            path: Some(f._root.path().join("evidence")),
+            ..Default::default()
+        };
+        let sha = f.head();
+        let id =
+            begin_revision_review(&f.clone, &ck, &f.cfg, &cfg, "code-review", 1, &sha).unwrap();
+        finish_revision_review(
+            &f.clone,
+            &ck,
+            &cfg,
+            id,
+            true,
+            "VERDICT: APPROVE\nSUMMARY: standalone",
+        )
+        .unwrap();
+        verify_archive(&f.clone, &ck, &sha, &cfg, "reviewed").unwrap();
+        std::fs::write(f.clone.join("dirty"), "untracked").unwrap();
+        assert!(
+            begin_revision_review(&f.clone, &ck, &f.cfg, &cfg, "code-review", 1, &sha).is_err()
+        );
+        finish_revision_review(&f.clone, &ck, &cfg, id, true, "VERDICT: APPROVE").unwrap_err();
     }
 
     #[test]

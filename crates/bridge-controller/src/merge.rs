@@ -2128,6 +2128,16 @@ mod git_tests {
                 let mut custody = original.custody.clone();
                 custody.delete_remote_on_merge = cleanup != "disabled";
                 let remote = run_git_str(&src, &["remote", "get-url", "origin"]);
+                let history_ref = "refs/review-history/impl-1-abcd/1";
+                crate::custody_push::push_review_history(
+                    &clone,
+                    &src,
+                    &custody,
+                    "impl-1-abcd",
+                    1,
+                    &current,
+                )
+                .unwrap();
                 let mut post = |clone: &Path, ck: &ImplementCheckpoint| {
                     (original.post_landing)(clone, ck);
                     // The dirty ref uses the same recorded custody lease mechanism.
@@ -2179,6 +2189,10 @@ mod git_tests {
                     0
                 );
                 assert!(!clone.exists());
+                assert_eq!(
+                    run_git_str(Path::new(&remote), &["rev-parse", history_ref]),
+                    current
+                );
                 for reference in [
                     "refs/heads/wip/impl-1-abcd",
                     "refs/heads/wip/impl-1-abcd-dirty",

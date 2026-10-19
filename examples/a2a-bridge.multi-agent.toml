@@ -83,6 +83,7 @@ model       = "gpt-4o-mini"
 # ── Default code review: one Sol/xhigh pass with post-review risk/cost triage ──
 [[workflows]]
 id = "code-review"
+review = true
 [[workflows.nodes]]
 id = "review"
 agent = "codex"
@@ -91,6 +92,7 @@ inputs = []
 
 [[workflows]]
 id = "spec-review"
+review = true
 [[workflows.nodes]]
 id = "rigordraft"
 agent = "codex"
@@ -119,6 +121,7 @@ inputs = ["rigor", "soundness"]
 
 [[workflows]]
 id = "plan-review"
+review = true
 [[workflows.nodes]]
 id = "execdraft"
 agent = "codex"

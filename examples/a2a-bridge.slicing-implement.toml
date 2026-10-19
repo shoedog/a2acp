@@ -166,6 +166,7 @@ model       = "qwen3-coder:480b"
 # ── Review/design workflows (single-pass here; Phase D restructures design/spec/plan into two-pass) ──
 [[workflows]]
 id = "code-review"
+review = true
 [[workflows.nodes]]
 id = "correctness"
 agent = "codex"
@@ -186,6 +187,7 @@ inputs = ["correctness", "architecture"]
 #    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
 [[workflows]]
 id = "implement-review"
+review = true
 [[workflows.nodes]]
 id = "reviewer_codex"
 agent = "codex"
@@ -234,6 +236,7 @@ inputs = []
 
 [[workflows]]
 id = "spec-review"
+review = true
 [[workflows.nodes]]
 id = "rigordraft"
 agent = "codex"
@@ -262,6 +265,7 @@ inputs = ["rigor", "soundness"]
 
 [[workflows]]
 id = "plan-review"
+review = true
 [[workflows.nodes]]
 id = "execdraft"
 agent = "codex"

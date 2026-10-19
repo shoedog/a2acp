@@ -2670,6 +2670,8 @@ async fn run_review_step(
     depth: review::Depth,
     slice: &dyn slice::SliceRunner,
     telemetry: Arc<ImplementAttemptTelemetry>,
+    custody_cfg: &bridge_controller::custody_push::CustodyConfig,
+    evidence_cfg: &bridge_controller::evidence::EvidenceConfig,
 ) -> (review::ReviewOutcome, String) {
     let rcfg = match review_cfg {
         None => return (review::ReviewOutcome::NotConfigured, String::new()),
@@ -2772,15 +2774,55 @@ async fn run_review_step(
         slice_ref.as_deref(),
         verify_outcome,
     );
-    let ctx = bridge_workflow::executor::WorkflowRunContext {
+    let mut ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
         make_rich_sink: Some(telemetry),
         ..bridge_workflow::executor::WorkflowRunContext::default()
     };
     let token = tokio_util::sync::CancellationToken::new();
-    let invocation = bridge_controller::evidence::begin_review(clone_path)
-        .inspect_err(|e| eprintln!("[evidence] warning: review reservation: {e}"))
-        .ok();
+    let publication = if custody_cfg.review_history {
+        let result = implement_resume::load_checkpoint(clone_path).and_then(|ck| {
+            let invocation = bridge_controller::evidence::begin_revision_review(
+                clone_path,
+                &ck,
+                custody_cfg,
+                evidence_cfg,
+                graph_id.as_str(),
+                attempt,
+                head_sha,
+            )?;
+            Ok((ck, invocation))
+        });
+        match result {
+            Ok(value) => Some(value),
+            Err(e) => {
+                return (
+                    review::ReviewOutcome::Refused(format!("review history: {e}")),
+                    String::new(),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let review_snapshot = if publication.is_some() {
+        match bridge_controller::evidence::ReviewSnapshot::new(clone_path, head_sha) {
+            Ok(snapshot) => {
+                match snapshot.cwd() {
+                    Ok(cwd) => ctx.session_cwd = Some(cwd),
+                    Err(e) => return (review::ReviewOutcome::Refused(e), String::new()),
+                }
+                Some(snapshot)
+            }
+            Err(e) => return (review::ReviewOutcome::Refused(e), String::new()),
+        }
+    } else {
+        None
+    };
+    let invocation = publication
+        .as_ref()
+        .map(|(_, id)| *id)
+        .or_else(|| bridge_controller::evidence::begin_review(clone_path).ok());
     let stream = executor.run_with_context(
         graph,
         input,
@@ -2790,23 +2832,53 @@ async fn run_review_step(
     );
     eprintln!("[implement] review: running implement-review (attempt {attempt})");
     let mut drain = std::pin::pin!(drain_review(stream));
+    let mut timed_out = false;
     let (completed, synth, reviewers_failed) = tokio::select! {
         r = &mut drain => r,
         _ = tokio::time::sleep(rcfg.timeout) => {
             eprintln!("[implement] review: timed out after {:?}", rcfg.timeout);
+            timed_out = true;
             token.cancel();
             (&mut drain).await
         }
     };
-    if !completed {
-        return (review::ReviewOutcome::Incomplete, String::new());
-    }
-    if let Some(invocation) = invocation {
-        if let Err(e) =
-            bridge_controller::evidence::complete_review(clone_path, attempt, invocation, &synth)
-        {
-            eprintln!("[evidence] warning: review persistence: {e}");
+    let snapshot_valid = review_snapshot
+        .as_ref()
+        .is_none_or(|s| s.validate(head_sha).is_ok());
+    if publication.is_none() && completed && !timed_out {
+        if let Some(invocation) = invocation {
+            if let Err(e) = bridge_controller::evidence::complete_review(
+                clone_path, attempt, invocation, &synth,
+            ) {
+                eprintln!("[evidence] warning: review persistence: {e}");
+            }
         }
+    }
+    if let Some((ck, invocation)) = publication {
+        if let Err(e) = bridge_controller::evidence::finish_revision_review(
+            clone_path,
+            &ck,
+            evidence_cfg,
+            invocation,
+            completed && !timed_out && snapshot_valid,
+            &synth,
+        ) {
+            return (
+                review::ReviewOutcome::Refused(format!("review history: {e}")),
+                synth,
+            );
+        }
+    }
+    if !snapshot_valid {
+        return (
+            review::ReviewOutcome::Refused(
+                "review snapshot changed; labels remain incomplete".into(),
+            ),
+            synth,
+        );
+    }
+    if !completed || timed_out {
+        return (review::ReviewOutcome::Incomplete, String::new());
     }
     let (verdict, summary) = review::parse_verdict(&synth);
     if !matches!(verdict, review::Verdict::Approve) {
@@ -3078,6 +3150,7 @@ struct ProdEffects<'a> {
     run: &'a bridge_core::run_identity::RunHandle,
     verify_owner: &'a str,
     custody_cfg: &'a bridge_controller::custody_push::CustodyConfig,
+    evidence_cfg: &'a bridge_controller::evidence::EvidenceConfig,
 }
 
 #[async_trait::async_trait]
@@ -3132,6 +3205,8 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             self.depth,
             &slice::ProdSliceRunner,
             self.telemetry.clone(),
+            self.custody_cfg,
+            self.evidence_cfg,
         )
         .await
     }
@@ -3467,6 +3542,7 @@ async fn run_warm_loop(
             run,
             verify_owner,
             custody_cfg,
+            evidence_cfg,
         };
         tweak::run_tweak_loop(
             clone,
@@ -4897,6 +4973,35 @@ fn validate_local_session_cwd(
     Ok(requested_session_cwd)
 }
 
+fn admitted_review_checkout(
+    admitted: &bridge_workflow::admission::AdmittedWorkflowRunV1,
+) -> Result<PathBuf, BoxError> {
+    use bridge_core::execution_policy::FrozenCheckoutEffectV1;
+    let mut paths = std::collections::BTreeSet::new();
+    for node in &admitted.run_spec.node_execution_identities {
+        for attempt in &node.provider_attempts {
+            let FrozenCheckoutEffectV1::Direct { effective_cwd, .. } = &attempt.checkout else {
+                return Err(
+                    "review history requires one direct checkout; worktree reviews are unsupported"
+                        .into(),
+                );
+            };
+            paths.insert(PathBuf::from(effective_cwd.as_str()).canonicalize()?);
+        }
+    }
+    if paths.len() != 1 {
+        return Err("review history refuses multiple admitted checkouts".into());
+    }
+    let path = paths.into_iter().next().unwrap();
+    if !path.join(".git").exists() && path.ancestors().skip(1).any(|p| p.join(".git").exists()) {
+        return Err(
+            "review history requires a repository-root cwd; subdirectory reviews are unsupported"
+                .into(),
+        );
+    }
+    Ok(path)
+}
+
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
@@ -4947,14 +5052,22 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     write_run_workflow_brief_lint_artifact(
-        out_path.as_deref(),
+        None,
         Some(&run_artifact_root),
         Some(&run_id),
         &brief_lint,
         strict_brief,
     );
 
-    enforce_strict_brief_lint("run-workflow", &brief_lint, strict_brief)?;
+    enforce_strict_brief_lint("run-workflow", &brief_lint, strict_brief).inspect_err(|_| {
+        write_run_workflow_brief_lint_artifact(
+            out_path.as_deref(),
+            None,
+            None,
+            &brief_lint,
+            strict_brief,
+        );
+    })?;
     if let Err(e) = bridge_core::task_spec::validate_input(&input) {
         eprintln!("{}", e.client_message());
         return Err(e.into());
@@ -4991,7 +5104,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // turn the warm-up into an agent/container effect.  Keep the original parsed cwd for the
     // workflow: canonical paths are only the containment proof, not a change to direct-mode cwd
     // semantics.
-    let requested_session_cwd =
+    let mut requested_session_cwd =
         validate_local_session_cwd(&session_cwd, cfg.allowed_cwd_root.as_deref())?;
 
     // Resolve prompt file base dir (same logic as `serve`).
@@ -5236,6 +5349,62 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         })
         .await
         .map_err(|error| format!("run-workflow: frozen admission failed: {error:?}"))?;
+
+    let review_enabled = admission_cfg.custody.review_history
+        && admission_cfg
+            .workflows
+            .iter()
+            .any(|workflow| workflow.id == workflow_id && workflow.review);
+    let review_clone = if review_enabled {
+        admitted_review_checkout(&authority)?
+    } else {
+        run_artifact_root.clone()
+    };
+    if review_enabled && review_clone.join(".git").is_file() {
+        return Err("review history requires a standalone repository checkout".into());
+    }
+    let _review_lock = if review_enabled && review_clone.join(".git").is_dir() {
+        Some(implement_resume::acquire_operation_lock(&review_clone)?)
+    } else {
+        None
+    };
+    let review_publication = if _review_lock.is_some() {
+        let mut ck = implement_resume::workflow_review_checkpoint(&review_clone)?
+            .ok_or("review checkpoint unavailable")?;
+        let sha = bridge_controller::evidence::review_head(&review_clone)?;
+        ck.current_commit = Some(sha.clone());
+        let invocation = bridge_controller::evidence::begin_revision_review(
+            &review_clone,
+            &ck,
+            &admission_cfg.custody,
+            &admission_cfg.evidence,
+            &workflow_id,
+            1,
+            &sha,
+        )?;
+        let snapshot = bridge_controller::evidence::ReviewSnapshot::new(&review_clone, &sha)?;
+        requested_session_cwd = Some(snapshot.cwd()?);
+        // Freeze again so execution, delivery fingerprints and persisted authority all name the snapshot.
+        authority = workflow_admission
+            .freeze(bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+                attempt_id: identity.attempt_id.clone(),
+                graph: graph.clone(),
+                requested_session_cwd: requested_session_cwd.clone(),
+                policy_invocation: bridge_core::execution_policy::ExecutionPolicyInvocationV1 {
+                    silence_cutoff,
+                    ..Default::default()
+                },
+                ledger_admission: authority.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await?;
+        if admitted_review_checkout(&authority)? != snapshot.path.canonicalize()? {
+            return Err("review snapshot differs from admitted checkout".into());
+        }
+        Some((ck, invocation, snapshot))
+    } else {
+        None
+    };
 
     // Optional history remains fail-open except for identity collision and an
     // unsupported physical-accounting configuration. Both fail closed before
@@ -5765,6 +5934,30 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         terminal_outcome = "failed";
         ok = false;
     }
+
+    if let Some((ck, invocation, snapshot)) = review_publication {
+        let snapshot_valid = snapshot
+            .validate(ck.current_commit.as_deref().unwrap())
+            .is_ok();
+        bridge_controller::evidence::finish_revision_review(
+            &review_clone,
+            &ck,
+            &admission_cfg.evidence,
+            invocation,
+            ok && terminal_seen && snapshot_valid,
+            &output,
+        )?;
+        if !snapshot_valid {
+            return Err("review snapshot changed; labels remain incomplete".into());
+        }
+    }
+    write_run_workflow_brief_lint_artifact(
+        out_path.as_deref(),
+        None,
+        None,
+        &brief_lint,
+        strict_brief,
+    );
 
     // Write output.
     let output_error = if let Some(out) = out_path {
@@ -7414,6 +7607,7 @@ description = "design synthesis prompt"
 # ── Default code review: one Sol/xhigh pass with post-review risk/cost triage ──
 [[workflows]]
 id = "code-review"
+review = true
 [[workflows.nodes]]
 id = "review"
 agent = "codex"
@@ -7423,6 +7617,7 @@ inputs = []
 # ── implement-review: the same one-turn Sol/xhigh risk-triaged review ──
 [[workflows]]
 id = "implement-review"
+review = true
 [[workflows.nodes]]
 id = "review"
 agent = "codex"
@@ -7431,6 +7626,7 @@ inputs = []
 
 [[workflows]]
 id = "spec-review"
+review = true
 [[workflows.nodes]]
 id = "rigor"
 agent = "codex"
@@ -7449,6 +7645,7 @@ inputs = ["rigor", "soundness"]
 
 [[workflows]]
 id = "plan-review"
+review = true
 [[workflows.nodes]]
 id = "exec"
 agent = "codex"
@@ -13235,10 +13432,391 @@ while not finished.exists(): time.sleep(0.001)
         }
     }
 
+    #[test]
+    fn local_review_designation_is_explicit_and_defaults_to_false() {
+        for id in [
+            "audit",
+            "preview",
+            "code-review",
+            "spec-review-oc",
+            "implement-review-light",
+        ] {
+            for flag in ["", "review = false", "review = true"] {
+                let workflow: config::WorkflowToml =
+                    toml::from_str(&format!("id = {id:?}\n{flag}")).unwrap();
+                assert_eq!(workflow.review, flag == "review = true");
+            }
+        }
+    }
+
+    // Inspect every shipped workflow's review prompts, rather than relying on a naming convention.
+    fn shipped_review_workflows() -> std::collections::BTreeSet<String> {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut ids = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(examples).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let cfg = config::RegistryConfig::parse(&raw).unwrap();
+            for workflow in cfg.workflows {
+                let has_review_prompt = workflow.nodes.iter().any(|node| {
+                    node.prompt.as_deref().is_some_and(|p| p.contains("review"))
+                        || node
+                            .prompt_file
+                            .as_deref()
+                            .is_some_and(|p| p.contains("review"))
+                });
+                if has_review_prompt {
+                    assert!(
+                        workflow.review,
+                        "{}: {} lacks review = true",
+                        path.display(),
+                        workflow.id
+                    );
+                    ids.insert(workflow.id);
+                }
+            }
+        }
+        for id in [
+            "code-review",
+            "spec-review",
+            "plan-review",
+            "spec-review-oc",
+            "plan-review-oc",
+        ] {
+            assert!(ids.contains(id), "missing shipped review workflow {id}");
+        }
+        ids
+    }
+
+    #[test]
+    fn every_shipped_review_workflow_is_explicitly_designated() {
+        shipped_review_workflows();
+        let initialized = build_init_config(&["codex".into(), "claude".into()], None).unwrap();
+        let cfg = config::RegistryConfig::parse(&initialized).unwrap();
+        for workflow in cfg.workflows {
+            assert_eq!(workflow.review, workflow.id != "design", "{}", workflow.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_history_workflow_without_checkpoint_or_out_archives_exact_revision() {
+        if let Ok(raw) = std::env::var("A2A_TEST_REVIEW_ARGS") {
+            let args: Vec<String> = serde_json::from_str(&raw).unwrap();
+            run_workflow_cmd(&args).await.unwrap();
+            return;
+        }
+        let (root, source, clone, remote) = custody_fixture();
+        std::fs::remove_file(implement_resume::checkpoint_path(&clone)).unwrap();
+        custody_git(&clone, &["config", "user.name", "Fixture"]);
+        custody_git(&clone, &["config", "user.email", "fixture@example.invalid"]);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("work", clone.join("internal-link")).unwrap();
+            custody_git(&clone, &["add", "internal-link"]);
+            custody_git(
+                &clone,
+                &["commit", "-qm", "internal symlink review fixture"],
+            );
+        }
+
+        let adapter = root.path().join("reviewer.py");
+        std::fs::write(&adapter, r#"
+import json, sys, pathlib, subprocess
+source = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req: continue
+    method = req.get('method')
+    result = {}
+    if method == 'initialize': result = {'protocolVersion':1, 'agentCapabilities':{}, 'authMethods':[]}
+    if method == 'session/new':
+        reviewed = pathlib.Path(req['params']['cwd'])
+        result = {'sessionId':'review'}
+    if method == 'session/prompt':
+        with open(pathlib.Path(__file__).with_name('prompts.log'), 'a') as log: log.write('prompt\n')
+        if mode == 'review':
+            # The immutable ref and incomplete reservation must exist before prompt dispatch.
+            records = json.loads((source / '.git/a2a-bridge/review-history.json').read_text())
+            record = records[-1]
+            remote = pathlib.Path(sys.argv[3])
+            published = subprocess.check_output(['git', '-C', str(remote), 'rev-parse', record['reference']], text=True).strip()
+            assert published == record['reviewed_sha'] and record['status'] == 'incomplete'
+            link = reviewed / 'internal-link'
+            assert link.is_symlink() and link.readlink() == pathlib.Path('work')
+            assert link.read_text() == (reviewed / 'work').read_text()
+            # Synchronized edit/read/restore: an original-checkout reader would see the wrong bytes.
+            original = (source / 'work').read_text()
+            (source / 'work').write_text('transient editor change')
+            observed = (reviewed / 'work').read_text()
+            (source / 'work').write_text(original)
+            assert reviewed != source and observed == original
+        print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'review','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'VERDICT: APPROVE\nSUMMARY: standalone review'}}}}), flush=True)
+        result = {'stopReason':'end_turn'}
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+"#).unwrap();
+        let launch_clone = root.path().join("launch-clone");
+        custody_git(
+            &source,
+            &[
+                "clone",
+                "-q",
+                source.to_str().unwrap(),
+                launch_clone.to_str().unwrap(),
+            ],
+        );
+        assert_ne!(
+            custody_git(&launch_clone, &["rev-parse", "HEAD"]),
+            custody_git(&clone, &["rev-parse", "HEAD"])
+        );
+        let config = root.path().join("workflow.toml");
+        std::fs::write(root.path().join("prompt.md"), "Review {{input}}").unwrap();
+        let evidence = root.path().join("evidence");
+        std::fs::write(
+            &config,
+            format!(
+                r#"default = "reviewer"
+[[agents]]
+id = "reviewer"
+cmd = "python3"
+args = ["{}", "{}", "review", "{}"]
+session_cwd = "{}"
+[[workflows]]
+id = "code-review"
+review = true
+[[workflows.nodes]]
+id = "review"
+agent = "reviewer"
+prompt_file = "prompt.md"
+inputs = []
+[store]
+path = "{}"
+[evidence]
+path = "{}"
+[server]
+"#,
+                adapter.display(),
+                clone.display(),
+                remote.display(),
+                clone.display(),
+                root.path().join("history.sqlite").display(),
+                evidence.display()
+            ),
+        )
+        .unwrap();
+        let brief = root.path().join("brief.md");
+        std::fs::write(
+            &brief,
+            "---\ntask-type: freeform\n---\nReview the committed change.",
+        )
+        .unwrap();
+        let args = vec![
+            "code-review".into(),
+            "--input".into(),
+            brief.to_string_lossy().into(),
+            "--config".into(),
+            config.to_string_lossy().into(),
+        ];
+        assert!(custody_git(&remote, &["for-each-ref", "refs/review-history/"]).is_empty());
+        for out in [
+            None,
+            Some(clone.join("review.md")),
+            Some(root.path().join("review.md")),
+        ] {
+            let mut command = args.clone();
+            if let Some(path) = &out {
+                command.extend(["--out".into(), path.to_string_lossy().into()]);
+            }
+            if out.is_none() {
+                // Launch from clean clone A; every reviewer is configured for different clone B.
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "cli_tests::review_history_workflow_without_checkpoint_or_out_archives_exact_revision", "--nocapture"])
+                    .current_dir(&launch_clone)
+                    .env("A2A_TEST_REVIEW_ARGS", serde_json::to_string(&command).unwrap())
+                    .output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(!launch_clone
+                    .join(".git/a2a-bridge/review-history.json")
+                    .exists());
+                assert!(custody_git(&launch_clone, &["status", "--porcelain"]).is_empty());
+            } else {
+                // Cargo's nongit launch directory exercises the other source-selection case.
+                run_workflow_cmd(&command).await.unwrap();
+            }
+            if let Some(path) = out {
+                assert!(path.is_file());
+                let sidecar = run_workflow_brief_lint_artifact_path(&path);
+                assert!(sidecar.is_file());
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_file(sidecar).unwrap();
+            }
+        }
+        let configured = std::fs::read_to_string(&config).unwrap();
+        let shipped_ids = shipped_review_workflows();
+        for id in &shipped_ids {
+            std::fs::write(
+                &config,
+                configured.replace("id = \"code-review\"", &format!("id = {id:?}")),
+            )
+            .unwrap();
+            let mut command = args.clone();
+            command[0] = id.clone();
+            run_workflow_cmd(&command).await.unwrap();
+        }
+
+        std::fs::write(
+            &config,
+            format!(
+                r#"{configured}
+[[agents]]
+id = "second"
+cmd = "python3"
+args = ["{}"]
+session_cwd = "{}"
+[[workflows.nodes]]
+id = "second"
+agent = "second"
+prompt_file = "prompt.md"
+inputs = ["review"]
+"#,
+                adapter.display(),
+                source.display()
+            ),
+        )
+        .unwrap();
+        assert!(run_workflow_cmd(&args)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("multiple admitted checkouts"));
+        // Neither a review-looking id, typed brief nor [review].workflow makes a local run a review.
+        let refs_before = custody_git(&remote, &["for-each-ref", "refs/review-history/"]);
+        let nonreview = configured.replace("review = true", "review = false")
+            + "\n[review]\nworkflow='code-review'\n";
+        std::fs::write(&config, nonreview).unwrap();
+        std::fs::write(&brief, "---\ntask-type: code-review\n---\n# Review\n\n## Description\nCheck the change.\n\n## Acceptance Criteria\nReport findings.\n").unwrap();
+        // The fake reviewer must use the original cwd and skip its snapshot assertions.
+        let nonreview = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("\"review\",", "\"preview\",");
+        std::fs::write(&config, nonreview).unwrap();
+        std::fs::write(clone.join("untracked"), "dirty").unwrap();
+        run_workflow_cmd(&args).await.unwrap();
+        assert_eq!(
+            custody_git(&remote, &["for-each-ref", "refs/review-history/"]),
+            refs_before
+        );
+        std::fs::remove_file(clone.join("untracked")).unwrap();
+        std::fs::write(
+            &brief,
+            "---\ntask-type: freeform\n---\nReview the committed change.",
+        )
+        .unwrap();
+        // A custom local review is designated on the workflow itself, without [review].workflow.
+        std::fs::write(
+            &config,
+            configured.replace("id = \"code-review\"", "id = \"audit\""),
+        )
+        .unwrap();
+        let mut audit_args = args.clone();
+        audit_args[0] = "audit".into();
+        run_workflow_cmd(&audit_args).await.unwrap();
+        std::fs::write(&config, configured).unwrap();
+        std::fs::write(clone.join("untracked"), "dirty").unwrap();
+        assert!(run_workflow_cmd(&args)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("clean checkout"));
+        std::fs::remove_file(clone.join("untracked")).unwrap();
+        #[cfg(unix)]
+        {
+            let outside = root.path().join("outside");
+            std::fs::write(&outside, "outside").unwrap();
+            std::os::unix::fs::symlink(&outside, clone.join("escape")).unwrap();
+            custody_git(&clone, &["add", "escape"]);
+            custody_git(
+                &clone,
+                &["commit", "-qm", "escaping symlink review fixture"],
+            );
+            let error = run_workflow_cmd(&args).await.unwrap_err().to_string();
+            assert!(error.contains("symlink escapes snapshot"), "{error}");
+            custody_git(&clone, &["rm", "escape"]);
+            custody_git(&clone, &["commit", "-qm", "remove escaping symlink"]);
+        }
+        custody_git(&clone, &["remote", "remove", "origin"]);
+        assert!(run_workflow_cmd(&args)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no origin"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("prompts.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            5 + shipped_ids.len()
+        );
+        let bytes = std::fs::read(clone.join(".git/a2a-bridge/review-history.json")).unwrap();
+        let records: Vec<bridge_controller::evidence::ReviewRevision> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            records.len(),
+            4 + shipped_ids.len() + usize::from(cfg!(unix))
+        );
+        assert_eq!(records[3 + shipped_ids.len()].workflow, "audit");
+        let record = &records[0];
+        assert_eq!(record.workflow, "code-review");
+        assert_eq!(record.verdict, "Approve");
+        assert_eq!(record.findings_summary, "standalone review");
+        assert_eq!(
+            custody_git(&remote, &["rev-parse", &record.reference]),
+            record.reviewed_sha
+        );
+        let archive = evidence
+            .join(bridge_controller::evidence::repo_key(&source).unwrap())
+            .join(format!("{}.tar.gz", records.last().unwrap().run_id));
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(archive).unwrap(),
+        ));
+        let manifest = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.path().unwrap().as_ref() == Path::new("manifest.json"))
+            .unwrap();
+        let manifest: bridge_controller::evidence::Manifest =
+            serde_json::from_reader(manifest).unwrap();
+        assert_eq!(
+            serde_json::to_value(&manifest.review_history).unwrap(),
+            serde_json::to_value(&records).unwrap()
+        );
+        for (index, id) in shipped_ids.iter().enumerate() {
+            let record = &records[3 + index];
+            assert_eq!(&record.workflow, id);
+            assert_eq!(record.status, "completed");
+            assert_eq!(record.verdict, "Approve");
+            assert_eq!(record.findings_summary, "standalone review");
+            assert_eq!(
+                custody_git(&remote, &["rev-parse", &record.reference]),
+                record.reviewed_sha
+            );
+        }
+    }
+
     #[tokio::test]
     async fn custody_precedes_first_review_and_resumed_review_after_unrecorded_amend() {
         use tweak::TweakEffects;
         let (_root, source, clone, remote) = custody_fixture();
+        std::fs::write(clone.join(".git/A2A_TASK.md"), "task").unwrap();
         let state = Arc::new(ReviewTelemetryState::default());
         let executor =
             bridge_workflow::executor::WorkflowExecutor::new(Arc::new(ReviewTelemetryRegistry {
@@ -13317,6 +13895,10 @@ while not finished.exists(): time.sleep(0.001)
                 profile: None,
                 review_cfg: &review_cfg,
                 custody_cfg: &cfg,
+                evidence_cfg: &bridge_controller::evidence::EvidenceConfig {
+                    path: Some(clone.parent().unwrap().join("evidence")),
+                    ..Default::default()
+                },
                 wf_map: &workflows,
                 executor: &executor,
                 runner: &runner,
@@ -13337,13 +13919,16 @@ while not finished.exists(): time.sleep(0.001)
             let (outcome, _) = effects
                 .review(1, &sha, &verify::VerifyOutcome::NotConfigured)
                 .await;
-            assert!(matches!(
-                outcome,
-                review::ReviewOutcome::Ran {
-                    verdict: review::Verdict::Approve,
-                    ..
-                }
-            ));
+            assert!(
+                matches!(
+                    outcome,
+                    review::ReviewOutcome::Ran {
+                        verdict: review::Verdict::Approve,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
             assert_eq!(
                 implement_resume::load_custody(&clone)
                     .unwrap()
@@ -14821,6 +15406,11 @@ esac
                     *sha,
                     "the remote must contain HEAD before the reviewer receives its prompt"
                 );
+                assert!(
+                    custody_git(remote, &["for-each-ref", "--format=%(objectname)", "refs/review-history/impl-test/"])
+                        .lines().any(|oid| oid == sha),
+                    "the reviewed revision must have an immutable history ref before prompt dispatch"
+                );
             }
             self.state.activity_owned.store(
                 observers
@@ -14976,6 +15566,8 @@ esac
             review::Depth::Auto,
             &slice::ProdSliceRunner,
             ImplementAttemptTelemetry::new("refusal"),
+            &Default::default(),
+            &Default::default(),
         )
         .await;
         assert!(
@@ -15055,6 +15647,11 @@ esac
             review::Depth::Forced(review::Tier::Standard),
             &NoReviewSlice,
             telemetry.clone(),
+            &bridge_controller::custody_push::CustodyConfig {
+                review_history: false,
+                ..Default::default()
+            },
+            &Default::default(),
         )
         .await;
 
@@ -15183,6 +15780,7 @@ esac
                 push: false,
                 ..Default::default()
             },
+            evidence_cfg: &Default::default(),
             review_cfg: &review_cfg,
             wf_map: &wf_map,
             executor: &executor,
@@ -18643,7 +19241,11 @@ The command prints schemas, templates, and validates input.
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.md");
         let out = dir.path().join("out.md");
-        std::fs::write(&input, valid_implement_task_spec()).unwrap();
+        std::fs::write(
+            &input,
+            "---\ntask-type: freeform\n---\nCustom workflow brief\n",
+        )
+        .unwrap();
         let args: Vec<String> = vec![
             "--serve".into(),
             "--url".into(),
@@ -18709,7 +19311,11 @@ The command prints schemas, templates, and validates input.
             .await;
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.md");
-        std::fs::write(&input, valid_implement_task_spec()).unwrap();
+        std::fs::write(
+            &input,
+            "---\ntask-type: freeform\n---\nCustom workflow brief\n",
+        )
+        .unwrap();
         let args: Vec<String> = vec![
             "--serve".into(),
             "--url".into(),
