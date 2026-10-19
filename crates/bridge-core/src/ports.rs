@@ -2,7 +2,7 @@
 // All traits live here so adapter crates depend on core, never the reverse.
 
 use crate::{attestation::*, domain::*, error::BridgeError, ids::*};
-use futures::Stream;
+pub use futures::Stream;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -351,6 +351,18 @@ impl BackendCleanupDispositionV1 {
 /// Streaming agent backend — adapters implement this; core never depends on adapters.
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
+    /// Explicit accounting dispatch, independent of optional observers. Only an outer
+    /// accounting decorator accepts this handle; legacy backends refuse it.
+    async fn prompt_accounted_v1(
+        &self,
+        _session: &SessionId,
+        _parts: Vec<Part>,
+        _attempt: crate::accounting::PreparedUsageAttemptV1,
+        _observers: Option<BackendObservers>,
+    ) -> Result<BackendStream, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     async fn prompt(
         &self,
         session: &SessionId,

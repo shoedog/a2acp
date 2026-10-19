@@ -1,5 +1,7 @@
 //! bridge-core — domain core: Task/Session state machines, port traits, error model.
 
+pub mod accounting;
+pub mod accounting_backend;
 pub mod attempt_activity;
 pub mod attestation;
 pub mod brief_lint;

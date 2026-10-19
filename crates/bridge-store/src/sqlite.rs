@@ -1,3 +1,4 @@
+use bridge_core::accounting::{summarize_v1, UsageAttemptV1, UsageQueryV1, UsageSummaryV1};
 // sqlite.rs — SQLite-backed SessionStore (spec §7, Task 9).
 
 use bridge_core::{
@@ -814,6 +815,7 @@ struct HistoryDirectory {
 /// and a per-task pending-request that is cleared atomically on first read.
 pub struct SqliteStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    usage_conn: Mutex<Option<UsageConnectionV1>>,
     // Declared after `conn` so SQLite and its managed sidecars close before the
     // retained canonical-parent descriptor.
     history_parent: Option<HistoryParent>,
@@ -974,6 +976,177 @@ impl Drop for ConfiguredHistoryWriteGuard<'_> {
     }
 }
 
+/// SQLite owns sidecar names within the same trusted directory as history allocations.
+/// Retain only directory descriptors and database/sidecar identities. Opening or
+/// closing these files outside SQLite can release another handle's POSIX locks;
+/// SQLite itself coordinates same-inode connection teardown within the process.
+struct UsageConnectionV1 {
+    conn: rusqlite::Connection,
+    allocation: Option<UsageAllocationV1>,
+}
+// The identity fields are read only by the Unix descriptor checks; other targets refuse history writers up front.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct UsageAllocationV1 {
+    parent: HistoryParent,
+    path: std::path::PathBuf,
+    files: Vec<(String, (u64, u64))>,
+}
+impl UsageAllocationV1 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn check(&mut self, allow_missing_database: bool) -> Result<(), BridgeError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        let mut check = || -> Result<(), LedgerError> {
+            self.parent.revalidate()?;
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let name = history_child_name(&self.parent.database_name, suffix)?;
+                let Some((dev, ino, links, _)) =
+                    history_entry_identity_if_present(&self.parent.directory, &name, false)?
+                else {
+                    if self.files.iter().any(|(s, _)| s == suffix)
+                        || (suffix.is_empty() && !allow_missing_database)
+                    {
+                        return Err(LedgerError::new(R::Open));
+                    }
+                    continue;
+                };
+                if links != 1 {
+                    return Err(LedgerError::new(R::Open));
+                }
+                let identity = (dev, ino);
+                if let Some((_, retained)) = self.files.iter().find(|(s, _)| s == suffix) {
+                    if *retained != identity {
+                        return Err(LedgerError::new(R::Open));
+                    }
+                } else {
+                    self.files.push((suffix.to_owned(), identity));
+                }
+            }
+            Ok(())
+        };
+        check().map_err(|_| BridgeError::StoreFailure)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn restrict_permissions(&self) -> Result<(), BridgeError> {
+        use std::os::fd::AsRawFd as _;
+        let name = history_child_name(&self.parent.database_name, "")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        // The canonical parent is the trusted namespace boundary. fchmodat with
+        // flags=0 changes permissions without opening a database descriptor.
+        if unsafe { libc::fchmodat(self.parent.directory.as_raw_fd(), name.as_ptr(), 0o600, 0) }
+            != 0
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn restrict_permissions(&self) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn check(&mut self, _: bool) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+}
+impl SqliteStore {
+    fn with_usage_conn<T>(
+        &self,
+        f: impl FnOnce(&mut rusqlite::Connection) -> Result<T, BridgeError>,
+    ) -> Result<T, BridgeError> {
+        let mut slot = self
+            .usage_conn
+            .lock()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if slot.is_none() {
+            let primary = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
+            let read_only = primary
+                .is_readonly(rusqlite::DatabaseName::Main)
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let path = primary
+                .path()
+                .filter(|s| !s.is_empty())
+                .map(|s| std::path::PathBuf::from(format!("{s}.usage-v1.sqlite")));
+            drop(primary);
+            let mut allocation = None;
+            if let Some(path) = &path {
+                let path = canonical_history_path(path).map_err(|_| BridgeError::StoreFailure)?;
+                if read_only && !path.try_exists().map_err(|_| BridgeError::StoreFailure)? {
+                    let mut conn = rusqlite::Connection::open_in_memory()
+                        .map_err(|_| BridgeError::StoreFailure)?;
+                    Self::usage_schema_v1(&conn, 0)?;
+                    conn.pragma_update(None, "query_only", true)
+                        .map_err(|_| BridgeError::StoreFailure)?;
+                    return f(&mut conn);
+                }
+                let parent = if read_only {
+                    HistoryParent::open(&path)
+                } else {
+                    HistoryParent::prove(&path)
+                }
+                .map_err(|_| BridgeError::StoreFailure)?;
+                let mut guard = UsageAllocationV1 {
+                    parent,
+                    path,
+                    files: Vec::new(),
+                };
+                guard.check(!read_only)?;
+                allocation = Some(guard);
+            }
+            let conn = if let Some(guard) = &allocation {
+                let flags = if read_only {
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                } else {
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                };
+                rusqlite::Connection::open_with_flags(
+                    &guard.path,
+                    flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )
+            } else {
+                rusqlite::Connection::open_in_memory()
+            }
+            .map_err(|_| BridgeError::StoreFailure)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| BridgeError::StoreFailure)?;
+            if let Some(guard) = &mut allocation {
+                guard.check(false)?;
+                if !read_only {
+                    // SQLite creates an empty file; restrict it before any
+                    // accounting data or schema is written.
+                    guard.restrict_permissions()?;
+                    guard.check(false)?;
+                }
+            }
+            if !read_only {
+                Self::usage_schema_v1(&conn, (self.now_ms)())?;
+            }
+            *slot = Some(UsageConnectionV1 { conn, allocation });
+        }
+        let state = slot.as_mut().ok_or(BridgeError::StoreFailure)?;
+        if let Some(guard) = &mut state.allocation {
+            guard.check(false)?;
+        }
+        let result = f(&mut state.conn);
+        if let Some(guard) = &mut state.allocation {
+            guard.check(false)?;
+        }
+        result
+    }
+    fn usage_schema_v1(conn: &rusqlite::Connection, started: i64) -> Result<(), BridgeError> {
+        conn.execute_batch("PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS usage_coverage_v1 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), started_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS usage_attempts_v1 (id TEXT PRIMARY KEY, record_json TEXT NOT NULL);")
+            .map_err(|_| BridgeError::StoreFailure)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO usage_coverage_v1 VALUES(1, ?1)",
+            [started],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        Ok(())
+    }
+}
+
 impl SqliteStore {
     /// Open an in-memory database (suitable for tests).
     pub fn open_in_memory() -> Result<Self, BridgeError> {
@@ -988,6 +1161,7 @@ impl SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             history_parent: None,
             now_ms,
             _lock: None,
@@ -1175,6 +1349,7 @@ impl SqliteStore {
         }
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             history_parent: Some(history_parent),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: Some(lock),
@@ -1346,6 +1521,7 @@ impl SqliteStore {
             .map_err(|error| history_error(&error))?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
             history_parent: Some(history_parent),
@@ -1406,6 +1582,7 @@ impl SqliteStore {
         .map_err(|error| history_migration_error(&error))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             history_parent: None,
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
@@ -1453,6 +1630,7 @@ impl SqliteStore {
         .map_err(|error| history_migration_error(&error))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             history_parent: None,
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
@@ -1530,6 +1708,7 @@ impl SqliteStore {
         .map_err(|error| history_migration_error(&error))?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            usage_conn: Mutex::new(None),
             history_parent: Some(history_parent),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
@@ -4260,6 +4439,100 @@ impl HarvestAuditStore for SqliteStore {
 
 #[async_trait::async_trait]
 impl bridge_core::task_store::TaskStore for SqliteStore {
+    async fn start_usage_attempt_v1(&self, row: &UsageAttemptV1) -> Result<(), BridgeError> {
+        bridge_core::ids::AttemptId::parse(&row.id)?;
+        if row.dispatched
+            || row.finalized
+            || row.cost_invalid
+            || row.usage != Default::default()
+            || row.utc_day != row.started_ms.div_euclid(86_400_000)
+            || row
+                .attribution
+                .execution
+                .as_deref()
+                .and_then(|s| bridge_core::ids::ExecutionId::parse(s).ok())
+                .is_none()
+            || row
+                .attribution
+                .run_attempt
+                .as_deref()
+                .and_then(|s| bridge_core::ids::AttemptId::parse(s).ok())
+                .is_none()
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        self.with_usage_conn(|conn| {
+            let json = serde_json::to_string(row).map_err(|_| BridgeError::StoreFailure)?;
+            conn.execute(
+                "INSERT INTO usage_attempts_v1 VALUES(?1, ?2)",
+                rusqlite::params![row.id, json],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+            Ok(())
+        })
+    }
+    async fn update_usage_attempt_v1(
+        &self,
+        id: &str,
+        dispatched: bool,
+        usage: Option<bridge_core::orch::UsageSnapshot>,
+        finalized: bool,
+    ) -> Result<(), BridgeError> {
+        self.with_usage_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let json: String = tx
+                .query_row(
+                    "SELECT record_json FROM usage_attempts_v1 WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut row: UsageAttemptV1 =
+                serde_json::from_str(&json).map_err(|_| BridgeError::StoreFailure)?;
+            if !row.finalized {
+                row.dispatched |= dispatched;
+                if let Some(usage) = usage {
+                    row.observe(usage);
+                }
+                row.finalized = finalized;
+                let json = serde_json::to_string(&row).map_err(|_| BridgeError::StoreFailure)?;
+                tx.execute(
+                    "UPDATE usage_attempts_v1 SET record_json=?2 WHERE id=?1",
+                    rusqlite::params![id, json],
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            }
+            tx.commit().map_err(|_| BridgeError::StoreFailure)
+        })
+    }
+    async fn usage_summary_v1(&self, query: &UsageQueryV1) -> Result<UsageSummaryV1, BridgeError> {
+        self.with_usage_conn(|conn| {
+            let coverage = conn
+                .query_row(
+                    "SELECT started_ms FROM usage_coverage_v1 WHERE singleton=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut stmt = conn
+                .prepare("SELECT record_json FROM usage_attempts_v1 ORDER BY id")
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|_| BridgeError::StoreFailure)?;
+            let mut attempts = Vec::new();
+            for row in rows {
+                attempts.push(
+                    serde_json::from_str(&row.map_err(|_| BridgeError::StoreFailure)?)
+                        .map_err(|_| BridgeError::StoreFailure)?,
+                );
+            }
+            summarize_v1(coverage, attempts, query)
+        })
+    }
+
     fn workflow_ledger_admission(&self) -> bridge_core::execution_policy::LedgerAdmissionV1 {
         bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
     }
@@ -10151,13 +10424,23 @@ fn history_file_identity(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(clippy::unnecessary_cast)]
 fn history_entry_identity(
     directory: &std::fs::File,
     name: &std::ffi::CStr,
     require_directory: bool,
     missing: bridge_core::workflow_history::LedgerUnavailableReason,
 ) -> Result<(u64, u64, u64, u32), bridge_core::workflow_history::LedgerError> {
+    history_entry_identity_if_present(directory, name, require_directory)?
+        .ok_or_else(|| bridge_core::workflow_history::LedgerError::new(missing))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+fn history_entry_identity_if_present(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    require_directory: bool,
+) -> Result<Option<(u64, u64, u64, u32)>, bridge_core::workflow_history::LedgerError> {
     use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
     use std::os::fd::AsRawFd as _;
 
@@ -10173,7 +10456,7 @@ fn history_entry_identity(
     if result != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::NotFound {
-            return Err(LedgerError::new(missing));
+            return Ok(None);
         }
         return Err(history_parent_permission_error(&error, R::Io));
     }
@@ -10187,12 +10470,12 @@ fn history_entry_identity(
     if file_type != expected || stat.st_uid != unsafe { libc::geteuid() } {
         return Err(LedgerError::new(R::Open));
     }
-    Ok((
+    Ok(Some((
         stat.st_dev as u64,
         stat.st_ino as u64,
         stat.st_nlink as u64,
         stat.st_mode as u32 & 0o777,
-    ))
+    )))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -11034,6 +11317,9 @@ impl HistoryDirectory {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl HistoryParent {
+    fn open(path: &std::path::Path) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::prove(path)
+    }
     fn prove(_path: &std::path::Path) -> Result<Self, bridge_core::workflow_history::LedgerError> {
         Err(bridge_core::workflow_history::LedgerError::new(
             bridge_core::workflow_history::LedgerUnavailableReason::Open,
