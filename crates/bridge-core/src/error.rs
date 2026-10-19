@@ -124,6 +124,10 @@ pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivabili
             | DiagnosticFailureClass::ContainerCredentials
             | DiagnosticFailureClass::Timeout
             | DiagnosticFailureClass::Overloaded
+            | DiagnosticFailureClass::QuotaExhausted
+            | DiagnosticFailureClass::RegionRestricted
+            | DiagnosticFailureClass::BillingFailure
+            | DiagnosticFailureClass::RateLimited
             | DiagnosticFailureClass::ProviderLimit
             | DiagnosticFailureClass::Persistence
             | DiagnosticFailureClass::Canceled

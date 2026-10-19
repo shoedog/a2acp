@@ -120,14 +120,13 @@ async fn successful_first_send_records_complete_post_barrier_lifecycle() {
 }
 
 #[tokio::test]
-async fn structured_provider_limit_is_fatal_after_send_installation() {
+async fn structured_rate_limit_is_fatal_after_send_installation() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
             "error": {
-                "code": "usage_limit_reached",
-                "type": "rate_limit_error",
+                "code": "rate_limit_error",
                 "retry_after_ms": 1234
             }
         })))
@@ -138,9 +137,9 @@ async fn structured_provider_limit_is_fatal_after_send_installation() {
     let (_, error, observer) = observed_turn(&backend, "provider-limit").await;
     let original_error = error.clone().expect("terminal failure");
     let diagnostic = agent_failure(error);
-    assert_eq!(diagnostic.class(), DiagnosticFailureClass::ProviderLimit);
+    assert_eq!(diagnostic.class(), DiagnosticFailureClass::RateLimited);
     assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
-    assert_eq!(diagnostic.code().as_str(), "upstream.provider_limit");
+    assert_eq!(diagnostic.code().as_str(), "upstream.rate_limited");
     assert!(diagnostic.prompt_may_have_been_accepted());
     assert!(!original_error.is_transient());
     assert_eq!(

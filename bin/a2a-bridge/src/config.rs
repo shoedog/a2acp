@@ -556,6 +556,14 @@ pub struct RegistryConfig {
     pub registry: Option<RegistrySection>,
     #[serde(default)]
     pub agents: Vec<AgentEntryToml>,
+    /// Explicit ordered provider-failure fallback chains. They are admitted and
+    /// frozen by policy code; phase one deliberately does not dispatch them.
+    #[serde(default)]
+    pub routing: RoutingToml,
+    /// Exact operator-owned billing identities. An absent match is deliberately
+    /// observable as unmapped rather than inferred from credentials or provider.
+    #[serde(default)]
+    pub billing_identities: Vec<BillingIdentityToml>,
     /// `[[prompts]]` named-prompt registry (E8a). Each entry is `file=` XOR `text=` (+ optional
     /// `description`); workflow nodes reference one by id via `prompt = "<id>"`.
     #[serde(default)]
@@ -1084,6 +1092,39 @@ pub(crate) fn parse_prompts_only(toml_str: &str) -> Result<Vec<PromptEntryToml>,
 pub struct RegistrySection {
     #[serde(default)]
     pub allowed_cmds: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingToml {
+    #[serde(default)]
+    pub chains: Vec<FallbackChainToml>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingCandidateToml {
+    pub agent: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackChainToml {
+    pub id: String,
+    pub source: RoutingCandidateToml,
+    pub causes: Vec<bridge_core::routing::FallbackCauseV1>,
+    pub steps: Vec<RoutingCandidateToml>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingIdentityToml {
+    pub agent: String,
+    pub model: String,
+    pub account_group: String,
+    #[allow(dead_code)]
+    pub billing_mode: bridge_core::routing::BillingModeV1,
 }
 
 /// One entry in the `[[agents]]` array, as parsed from TOML.
@@ -1867,6 +1908,70 @@ fn parse_egress(t: &SandboxToml) -> Result<bridge_core::domain::EgressPolicy, Co
     parse_egress_fields(&t.egress, &t.network, &t.proxy, &t.no_proxy)
 }
 
+fn agent_posture(
+    agent: &AgentEntryToml,
+) -> Result<bridge_core::routing::CandidatePostureV1, ConfigError> {
+    use bridge_core::routing::{CandidatePostureV1, McpPostureV1, SandboxPostureV1};
+    let kind = match parse_kind(agent.kind.as_deref().unwrap_or("acp"))? {
+        AgentKind::Acp => "acp",
+        AgentKind::Api => "api",
+        AgentKind::ContainerRw => "container_rw",
+    };
+    // Validate MCP shape before reducing its declaration to a set.
+    build_mcp_specs(&agent.mcp, &agent.id)?;
+    let delivery = match resolve_mcp_delivery(
+        agent.mcp_delivery.as_deref(),
+        agent.cmd.as_deref(),
+        !agent.mcp.is_empty(),
+        &agent.id,
+    )? {
+        bridge_core::mcp::McpDelivery::Acp => "acp",
+        bridge_core::mcp::McpDelivery::CodexNative => "codex_native",
+        bridge_core::mcp::McpDelivery::KiroNative => "kiro_native",
+    };
+    let cwd = agent.cwd.clone().unwrap_or_else(|| ".".into());
+    Ok(CandidatePostureV1 {
+        kind: kind.into(),
+        sandbox: agent.sandbox.as_ref().map(|sandbox| SandboxPostureV1 {
+            runtime: sandbox.runtime.clone().unwrap_or_else(|| "docker".into()),
+            image: sandbox.image.clone(),
+            mount: sandbox.mount.clone(),
+            access: sandbox.access.clone(),
+            egress: sandbox.egress.clone(),
+            network: sandbox.network.clone(),
+            proxy: sandbox.proxy.clone(),
+            no_proxy: sandbox.no_proxy.clone(),
+            volumes: sandbox.volumes.clone(),
+        }),
+        session_cwd: agent.session_cwd.clone().unwrap_or_else(|| cwd.clone()),
+        cwd,
+        cmd: agent.cmd.clone(),
+        args: agent.args.clone(),
+        mode: agent.mode.clone(),
+        mcp_delivery: delivery.into(),
+        mcp: agent
+            .mcp
+            .iter()
+            .map(|server| McpPostureV1 {
+                name: server.name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server
+                    .env
+                    .iter()
+                    .map(|env| {
+                        (
+                            env.name.clone(),
+                            env.value.clone(),
+                            env.value_from_env.clone(),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
 impl RegistryConfig {
     /// Parse a multi-agent TOML string into a `RegistryConfig`.
     /// TOML deserialization plus env-expansion of the `[delegation]` `peer_url`/`auth`
@@ -1908,7 +2013,206 @@ impl RegistryConfig {
                 }
             }
         }
+        cfg.validate_provider_governance()?;
         Ok(cfg)
+    }
+
+    #[allow(dead_code)]
+    pub fn billing_identities_v1(
+        &self,
+    ) -> Result<Vec<bridge_core::routing::BillingIdentityV1>, ConfigError> {
+        self.validate_provider_governance()?;
+        self.billing_identities
+            .iter()
+            .map(|identity| {
+                Ok(bridge_core::routing::BillingIdentityV1 {
+                    agent: AgentId::parse(identity.agent.clone())
+                        .map_err(|error| ConfigError::Registry(error.to_string()))?,
+                    effective_model: identity.model.clone(),
+                    account_group: identity.account_group.clone(),
+                    billing_mode: identity.billing_mode,
+                })
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn fallback_chains_v1(
+        &self,
+    ) -> Result<Vec<bridge_core::routing::FrozenFallbackChainV1>, ConfigError> {
+        self.validate_provider_governance()?;
+        let agents: BTreeMap<_, _> = self
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent))
+            .collect();
+        self.routing
+            .chains
+            .iter()
+            .map(|chain| {
+                let freeze = |candidate: &RoutingCandidateToml| {
+                    Ok(bridge_core::routing::FallbackCandidateV1 {
+                        agent: AgentId::parse(candidate.agent.clone())
+                            .map_err(|error| ConfigError::Registry(error.to_string()))?,
+                        model: candidate.model.clone(),
+                        posture: agent_posture(agents[candidate.agent.as_str()])?,
+                    })
+                };
+                Ok(bridge_core::routing::FrozenFallbackChainV1 {
+                    id: chain.id.clone(),
+                    source: freeze(&chain.source)?,
+                    causes: chain.causes.iter().copied().collect(),
+                    steps: chain
+                        .steps
+                        .iter()
+                        .map(freeze)
+                        .collect::<Result<_, ConfigError>>()?,
+                })
+            })
+            .collect()
+    }
+
+    fn validate_provider_governance(&self) -> Result<(), ConfigError> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let agents: BTreeMap<_, _> = self
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent))
+            .collect();
+        let valid = |name: &str, value: &str| {
+            (value.is_empty() || value.trim() != value).then(|| {
+                ConfigError::Registry(format!(
+                    "{name} must be non-empty without leading/trailing whitespace"
+                ))
+            })
+        };
+        let mut ids = BTreeSet::new();
+        let mut cause_sources = BTreeSet::new();
+        // This graph is used solely to reject cycles, never to compile or select steps.
+        let mut graph: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+        for chain in &self.routing.chains {
+            if let Some(error) = valid("fallback chain id", &chain.id) {
+                return Err(error);
+            }
+            if !ids.insert(&chain.id) || chain.causes.is_empty() || chain.steps.is_empty() {
+                return Err(ConfigError::Registry(
+                    "fallback chains require unique ids, causes and non-empty steps".into(),
+                ));
+            }
+            let source_key = (chain.source.agent.clone(), chain.source.model.clone());
+            for cause in &chain.causes {
+                if !cause_sources.insert((source_key.clone(), *cause)) {
+                    return Err(ConfigError::Registry(
+                        "overlapping fallback causes for the same source".into(),
+                    ));
+                }
+            }
+            let mut seen = BTreeSet::new();
+            let mut previous = source_key;
+            let mut source_posture = None;
+            for candidate in std::iter::once(&chain.source).chain(&chain.steps) {
+                for (name, value) in [
+                    ("fallback agent", &candidate.agent),
+                    ("fallback model", &candidate.model),
+                ] {
+                    if let Some(error) = valid(name, value) {
+                        return Err(error);
+                    }
+                }
+                if !seen.insert(candidate) {
+                    return Err(ConfigError::Registry(
+                        "duplicate or cyclic fallback step".into(),
+                    ));
+                }
+                let agent = agents.get(candidate.agent.as_str()).ok_or_else(|| {
+                    ConfigError::Registry(format!(
+                        "fallback agent {:?} is unknown",
+                        candidate.agent
+                    ))
+                })?;
+                // Admission is offline: only exact operator-declared models are known here.
+                // Live catalog validation and dispatch belong to C2.
+                if agent.model.as_deref() != Some(&candidate.model)
+                    && !agent.fallback_models.contains(&candidate.model)
+                {
+                    return Err(ConfigError::Registry(format!(
+                        "fallback model {:?} is unknown for agent {:?}; declare model or fallback_models",
+                        candidate.model, candidate.agent,
+                    )));
+                }
+                let posture = agent_posture(agent)?;
+                if let Some(source) = &source_posture {
+                    if source != &posture {
+                        return Err(ConfigError::Registry(
+                            "fallback normalized posture must equal source posture".into(),
+                        ));
+                    }
+                    let key = (candidate.agent.clone(), candidate.model.clone());
+                    graph.entry(previous).or_default().push(key.clone());
+                    previous = key;
+                } else {
+                    source_posture = Some(posture);
+                }
+            }
+        }
+        fn cyclic(
+            node: &(String, String),
+            graph: &BTreeMap<(String, String), Vec<(String, String)>>,
+            visiting: &mut BTreeSet<(String, String)>,
+            done: &mut BTreeSet<(String, String)>,
+        ) -> bool {
+            if done.contains(node) {
+                return false;
+            }
+            if !visiting.insert(node.clone()) {
+                return true;
+            }
+            let result = graph.get(node).is_some_and(|targets| {
+                targets
+                    .iter()
+                    .any(|target| cyclic(target, graph, visiting, done))
+            });
+            visiting.remove(node);
+            done.insert(node.clone());
+            result
+        }
+        let mut visiting = BTreeSet::new();
+        let mut done = BTreeSet::new();
+        if graph
+            .keys()
+            .any(|node| cyclic(node, &graph, &mut visiting, &mut done))
+        {
+            return Err(ConfigError::Registry(
+                "fallback chains must not form a cycle".into(),
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for identity in &self.billing_identities {
+            for (name, value) in [
+                ("billing identity agent", identity.agent.as_str()),
+                ("billing identity model", identity.model.as_str()),
+                (
+                    "billing identity account_group",
+                    identity.account_group.as_str(),
+                ),
+            ] {
+                if let Some(error) = valid(name, value) {
+                    return Err(error);
+                }
+            }
+            if !agents.contains_key(identity.agent.as_str()) {
+                return Err(ConfigError::Registry(format!(
+                    "billing identity agent {:?} is unknown",
+                    identity.agent
+                )));
+            }
+            if !identities.insert((identity.agent.as_str(), identity.model.as_str())) {
+                return Err(ConfigError::Registry(
+                    "duplicate billing identity mapping".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Pure syntax validation for the separately held provider-effect key.
@@ -2163,6 +2467,7 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        self.validate_provider_governance()?;
         if let Some(implement) = &self.implement {
             implement.clone_config_policy()?;
         }
@@ -3042,6 +3347,239 @@ addr="127.0.0.1:8080"
         .into_snapshot()
         .unwrap_err();
         assert!(err.to_string().contains("fallback_models"));
+    }
+
+    const PROVIDER_CHAINS: &str = r#"
+default = "source"
+[[agents]]
+id = "source"
+cmd = "codex-acp"
+model = "model-a"
+[[agents]]
+id = "target"
+cmd = "codex-acp"
+model = "model-b"
+[[agents]]
+id = "third"
+cmd = "codex-acp"
+model = "model-c"
+[[routing.chains]]
+id = "capacity"
+source = { agent = "source", model = "model-a" }
+causes = ["quota_exhausted", "rate_limited"]
+steps = [{ agent = "target", model = "model-b" }]
+[[billing_identities]]
+agent = "source"
+model = "model-a"
+account_group = "platform"
+billing_mode = "metered"
+[server]
+"#;
+
+    #[test]
+    fn provider_governance_requires_explicit_safe_chains_and_billing_identities() {
+        let config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        let identities = config.billing_identities_v1().unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].account_group, "platform");
+        let chains = config.fallback_chains_v1().unwrap();
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].steps.len(), 1);
+        assert_eq!(chains[0].causes.len(), 2);
+        config.into_snapshot().unwrap();
+
+        for invalid in [
+            PROVIDER_CHAINS.replace("agent = \"target\"", "agent = \"missing\""),
+            PROVIDER_CHAINS.replace("model = \"model-b\" }", "model = \"unknown\" }"),
+            PROVIDER_CHAINS.replace("steps = [{ agent = \"target\", model = \"model-b\" }]", "steps = []"),
+            PROVIDER_CHAINS.replace("causes = [\"quota_exhausted\", \"rate_limited\"]", "causes = []"),
+            PROVIDER_CHAINS.replace("steps = [{ agent = \"target\", model = \"model-b\" }]", "steps = [{ agent = \"source\", model = \"model-a\" }]"),
+            PROVIDER_CHAINS.replace("steps = [{ agent = \"target\", model = \"model-b\" }]", "steps = [{ agent = \"target\", model = \"model-b\" }, { agent = \"target\", model = \"model-b\" }]"),
+            PROVIDER_CHAINS.replace("[[billing_identities]]", "[[billing_identities]]\nagent = \"source\"\nmodel = \"model-a\"\naccount_group = \"other\"\nbilling_mode = \"subscription\"\n[[billing_identities]]"),
+        ] {
+            assert!(RegistryConfig::parse(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn provider_chains_freeze_order_and_keep_disjoint_source_causes_separate() {
+        use bridge_core::diagnostics::DiagnosticFailureClass as Class;
+        use bridge_core::routing::{
+            decide_fallback, select_fallback_chain, ExclusionEvidenceV1, FallbackPositionV1,
+            ReplayEvidenceV1, RoutingDecisionV1,
+        };
+        let evidence = ReplayEvidenceV1 {
+            prompt_acceptance: ExclusionEvidenceV1::Excluded,
+            effects: ExclusionEvidenceV1::Excluded,
+            cleanup_completed: true,
+        };
+        let source = AgentId::parse("source").unwrap();
+        let config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        let chains = config.fallback_chains_v1().unwrap();
+        let chain = select_fallback_chain(&chains, &source, "model-a", Class::RateLimited).unwrap();
+        assert!(
+            matches!(decide_fallback(Some(chain), Class::RateLimited, evidence, FallbackPositionV1::Source), RoutingDecisionV1::Next(next) if next.agent.as_str() == "target")
+        );
+        assert_eq!(
+            decide_fallback(
+                Some(chain),
+                Class::RateLimited,
+                evidence,
+                FallbackPositionV1::Step(0)
+            ),
+            RoutingDecisionV1::Exhausted
+        );
+
+        let separate = PROVIDER_CHAINS.replace(
+            "[[billing_identities]]",
+            r#"
+[[routing.chains]]
+id = "billing"
+source = { agent = "source", model = "model-a" }
+causes = ["billing_failure"]
+steps = [{ agent = "third", model = "model-c" }]
+[[billing_identities]]"#,
+        );
+        let chains = RegistryConfig::parse(&separate)
+            .unwrap()
+            .fallback_chains_v1()
+            .unwrap();
+        assert_eq!(chains.len(), 2);
+        let chain =
+            select_fallback_chain(&chains, &source, "model-a", Class::QuotaExhausted).unwrap();
+        assert!(
+            matches!(decide_fallback(Some(chain), Class::QuotaExhausted, evidence, FallbackPositionV1::Source), RoutingDecisionV1::Next(next) if next.agent.as_str() == "target")
+        );
+        assert_eq!(
+            decide_fallback(
+                Some(chain),
+                Class::BillingFailure,
+                evidence,
+                FallbackPositionV1::Step(0)
+            ),
+            RoutingDecisionV1::Exhausted
+        );
+        let overlap = separate.replace(
+            "causes = [\"billing_failure\"]",
+            "causes = [\"quota_exhausted\"]",
+        );
+        assert!(RegistryConfig::parse(&overlap)
+            .unwrap_err()
+            .to_string()
+            .contains("overlapping"));
+
+        let ordered = PROVIDER_CHAINS.replace("steps = [{ agent = \"target\", model = \"model-b\" }]", "steps = [{ agent = \"target\", model = \"model-b\" }, { agent = \"third\", model = \"model-c\" }]");
+        let chains = RegistryConfig::parse(&ordered)
+            .unwrap()
+            .fallback_chains_v1()
+            .unwrap();
+        let chain = &chains[0];
+        for (position, agent) in [
+            (FallbackPositionV1::Source, "target"),
+            (FallbackPositionV1::Step(0), "third"),
+        ] {
+            assert!(
+                matches!(decide_fallback(Some(chain), Class::QuotaExhausted, evidence, position), RoutingDecisionV1::Next(next) if next.agent.as_str() == agent)
+            );
+        }
+        assert_eq!(
+            decide_fallback(
+                Some(chain),
+                Class::QuotaExhausted,
+                evidence,
+                FallbackPositionV1::Step(1)
+            ),
+            RoutingDecisionV1::Exhausted
+        );
+    }
+
+    #[test]
+    fn provider_chains_reject_cycles_across_declarations() {
+        let cyclic = PROVIDER_CHAINS.replace(
+            "[[billing_identities]]",
+            r#"
+[[routing.chains]]
+id = "back"
+source = { agent = "target", model = "model-b" }
+causes = ["billing_failure"]
+steps = [{ agent = "source", model = "model-a" }]
+[[billing_identities]]"#,
+        );
+        assert!(RegistryConfig::parse(&cyclic)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
+    }
+
+    #[test]
+    fn provider_posture_normalizes_runtime_and_refuses_argument_authority_change() {
+        let read_only = PROVIDER_CHAINS.replace(
+            "id = \"source\"",
+            "id = \"source\"\nargs = [\"--sandbox=read-only\"]",
+        );
+        assert!(RegistryConfig::parse(&read_only)
+            .unwrap_err()
+            .to_string()
+            .contains("posture"));
+        let sandbox = r#"
+[agents.sandbox]
+image = "reader:fixed"
+mount = "/repo"
+access = "ro"
+egress = "open"
+"#;
+        let mut config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        for (index, agent) in config.agents.iter_mut().enumerate() {
+            agent.sandbox = Some(
+                toml::from_str(sandbox.trim().strip_prefix("[agents.sandbox]").unwrap()).unwrap(),
+            );
+            if index == 1 {
+                agent.sandbox.as_mut().unwrap().runtime = Some("docker".into());
+            }
+        }
+        let chains = config.fallback_chains_v1().unwrap();
+        assert_eq!(chains[0].source.posture, chains[0].steps[0].posture);
+        config.agents[1].sandbox.as_mut().unwrap().runtime = Some("podman".into());
+        assert!(config
+            .fallback_chains_v1()
+            .unwrap_err()
+            .to_string()
+            .contains("posture"));
+    }
+
+    #[test]
+    fn provider_posture_compares_mcp_as_a_set_and_refuses_narrower_authority() {
+        let mut config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        let mcp: McpToml = toml::from_str(
+            r#"
+name = "tools"
+command = "/tools/server"
+args = ["{cwd}"]
+[[env]]
+name = "FIRST"
+value = "public"
+[[env]]
+name = "SECOND"
+value_from_env = "GC1_TEST_REFERENCE"
+"#,
+        )
+        .unwrap();
+        // Compare declaration authority without resolving a live credential.
+        // Use literals here because admission validates referenced env availability.
+        let mut mcp = mcp;
+        mcp.env[1].value_from_env = None;
+        mcp.env[1].value = Some("second".into());
+        config.agents[0].mcp = vec![mcp.clone()];
+        mcp.env.reverse();
+        config.agents[1].mcp = vec![mcp];
+        let chains = config.fallback_chains_v1().unwrap();
+        assert_eq!(chains[0].source.posture, chains[0].steps[0].posture);
+        config.agents[1].mcp.clear();
+        assert!(config
+            .fallback_chains_v1()
+            .unwrap_err()
+            .to_string()
+            .contains("posture"));
     }
 
     #[test]

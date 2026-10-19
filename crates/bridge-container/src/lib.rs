@@ -263,6 +263,9 @@ pub struct ContainerRwConfig {
     pub sandbox: SandboxConfig,
     /// The inner ACP CLI (e.g. `claude-agent-acp`) — runs contained.
     pub cmd: String,
+    /// Configured inner executable retained as adapter provenance when `cmd`
+    /// is wrapped for the warm writer environment.
+    pub adapter_command: String,
     pub args: Vec<String>,
     /// MCP servers for `McpDelivery::CodexNative` — rendered to `-c mcp_servers.*` args and appended
     /// to the inner codex-acp argv at open (with `{cwd}` = the per-turn `:rw` clone). Empty otherwise.
@@ -920,6 +923,7 @@ impl ContainerRwBackend {
         };
         let acp = AcpConfig {
             agent_id: self.cfg.agent.clone(),
+            adapter_command: Some(self.cfg.adapter_command.clone()),
             cwd: PathBuf::from(delivery_cwd.as_str()),
             model: self.cfg.model.clone(),
             mode: self.cfg.mode.clone(),
@@ -2842,6 +2846,7 @@ mod tests {
                 volumes: vec![],
             },
             cmd: "claude-agent-acp".into(),
+            adapter_command: "claude-agent-acp".into(),
             args: vec![],
             mcp: vec![],
             mcp_delivery: Default::default(),

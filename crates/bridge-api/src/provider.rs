@@ -166,7 +166,10 @@ fn parse_reset_timestamp(value: Value) -> Hint<i64> {
 
 fn status_is_compatible(status: StatusCode, class: DiagnosticFailureClass) -> bool {
     match class {
-        DiagnosticFailureClass::ProviderLimit => {
+        DiagnosticFailureClass::QuotaExhausted
+        | DiagnosticFailureClass::BillingFailure
+        | DiagnosticFailureClass::RateLimited
+        | DiagnosticFailureClass::ProviderLimit => {
             matches!(status.as_u16(), 402 | 429)
         }
         DiagnosticFailureClass::Overloaded => matches!(status.as_u16(), 429 | 503 | 529),
@@ -182,6 +185,7 @@ fn status_is_compatible(status: StatusCode, class: DiagnosticFailureClass) -> bo
         | DiagnosticFailureClass::ContainerMount
         | DiagnosticFailureClass::ContainerCredentials
         | DiagnosticFailureClass::Timeout
+        | DiagnosticFailureClass::RegionRestricted
         | DiagnosticFailureClass::Persistence
         | DiagnosticFailureClass::Canceled
         | DiagnosticFailureClass::Unknown => false,
@@ -373,34 +377,34 @@ mod tests {
             (
                 "insufficient_quota",
                 402,
-                DiagnosticFailureClass::ProviderLimit,
+                DiagnosticFailureClass::QuotaExhausted,
             ),
-            ("quota_exceeded", 429, DiagnosticFailureClass::ProviderLimit),
+            (
+                "quota_exceeded",
+                429,
+                DiagnosticFailureClass::QuotaExhausted,
+            ),
             (
                 "billing_hard_limit_reached",
                 402,
-                DiagnosticFailureClass::ProviderLimit,
+                DiagnosticFailureClass::BillingFailure,
             ),
             (
                 "usage_limit_reached",
                 429,
-                DiagnosticFailureClass::ProviderLimit,
+                DiagnosticFailureClass::QuotaExhausted,
             ),
             (
                 "usage_limit_exceeded",
                 429,
-                DiagnosticFailureClass::ProviderLimit,
+                DiagnosticFailureClass::QuotaExhausted,
             ),
             (
                 "rate_limit_exceeded",
                 429,
-                DiagnosticFailureClass::ProviderLimit,
+                DiagnosticFailureClass::RateLimited,
             ),
-            (
-                "rate_limit_error",
-                429,
-                DiagnosticFailureClass::ProviderLimit,
-            ),
+            ("rate_limit_error", 429, DiagnosticFailureClass::RateLimited),
             ("overloaded_error", 429, DiagnosticFailureClass::Overloaded),
             ("server_overloaded", 503, DiagnosticFailureClass::Overloaded),
             ("capacity_exceeded", 529, DiagnosticFailureClass::Overloaded),
@@ -496,7 +500,7 @@ mod tests {
         exact.resize(MAX_ERROR_BODY_BYTES, b' ');
         assert_eq!(
             classify_with_headers(429, &exact, false, &[]).class,
-            DiagnosticFailureClass::ProviderLimit
+            DiagnosticFailureClass::QuotaExhausted
         );
         exact.push(b' ');
         assert_eq!(
@@ -517,7 +521,7 @@ mod tests {
         );
         assert_eq!(valid.retry_after_ms, Some(MAX_RETRY_AFTER_MS));
         assert_eq!(valid.reset_at_ms, Some(NOW_MS + MAX_RETRY_AFTER_MS as i64));
-        assert_eq!(valid.code, "upstream.provider_limit");
+        assert_eq!(valid.code, "upstream.quota_exhausted");
 
         for body in [
             r#"{"error":{"code":"usage_limit_reached","retry_after_ms":-1}}"#,
@@ -527,7 +531,7 @@ mod tests {
             r#"{"error":{"code":"usage_limit_reached","retry_after_ms":1,"retry_after_ms":2}}"#,
         ] {
             let failure = classify(429, body);
-            assert_eq!(failure.class, DiagnosticFailureClass::ProviderLimit);
+            assert_eq!(failure.class, DiagnosticFailureClass::QuotaExhausted);
             assert_eq!(failure.retry_after_ms, None, "accepted {body}");
             assert_eq!(failure.code, "upstream.retry_metadata_invalid");
         }
@@ -589,7 +593,7 @@ mod tests {
             &[("retry-after", "1")],
         );
         assert_eq!(same.retry_after_ms, Some(1000));
-        assert_eq!(same.code, "upstream.provider_limit");
+        assert_eq!(same.code, "upstream.quota_exhausted");
 
         let conflict = classify_with_headers(
             429,

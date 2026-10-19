@@ -499,6 +499,7 @@ async fn probe_acp_host_with(
     // applied), and there is no `:ro` container to reap — the host probe ignores `[sandbox]`.
     let acp = AcpConfig {
         agent_id: entry.id.as_str().to_string(),
+        adapter_command: entry.cmd.clone(),
         cwd: cwd.to_path_buf(),
         model: None,
         mode: None,
