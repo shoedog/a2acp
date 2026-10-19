@@ -167,3 +167,15 @@ no live provider/container compatibility claim follows from deterministic tests.
    `execution_policy.rs`? No 1a-i dependency on that answer; no speculative edit to that file.
 3. PR 1b owner: which separately authorized evidence or validated bounds will retire Claude's payload
    omission? Until then, omission remains explicit and tested; no provider turn is authorized here.
+
+## Coordination update (2026-10-18, bridge session)
+
+- Base is main `c487d6c4` (Lane R #187 and G-A2.1 #189 merged). **1a-i may start now** with its listed files; no other
+  lane reserves `bin/a2a-bridge/Cargo.toml`/`Cargo.lock` (a parked B1 rebase may touch Cargo.toml after G-A2.2).
+- In `config.rs`, stay outside `[custody]`, C1's `[[routing.chains]]` / billing-identity parsing, and R's
+  `review_history` / `[[workflows]]` review flag.
+- **1a-ii waits for G-A2.2** and must: deliver skill payloads through the same accounting-decorated backend and the same
+  per-turn accounting envelope (no second prompt entry point, no decorator bypass, including implement warm construction
+  and rebuild); leave accounting attribution unchanged (same attempt identity); keep run-spec fields additive
+  (`skip_serializing_if` empty) so frozen accounting identity stays byte-stable for old records; run and keep green
+  G-A2.2's production-path matrix test (exactly one accounting attempt per dispatch path).
