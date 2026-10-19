@@ -295,3 +295,20 @@ not claims that implementation defects or adapter compatibility have already bee
 | Sol S2 — SMELL / MATERIAL | §3 / 4a–4b: aggregate ceiling above namespace leases; three-container/overlap regression; split accounting/readiness. |
 | Sol S3 — SMELL / MATERIAL | §5: predeclared eligibility; justified skips outside denominator; unknown is not zero or demonstrated usefulness. |
 | Sol source-check recommendations | §§1,2,6: preserve lint/input/findings/contracts and mixed-role graph; named runtime gaps, unchanged safety gates. |
+
+## Round-2 post-cap fold (disclosed)
+
+Round 2: sol APPROVE (no findings); Opus APPROVE WITH FIXES with two MATERIAL WRONG findings, each confined to a later
+slice, plus SMELLs. The loop is converging (round 1: three later-slice WRONGs, all resolved; round 2: two new, bounded),
+so these are folded here without a third round:
+
+| Finding | Obligation |
+|---|---|
+| N1 (WRONG / MATERIAL, PR 4a) | Preflight logical sessions always freeze and select the **without-MCP candidate**; the smoke never takes a pool reservation. 4a regression: worktrees + preflight, two reviewer nodes, both select the with-candidate, no preflight reservation journaled. The trial report shows worktree on/off per run (under worktrees each node is its own checkout identity and cold build). |
+| N2 (WRONG / MATERIAL, PR 2) | Policy- or bundle-sourced MCP that targets an agent whose delivery channel is unavailable (sandboxed Kiro-native; unknown command with no declared `mcp_delivery`) is **omitted** with `unsupported_namespace` / `unsupported_delivery`, previewed, and the skill is still sent with a "no navigator in this session" line. Direct per-agent entries keep today's hard refusals. PR 2 test: the shipped containerized example under a role default resolves, previews both omissions and runs. |
+| S1 (PR 1a) | The 1a plan applies the payload gate to in-container Claude workflow targets, or reports `not_delivered: payload_gate` for them until 1b evidence exists; deterministic test either way. |
+| S2 (PR 2) | `--no-attachments` is passed at both eval call sites (runner and judge argv); test the judge argv and recorded disabled identity. |
+| S3 (PR 4a) | Unbound paths use per-`(agent, candidate)` slots, or direct/implement move onto the bound path before 4a; add the case to 4a tests. |
+| S4 (PR 1a) | 1a reports `not_delivered(path)` for direct/implement in preview and run summary; the fingerprint consumer check waits for 1b (or the refusal is stated as intended). |
+| S5 (PR 1a) | New frozen-skill run-spec fields use `skip_serializing_if` when empty (old records must re-encode byte-identically) and are committed into `workload_fingerprint`. |
+| S6 (PR 3) | The local journal's location (beside the local audit store or under `--out`) and retention are named in the PR 3 plan. |
