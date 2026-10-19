@@ -1568,7 +1568,13 @@ fn a8_a8b_a9_a10_bound_streams_deadlines_and_descendant_pipe_holders() {
         #[cfg(target_os = "linux")]
         let state = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat.rsplit_once(')').unwrap().1.trim().to_owned(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // The process can exit between opening and reading its stat file (ESRCH).
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                String::new()
+            }
             Err(error) => panic!("process-state probe: {error}"),
         };
         #[cfg(not(target_os = "linux"))]
