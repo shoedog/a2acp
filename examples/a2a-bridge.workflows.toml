@@ -65,6 +65,7 @@ description = "plan-review synthesis prompt"
 
 [[workflows]]
 id = "code-review"
+review = true
 
 [[workflows.nodes]]
 id = "review"
@@ -76,6 +77,7 @@ inputs = []
 # Feed a design spec as the input; agents do not explore, so inline all context.
 [[workflows]]
 id = "spec-review"
+review = true
 
 [[workflows.nodes]]
 id = "rigor"
@@ -98,6 +100,7 @@ inputs = ["rigor", "soundness"]
 # plan-review: executability (compile/ordering/ripple) + coverage (spec/decomposition) -> synth.
 [[workflows]]
 id = "plan-review"
+review = true
 
 [[workflows.nodes]]
 id = "exec"

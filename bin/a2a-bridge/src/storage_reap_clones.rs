@@ -2848,6 +2848,15 @@ mod tests {
         )
         .unwrap();
         let sha = ck.current_commit.clone().unwrap();
+        bridge_controller::custody_push::push_review_history(
+            &clone,
+            &source,
+            &cfg.custody,
+            &run_id,
+            1,
+            &sha,
+        )
+        .unwrap();
         bridge_controller::custody_push::push_before_review_or_merge(
             &clone,
             &cfg.custody,
@@ -5308,6 +5317,13 @@ mod tests {
     }
 
     fn assert_remote(f: &Fx, present: bool) {
+        let remote = sr::git_str(&f.source, &["remote", "get-url", "origin"]).unwrap();
+        assert!(!sr::git_str(
+            Path::new(&remote),
+            &["rev-parse", &format!("refs/review-history/{}/1", f.run_id)]
+        )
+        .unwrap()
+        .is_empty());
         let remote = f.root.join("backup.git");
         let reference = format!("refs/heads/wip/{}", f.run_id);
         let out = sr::git_ro(&remote, &["show-ref", "--verify", &reference]).unwrap();

@@ -46,6 +46,7 @@ Configuration (`[custody]`):
 | Key | Default | Meaning |
 |---|---|---|
 | `push` | `true` | Push the run branch at stable points |
+| `review_history` | `true` | Secure each reviewed revision with an immutable history ref, independently of `push` |
 | `remote` | `origin` | Remote to push to; may name a private mirror |
 | `ref_prefix` | `wip/` | Branch prefix; the run branch is `<prefix><run-id>` |
 | `delete_remote_on_merge` | `true` | Delete the run branch after a successful merge |
@@ -55,9 +56,40 @@ remain on the remote.
 
 On a public repository, the run branch is public. Set `remote` to a private mirror if that is not acceptable.
 
+Each actual implementation review, including resume, and local `run-workflow` review over a clone
+reserves a distinct invocation and publishes `refs/review-history/<run-id>/<invocation>` before dispatch.
+These refs use the source repository's configured remote and the isolated, bounded host transport.
+An existing equal ref permits recovery; a different SHA is a collision and is never overwritten.
+Dirty checkouts and hidden index flags are refused. Reviewers run in a separate read-only checkout of
+the preserved SHA inside the clone's mount, so an editor changing and restoring the original checkout
+cannot change the reviewed bytes. Tracked symlinks are preserved when their resolved targets stay
+inside the snapshot; escaping or unresolvable links are explicitly refused.
+Workflow preservation uses all frozen admitted checkout identities, including configured agent cwd;
+multi-checkout, subdirectory, and worktree-managed reviews are refused until snapshot binding supports them.
+Review designation is explicit: every `implement` review step (the configured `[review].workflow`
+and its `-light`/`-thorough` variants) is a review. A local `run-workflow` is a review only when its
+`[[workflows]]` entry sets `review = true` (default `false`), independently of its id, prompt or brief.
+The shipped review workflows set that flag, including the OpenCode variants.
+Served workflows are outside this preservation scope: the client submits custom and review workflows
+without classification or refusal, and neither client nor server preserves their revisions or labels.
+Server-owned preservation is a documented limitation and remains future work.
+Output-side diagnostics are deferred until after review publication, so an in-clone `--out` does not
+dirty an initially clean input. Missing custody origin is a preservation error, never a review bypass.
+History refs on a public remote are public; select a private mirror with `remote` when needed.
+Explicit `review_history = false` disables new history publication and linkage without changing ordinary custody.
+
+History refs have indefinite retention. Merge, every reap disposition, and archive retention never delete
+them. Pruning requires a separate explicit command or policy, outside this implementation.
+
 ### 2. Evidence is kept by a configurable policy
 
-At merge, or at the terminal state of an unmerged run, the bridge writes one evidence archive per run.
+Before and after every review, at merge, and at the terminal state of an unmerged run, the bridge
+refreshes the external evidence archive. Mandatory manifest records retain every invocation's workflow,
+reviewed SHA, exact ref, redacted remote, status, verdict and findings summary, independently of `include`
+and optional oversized-payload dropping. Interrupted/failed reviews remain incomplete/inconclusive.
+Publication failure refuses review or stops the repair loop; completed labels stay in the clone, and
+archive verification refuses automatic deletion until all local history records are published.
+Later reviews and merged-phase rewrites preserve earlier records; archive age/size retention is unchanged.
 
 Configuration (`[evidence]`):
 

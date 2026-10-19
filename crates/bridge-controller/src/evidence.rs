@@ -74,7 +74,286 @@ pub struct Manifest {
     pub created_at: String,
     pub included: Vec<Included>,
     pub dropped: Vec<Dropped>,
+    #[serde(default)]
+    pub review_history: Vec<ReviewRevision>,
 }
+/// Mandatory manifest metadata, independent of optional review payload selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRevision {
+    pub run_id: String,
+    pub invocation: u64,
+    pub attempt: u32,
+    pub workflow: String,
+    pub reviewed_sha: String,
+    pub reference: String,
+    pub remote: String,
+    pub status: String,
+    pub verdict: String,
+    pub findings_summary: String,
+}
+fn history_path(clone: &Path) -> PathBuf {
+    clone.join(".git/a2a-bridge/review-history.json")
+}
+fn history(clone: &Path) -> io::Result<Vec<ReviewRevision>> {
+    if history_path(clone).with_extension("json.tmp").exists() {
+        return Err(invalid(
+            "unpublished review history update; clone must be retained",
+        ));
+    }
+    match fs::read(history_path(clone)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e),
+    }
+}
+fn save_history(clone: &Path, records: &[ReviewRevision]) -> io::Result<()> {
+    let path = history_path(clone);
+    fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension("json.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(&serde_json::to_vec(records)?)?;
+    file.sync_all()?;
+    fs::rename(tmp, path)?;
+    fs::File::open(clone.join(".git/a2a-bridge"))?.sync_all()
+}
+/// Refuse dirty or changing checkouts rather than attaching their output to clean HEAD.
+pub fn review_head(clone: &Path) -> Result<String, String> {
+    let flags = crate::implement::run_clone_git(clone, &["ls-files", "-v"])
+        .map_err(|_| "review index flags unavailable")?;
+    if !flags.status.success() {
+        return Err("review index flags unavailable".into());
+    }
+    crate::clone_deletion::index_flags_disposition(&String::from_utf8_lossy(&flags.stdout))?;
+    if crate::custody_push::custody_status(clone)? {
+        return Err("review history requires a clean checkout".into());
+    }
+    let out = crate::implement::run_clone_git(clone, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|_| "review HEAD unavailable")?;
+    if !out.status.success() {
+        return Err("review HEAD unavailable".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().into())
+}
+/// A separate, read-only checkout: edits in the operator's checkout cannot enter a review.
+/// Kept inside the clone's mount for container readers; never part of the landing commit.
+pub struct ReviewSnapshot {
+    pub path: PathBuf,
+}
+fn snapshot_permissions(root: &Path, path: &Path, readonly: bool) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        if readonly {
+            let target = path.canonicalize().map_err(|error| {
+                invalid(&format!(
+                    "review snapshot symlink cannot be resolved: {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !target.starts_with(root) {
+                return Err(invalid(&format!(
+                    "review snapshot symlink escapes snapshot: {}",
+                    path.display()
+                )));
+            }
+        }
+        // Never chmod or recurse through a link, including during cleanup. Its target is
+        // visited by the ordinary directory walk when it is inside the snapshot.
+        return Ok(());
+    }
+    let mut permissions = meta.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(if readonly {
+            permissions.mode() & !0o222
+        } else {
+            permissions.mode() | 0o200
+        });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(readonly);
+    fs::set_permissions(path, permissions)?;
+    if meta.is_dir() {
+        for entry in fs::read_dir(path)? {
+            snapshot_permissions(root, &entry?.path(), readonly)?;
+        }
+    }
+    Ok(())
+}
+impl ReviewSnapshot {
+    pub fn new(clone: &Path, sha: &str) -> Result<Self, String> {
+        if review_head(clone)? != sha {
+            return Err("review checkout changed".into());
+        }
+        let parent = clone.join(".git/a2a-bridge/review-snapshots");
+        fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+        let snapshot = Self {
+            path: parent.join(crate::implement::nonce(16)),
+        };
+        fs::create_dir(&snapshot.path).map_err(|e| e.to_string())?;
+        let run = |args: &[&std::ffi::OsStr]| -> Result<(), String> {
+            let mut cmd = crate::custody_push::git();
+            cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "init.templateDir=", "-c", "core.autocrlf=false"])
+                .args(args);
+            let out = crate::custody_push::bounded(cmd, Duration::from_secs(120))?;
+            if !out.status.success() {
+                return Err("review snapshot Git operation failed".into());
+            }
+            Ok(())
+        };
+        run(&[
+            "clone".as_ref(),
+            "--no-hardlinks".as_ref(),
+            "--dissociate".as_ref(),
+            "--no-checkout".as_ref(),
+            "--".as_ref(),
+            clone.as_os_str(),
+            snapshot.path.as_os_str(),
+        ])?;
+        run(&[
+            "-C".as_ref(),
+            snapshot.path.as_os_str(),
+            "checkout".as_ref(),
+            "--detach".as_ref(),
+            sha.as_ref(),
+        ])?;
+        // Preserve only review inputs under .git; never copy credentials or mutable run state.
+        let task = clone.join(".git/A2A_TASK.md");
+        if task.is_file() {
+            fs::copy(task, snapshot.path.join(".git/A2A_TASK.md")).map_err(|e| e.to_string())?;
+        }
+        let slices = clone.join(".git/a2a-bridge/review-slices");
+        if slices.is_dir() {
+            let target = snapshot.path.join(".git/a2a-bridge/review-slices");
+            fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            for entry in fs::read_dir(slices).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry.file_type().map_err(|e| e.to_string())?.is_file() {
+                    fs::copy(entry.path(), target.join(entry.file_name()))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        snapshot_permissions(
+            &snapshot.path.canonicalize().map_err(|e| e.to_string())?,
+            &snapshot.path,
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        snapshot.validate(sha)?;
+        Ok(snapshot)
+    }
+    pub fn cwd(&self) -> Result<bridge_core::SessionCwd, String> {
+        bridge_core::SessionCwd::parse(&self.path.to_string_lossy()).map_err(|e| e.to_string())
+    }
+    pub fn validate(&self, sha: &str) -> Result<(), String> {
+        if review_head(&self.path)? != sha {
+            return Err("review snapshot changed".into());
+        }
+        Ok(())
+    }
+}
+impl Drop for ReviewSnapshot {
+    fn drop(&mut self) {
+        // Only this invocation's private copy; source files and history refs are untouched.
+        let _ = snapshot_permissions(&self.path, &self.path, false);
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Caller holds the clone operation lock through review and publication.
+pub fn begin_revision_review(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    custody: &crate::custody_push::CustodyConfig,
+    evidence: &EvidenceConfig,
+    workflow: &str,
+    attempt: u32,
+    sha: &str,
+) -> Result<u64, String> {
+    if review_head(clone)? != sha {
+        return Err("review checkout changed".into());
+    }
+    // Recover only a fully serialized interrupted atomic write, under the operation lock.
+    let pending = history_path(clone).with_extension("json.tmp");
+    if pending.exists() {
+        let _: Vec<ReviewRevision> =
+            serde_json::from_slice(&fs::read(&pending).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        fs::rename(pending, history_path(clone)).map_err(|e| e.to_string())?;
+    }
+    // Retry publication of prior labels before another invocation or repair can proceed.
+    write_run_archive(clone, ck, "reviewing", evidence).map_err(|e| e.to_string())?;
+    let invocation = begin_review(clone)?;
+    let (reference, remote) = crate::custody_push::push_review_history(
+        clone,
+        &ck.source_repo,
+        custody,
+        &ck.task_id,
+        invocation,
+        sha,
+    )?;
+    let mut records = history(clone).map_err(|e| e.to_string())?;
+    records.push(ReviewRevision {
+        run_id: ck.task_id.clone(),
+        invocation,
+        attempt,
+        workflow: workflow.into(),
+        reviewed_sha: sha.into(),
+        reference,
+        remote,
+        status: "incomplete".into(),
+        verdict: "Inconclusive".into(),
+        findings_summary: String::new(),
+    });
+    save_history(clone, &records).map_err(|e| e.to_string())?;
+    write_run_archive(clone, ck, "reviewing", evidence).map_err(|e| e.to_string())?;
+    if review_head(clone)? != sha {
+        return Err("review checkout changed".into());
+    }
+    Ok(invocation)
+}
+pub fn finish_revision_review(
+    clone: &Path,
+    ck: &ImplementCheckpoint,
+    evidence: &EvidenceConfig,
+    invocation: u64,
+    completed: bool,
+    text: &str,
+) -> Result<(), String> {
+    let mut records = history(clone).map_err(|e| e.to_string())?;
+    let record = records
+        .iter_mut()
+        .find(|r| r.invocation == invocation)
+        .ok_or("review reservation missing")?;
+    let stable = review_head(clone).is_ok_and(|sha| sha == record.reviewed_sha);
+    if completed && stable {
+        let (verdict, summary) = crate::review::parse_verdict(text);
+        record.status = "completed".into();
+        record.verdict = format!("{verdict:?}");
+        record.findings_summary = crate::verify::truncate_output(&summary, 16384);
+    }
+    let attempt = record.attempt;
+    save_history(clone, &records).map_err(|e| e.to_string())?;
+    if completed && stable {
+        complete_review(clone, attempt, invocation, text)?;
+    }
+    write_run_archive(clone, ck, "reviewed", evidence).map_err(|e| e.to_string())?;
+    if !stable {
+        return Err("review checkout changed; labels remain incomplete".into());
+    }
+    Ok(())
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
@@ -176,6 +455,9 @@ pub fn verify_archive(
     // Tar EOF is earlier than gzip EOF: drain and check every gzip checksum too.
     io::copy(&mut archive.into_inner(), &mut io::sink())?;
     let manifest = manifest.ok_or_else(|| invalid("no evidence manifest"))?;
+    if manifest.review_history != history(clone)? {
+        return Err(invalid("unarchived review history; clone must be retained"));
+    }
     if manifest.schema != "a2a-evidence.v1"
         || manifest.task_id != ck.task_id
         || manifest.source_repo != ck.source_repo.canonicalize()?
@@ -225,6 +507,16 @@ pub fn verify_archive(
 
 /// Reserve before invoking a review, so an interrupted invocation cannot reuse an identity.
 pub fn begin_review(clone: &Path) -> Result<u64, String> {
+    if !crate::implement_resume::checkpoint_path(clone).exists() {
+        return history(clone)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|r| r.invocation)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("review counter exhausted".into());
+    }
     let mut ck = load_checkpoint(clone)?;
     ck.review_invocation = ck
         .review_invocation
@@ -239,7 +531,10 @@ pub fn complete_review(
     invocation: u64,
     text: &str,
 ) -> Result<(), String> {
-    let mut ck = load_checkpoint(clone)?;
+    let mut ck = crate::implement_resume::checkpoint_path(clone)
+        .exists()
+        .then(|| load_checkpoint(clone))
+        .transpose()?;
     let name = format!("review-{attempt}-{invocation}.md");
     let dir = clone.join(".git/a2a-bridge/reviews");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -262,8 +557,11 @@ pub fn complete_review(
     file.write_all(body.as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|e| e.to_string())?;
-    ck.final_review = Some(name);
-    save_checkpoint(clone, &ck)
+    if let Some(ck) = ck.as_mut() {
+        ck.final_review = Some(name);
+        save_checkpoint(clone, ck)?;
+    }
+    Ok(())
 }
 struct Source {
     kind: String,
@@ -455,6 +753,7 @@ pub fn write_run_archive(
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         included: vec![],
         dropped: vec![],
+        review_history: history(clone)?,
     };
     let mut sources = vec![];
     for kind in KINDS {
@@ -491,7 +790,8 @@ pub fn write_run_archive(
         match fs::symlink_metadata(&path) {
             Err(e)
                 if e.kind() == io::ErrorKind::NotFound
-                    && !["spec", "final_review_summary", "checkpoint"].contains(&kind) => {}
+                    && (!crate::implement_resume::checkpoint_path(clone).exists()
+                        || !["spec", "final_review_summary", "checkpoint"].contains(&kind)) => {}
             Err(e) => return Err(e),
             Ok(_) => collect(clone, &path, kind, &mut sources)?,
         }
@@ -648,6 +948,58 @@ mod tests {
     use super::*;
     use crate::implement_resume::{ImplementPhase, SCHEMA_VERSION};
     use std::io::Read;
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_symlinks_stay_links_and_never_change_external_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("snapshot");
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), "reviewed bytes").unwrap();
+        symlink("dir", root.join("directory-link")).unwrap();
+        symlink("directory-link/file", root.join("internal-link")).unwrap();
+        symlink("../internal-link", root.join("dir/chain")).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        snapshot_permissions(&canonical_root, &root, true).unwrap();
+        assert!(fs::symlink_metadata(root.join("internal-link"))
+            .unwrap()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(root.join("dir/chain")).unwrap(),
+            "reviewed bytes"
+        );
+        assert_eq!(
+            fs::metadata(root.join("dir/file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o222,
+            0
+        );
+        snapshot_permissions(&root, &root, false).unwrap();
+
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "external bytes").unwrap();
+        let mode = fs::metadata(&outside).unwrap().permissions().mode();
+        for target in [PathBuf::from("../outside"), outside.clone()] {
+            symlink(target, root.join("escape")).unwrap();
+            let error = snapshot_permissions(&canonical_root, &root, true).unwrap_err();
+            assert!(
+                error.to_string().contains("symlink escapes snapshot"),
+                "{error}"
+            );
+            snapshot_permissions(&root, &root, false).unwrap();
+            assert_eq!(fs::metadata(&outside).unwrap().permissions().mode(), mode);
+            fs::remove_file(root.join("escape")).unwrap();
+        }
+        symlink("missing", root.join("dangling")).unwrap();
+        assert!(snapshot_permissions(&canonical_root, &root, true)
+            .unwrap_err()
+            .to_string()
+            .contains("symlink cannot be resolved"));
+        snapshot_permissions(&root, &root, false).unwrap();
+    }
+
     struct Fixture {
         _temp: tempfile::TempDir,
         clone: PathBuf,
@@ -908,6 +1260,7 @@ mod tests {
             created_at: date.into(),
             included: vec![],
             dropped: vec![],
+            review_history: vec![],
         };
         let payload = dir.join("payload.tmp");
         fs::write(&payload, noise(size)).unwrap();

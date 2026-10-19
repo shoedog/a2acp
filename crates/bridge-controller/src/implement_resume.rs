@@ -68,6 +68,61 @@ pub struct ImplementCheckpoint {
     pub updated_at_ms: i64,
 }
 
+/// Standalone clone reviews share evidence publication without creating an implement checkpoint.
+pub fn workflow_review_checkpoint(clone: &Path) -> Result<Option<ImplementCheckpoint>, String> {
+    if checkpoint_path(clone).exists() {
+        return load_checkpoint(clone).map(Some);
+    }
+    if !clone.join(".git").is_dir() {
+        return Ok(None);
+    }
+    let out = crate::implement::run_clone_git(clone, &["remote", "get-url", "origin"])
+        .map_err(|_| "review clone origin unavailable")?;
+    if !out.status.success() {
+        return Err(
+            "review repository has no origin; configure its custody remote before reviewing".into(),
+        );
+    }
+    let origin = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let origin = origin
+        .strip_prefix("file://localhost/")
+        .map(|p| format!("/{p}"))
+        .unwrap_or_else(|| origin.strip_prefix("file://").unwrap_or(&origin).to_owned());
+    let local_source = clone.join(origin).canonicalize().ok();
+    let source_repo = local_source
+        .filter(|p| p.join(".git").exists())
+        .unwrap_or_else(|| clone.to_path_buf());
+    let sha = crate::evidence::review_head(clone)?;
+    let id = format!("impl-workflow-{}", crate::implement::nonce(16));
+    Ok(Some(ImplementCheckpoint {
+        schema_version: SCHEMA_VERSION,
+        resume_id: id.clone(),
+        task_id: id,
+        task_brief: String::new(),
+        source_repo,
+        clone_path: clone.into(),
+        config_path: PathBuf::new(),
+        branch: "workflow-review".into(),
+        base_ref: None,
+        base_commit: sha.clone(),
+        current_commit: Some(sha),
+        original_message: None,
+        edit_workflow: String::new(),
+        fix_workflow: String::new(),
+        loop_max_attempts: 1,
+        review_invocation: 0,
+        final_review: None,
+        attempt_next: 1,
+        forced_depth: None,
+        resolved_lang: None,
+        activity_tally: None,
+        terminal_evidence_counts: None,
+        phase: ImplementPhase::InLoop,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }))
+}
+
 /// Optional host custody metadata wraps the stable run checkpoint. Keeping the
 /// envelope separate lets existing checkpoint consumers retain their core model;
 /// every disk write preserves the custody lease, including attempt/terminal writes.
