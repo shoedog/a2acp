@@ -1511,6 +1511,7 @@ fn build_coordinator(
     workflow_admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
+    let accounting = bridge_core::accounting::AccountingV1::new(task_store.clone());
     Arc::new(
         bridge_coordinator::Coordinator::new(
             session_manager,
@@ -1526,6 +1527,7 @@ fn build_coordinator(
             observer,
             resume_cap,
         )
+        .with_accounting(accounting)
         .with_trace_refs_config(trace_refs_enabled, max_task_turns)
         .with_workflow_history(workflow_history)
         .with_workflow_admission(workflow_admission)

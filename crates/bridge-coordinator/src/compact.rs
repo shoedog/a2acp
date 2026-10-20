@@ -17,15 +17,32 @@ pub async fn summarize_collect(
     backend: Arc<dyn AgentBackend>,
     session: SessionId,
 ) -> Result<String, BridgeError> {
-    use futures::StreamExt;
-    let mut stream = backend
-        .prompt(
-            &session,
-            vec![Part {
-                text: SUMMARIZE_PROMPT.to_string(),
-            }],
-        )
+    let stream = backend.prompt(&session, summarize_parts()).await?;
+    collect_summary(stream).await
+}
+
+pub async fn summarize_collect_accounted(
+    backend: Arc<dyn AgentBackend>,
+    session: SessionId,
+    attempt: Option<bridge_core::translator::PreparedAccountingTurnV1>,
+) -> Result<String, BridgeError> {
+    let attempt = attempt.ok_or(BridgeError::StoreFailure)?;
+    let stream = bridge_core::accounting_backend::AccountingBackendV1::new(backend)
+        .prompt_accounted_v1(&session, summarize_parts(), attempt.into_attempt(), None)
         .await?;
+    collect_summary(stream).await
+}
+
+fn summarize_parts() -> Vec<Part> {
+    vec![Part {
+        text: SUMMARIZE_PROMPT.to_string(),
+    }]
+}
+
+async fn collect_summary(
+    mut stream: bridge_core::ports::BackendStream,
+) -> Result<String, BridgeError> {
+    use futures::StreamExt;
     let mut out = String::new();
     let mut saw_done = false;
     while let Some(update) = stream.next().await {
@@ -36,7 +53,7 @@ pub async fn summarize_collect(
                 }
                 out.push_str(&t);
             }
-            Update::Usage(_) => {} // FIX-14: intentionally not recorded
+            Update::Usage(_) => {} // Actuals are persisted by the turn capture before collection.
             Update::Permission(_) => {
                 return Err(BridgeError::AgentCrashed {
                     reason: "compact summarize requested a permission".into(),

@@ -16,6 +16,7 @@ use crate::session_manager::{ExpiryClaim, SessionManager, WarmExpiryIntent};
 /// lifetime. The lease drops when the binding is removed from the map ([`BindingGuard`]
 /// eviction on producer exit), decrementing the slot's active-task count.
 pub struct TaskBinding {
+    pub agent: bridge_core::ids::AgentId,
     pub backend: Arc<dyn AgentBackend>,
     /// The effective config applied to the task's session — reused by binding-driven
     /// follow-ups (they prompt the bound backend without recomputing config). Kept on
@@ -73,6 +74,7 @@ impl Drop for BindingGuard {
 /// `None` (the original producer owns eviction — a follow-up must not evict a still-
 /// live binding when its own short-lived call ends).
 pub struct LocalDispatch {
+    pub usage: Option<bridge_core::translator::PreparedAccountingTurnV1>,
     pub backend: Arc<dyn AgentBackend>,
     /// The session to prompt against — warm `ctx-…` session, or legacy `session-{task}`.
     pub session: SessionId,
