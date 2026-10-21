@@ -1977,6 +1977,11 @@ pub enum WorkflowEvent {
 pub type WorkflowStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<WorkflowEvent, BridgeError>> + Send>>;
 
+/// Typed workflow failures for owners that must settle before final projection.
+pub type WorkflowAccountingStreamV1 = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<WorkflowEvent, AccountingFailureV1>> + Send>,
+>;
+
 /// The liveness request every workflow turn stages (preflight, warm and cold). The silence
 /// cutoff is the run's frozen one: `None` is off, `AgentDefault` inherits the node agent's
 /// `[agents.liveness]` (else 30 minutes), `Activity` is that duration. A turn with no frozen
@@ -5477,6 +5482,43 @@ impl WorkflowExecutor {
         )
     }
 
+    /// Forward composite failures to a detached owner without projecting them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_from_with_accounting_failures(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
+        structured_seed: Option<StructuredWorkflowSeedV1>,
+        ctx: WorkflowDiagnosticContext,
+    ) -> WorkflowAccountingStreamV1 {
+        let (
+            ctx,
+            diagnostic_factory,
+            prompt_dispatch,
+            policy_trigger,
+            frozen_authority,
+            accounting,
+        ) = ctx.into_parts();
+        self.run_from_with_context_accounting_inner(
+            graph,
+            input,
+            run_id,
+            cancel,
+            seed,
+            structured_seed,
+            ctx,
+            diagnostic_factory,
+            prompt_dispatch,
+            policy_trigger,
+            frozen_authority,
+            accounting,
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_from_with_context_inner(
         &self,
@@ -5494,6 +5536,43 @@ impl WorkflowExecutor {
         accounting: Option<WorkflowAccountingInvocationV1>,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
+        Box::pin(
+            self.run_from_with_context_accounting_inner(
+                graph,
+                input,
+                run_id,
+                cancel,
+                seed,
+                structured_seed,
+                ctx,
+                diagnostic_factory,
+                prompt_dispatch,
+                policy_trigger_barrier,
+                frozen_authority,
+                accounting,
+                dispatcher,
+            )
+            .map(|item| item.map_err(|failure| failure.surfaced_error())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_from_with_context_accounting_inner(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
+        structured_seed: Option<StructuredWorkflowSeedV1>,
+        ctx: WorkflowRunContext,
+        diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: Option<PromptDispatchBarrier>,
+        policy_trigger_barrier: Option<PolicyTriggerBarrier>,
+        frozen_authority: Option<FrozenWorkflowAuthority>,
+        accounting: Option<WorkflowAccountingInvocationV1>,
+        dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
+    ) -> WorkflowAccountingStreamV1 {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
             accounting,
@@ -5503,7 +5582,7 @@ impl WorkflowExecutor {
         Box::pin(async_stream::stream! {
             if let Some(authority) = frozen_authority.as_ref() {
                 if graph.as_ref() != &authority.run_spec.graph {
-                    yield Err(BridgeError::ConfigMismatch { field: "workflow_graph" });
+                    yield Err(BridgeError::ConfigMismatch { field: "workflow_graph" }.into());
                     return;
                 }
             }
@@ -5511,13 +5590,13 @@ impl WorkflowExecutor {
                 (Some(_), None) if !seed.is_empty() => {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: "V2 resume requires structured node terminal evidence".into(),
-                    });
+                    }.into());
                     return;
                 }
                 (None, Some(_)) => {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: "structured node terminal evidence requires a frozen V2 run".into(),
-                    });
+                    }.into());
                     return;
                 }
                 _ => {}
@@ -5531,7 +5610,7 @@ impl WorkflowExecutor {
                 {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: "V2 resume checkpoint and terminal sets differ".into(),
-                    });
+                    }.into());
                     return;
                 }
                 for checkpoint in structured.nodes.values() {
@@ -5540,7 +5619,7 @@ impl WorkflowExecutor {
                     {
                         yield Err(BridgeError::ConfigInvalid {
                             reason: "V2 resume checkpoint terminal is invalid".into(),
-                        });
+                        }.into());
                         return;
                     }
                 }
@@ -5565,7 +5644,7 @@ impl WorkflowExecutor {
                         terminal_error_checkout_outcome(cancel.is_cancelled()),
                     )
                     .await;
-                    yield Err(primary_error.surfaced_error());
+                    yield Err(primary_error);
                     return;
                 }};
             }
@@ -5594,7 +5673,7 @@ impl WorkflowExecutor {
                             "workflow node {} enables harvest_sanitization=attested_prefix_v1 but this workflow context has no retaining harvest audit store",
                             node.id.as_str()
                         ),
-                    });
+                    }.into());
                     return;
                 }
             }
@@ -5620,7 +5699,7 @@ impl WorkflowExecutor {
                 if !node_ids.contains(key.as_str()) {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: "resume seed references unknown node".into(),
-                    });
+                    }.into());
                     return;
                 }
             }
@@ -5632,7 +5711,7 @@ impl WorkflowExecutor {
                         if !seed.contains_key(inp.as_str()) {
                             yield Err(BridgeError::ConfigInvalid {
                                 reason: "resume seed is not closed under inputs".into(),
-                            });
+                            }.into());
                             return;
                         }
                     }
@@ -5727,7 +5806,7 @@ impl WorkflowExecutor {
                     let identity = match authority.node_identity(node) {
                         Ok(identity) => identity,
                         Err(error) => {
-                            yield Err(error);
+                            yield Err(error.into());
                             return;
                         }
                     };
@@ -5750,7 +5829,7 @@ impl WorkflowExecutor {
                             )
                             .is_err()
                         {
-                            yield Err(BridgeError::InvalidStateTransition);
+                            yield Err(BridgeError::InvalidStateTransition.into());
                             return;
                         }
                     }
@@ -5772,7 +5851,7 @@ impl WorkflowExecutor {
                                     bridge_core::execution_policy::FanOutPolicyV1::BoundedIndependent
                                 ))
                         {
-                            yield Err(BridgeError::InvalidStateTransition);
+                            yield Err(BridgeError::InvalidStateTransition.into());
                             return;
                         }
                     }

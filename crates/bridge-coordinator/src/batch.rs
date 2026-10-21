@@ -1,3 +1,5 @@
+use bridge_core::accounting::AccountingV1;
+use bridge_workflow::accounting::WorkflowAccountingInvocationV1;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -19,9 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
     decode_workflow_spec, encode_workflow_run_spec, encode_workflow_spec, finalize_detached,
-    finalize_detached_with_barrier, spawn_bound_detached_workflow_with_attempt_barriers,
-    spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
-    workflow_terminal_summary_barrier, AttemptTelemetryState, TaskProgressHub,
+    finalize_detached_with_barrier, load_structured_resume_seed, spawn_detached_workflow_accounted,
+    workflow_prompt_dispatch_barrier_with_state, workflow_terminal_summary_barrier,
+    AttemptTelemetryState, TaskProgressHub,
 };
 use crate::params::validate_cwd_str;
 
@@ -169,6 +171,14 @@ fn now_ms(deps: &BatchDeps) -> i64 {
 }
 
 pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId, BridgeError> {
+    run_batch_with_accounting(deps, params, None).await
+}
+
+pub async fn run_batch_with_accounting(
+    deps: &BatchDeps,
+    params: BatchParams,
+    accounting: Option<AccountingV1>,
+) -> Result<BatchId, BridgeError> {
     let workflow = WorkflowId::parse(params.workflow)
         .map_err(|_| BridgeError::InvalidRequest { field: "workflow" })?;
     let _graph = deps
@@ -231,7 +241,7 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
         .lock()
         .await
         .insert(bid.clone(), token.clone());
-    tokio::spawn(run_admission(
+    tokio::spawn(run_admission_with_accounting(
         deps.clone(),
         bid.clone(),
         VecDeque::new(),
@@ -239,6 +249,7 @@ pub async fn run_batch(deps: &BatchDeps, params: BatchParams) -> Result<BatchId,
         concurrency,
         token,
         0,
+        accounting,
     ));
     Ok(bid)
 }
@@ -299,6 +310,14 @@ pub async fn cancel_batch(deps: &BatchDeps, id: &BatchId) -> Result<bool, Bridge
 /// Removing `[batch]` while batch rows are in-flight is unsupported; drain or cancel batches
 /// before dropping the block.
 pub async fn resume_all(deps: &BatchDeps, cap: u32) {
+    resume_all_with_accounting(deps, cap, None).await
+}
+
+pub async fn resume_all_with_accounting(
+    deps: &BatchDeps,
+    cap: u32,
+    accounting: Option<AccountingV1>,
+) {
     match deps.detached.task_store.active_batches().await {
         Ok(active) => {
             let active: HashSet<BatchId> = active.into_iter().map(|b| b.id).collect();
@@ -341,8 +360,13 @@ pub async fn resume_all(deps: &BatchDeps, cap: u32) {
             tracing::warn!(error = ?e, "batch resume: active_batches() failed; skipping orphan sweep");
         }
     }
-    crate::detached::resume_non_batch_tasks(&deps.detached, cap).await;
-    resume_batches(deps, cap).await;
+    crate::detached::resume_non_batch_tasks_with_accounting(
+        &deps.detached,
+        cap,
+        accounting.clone(),
+    )
+    .await;
+    resume_batches_with_accounting(deps, cap, accounting).await;
 }
 
 #[derive(serde::Deserialize)]
@@ -389,6 +413,7 @@ async fn resumed_child_future(
     permit: OwnedSemaphorePermit,
     attempt_started: Instant,
     queue_ms: u64,
+    accounting: Option<AccountingV1>,
 ) -> Option<(BoxFuture<'static, TaskId>, TaskId, CancellationToken)> {
     let task = child.id.clone();
     let Some(spec_json) = child.workflow_spec_json.as_deref() else {
@@ -442,6 +467,28 @@ async fn resumed_child_future(
             )
         })
         .collect();
+
+    let structured_seed = if frozen_run_spec.is_some() {
+        match load_structured_resume_seed(&deps.detached, &task, &cps).await {
+            Ok(seed) => Some(seed),
+            Err(reason) => {
+                let _ = finalize_detached(
+                    &deps.detached.task_store,
+                    &deps.detached.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some(reason),
+                    None,
+                )
+                .await;
+                drop(permit);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
 
     let terminal_id = match graph.terminal() {
         Some(n) => n.id.as_str().to_string(),
@@ -728,35 +775,25 @@ async fn resumed_child_future(
         .insert(task.clone(), token.clone());
     let run_id = identity.run_id().to_string();
     let graph = Arc::new(graph);
-    let handle = match authority {
-        Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
-            &deps.detached,
-            task.clone(),
-            child.input.clone(),
-            graph,
-            run_id,
-            token.clone(),
-            seed,
-            ctx,
-            hub,
-            prompt_dispatch,
-            Some(terminal_barrier),
-            authority,
-        ),
-        None => spawn_detached_workflow_with_attempt_barriers(
-            &deps.detached,
-            task.clone(),
-            child.input.clone(),
-            graph,
-            run_id,
-            token.clone(),
-            seed,
-            ctx,
-            hub,
-            prompt_dispatch,
-            Some(terminal_barrier),
-        ),
-    };
+    let invocation = accounting.clone().map(|service| {
+        WorkflowAccountingInvocationV1::new(service, identity.clone(), graph.id.clone())
+    });
+    let handle = spawn_detached_workflow_accounted(
+        &deps.detached,
+        task.clone(),
+        child.input.clone(),
+        graph,
+        run_id,
+        token.clone(),
+        seed,
+        ctx,
+        hub,
+        prompt_dispatch,
+        Some(terminal_barrier),
+        authority,
+        structured_seed,
+        invocation,
+    );
     let task_id = child.id.clone();
     Some((
         Box::pin(async move {
@@ -770,6 +807,14 @@ async fn resumed_child_future(
 }
 
 pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
+    resume_batches_with_accounting(deps, cap, None).await
+}
+
+pub async fn resume_batches_with_accounting(
+    deps: &BatchDeps,
+    cap: u32,
+    accounting: Option<AccountingV1>,
+) {
     let batches = match deps.detached.task_store.active_batches().await {
         Ok(batches) => batches,
         Err(e) => {
@@ -846,7 +891,7 @@ pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
             .into_iter()
             .filter(|item| !existing.contains(&item.item_id))
             .collect();
-        tokio::spawn(run_admission(
+        tokio::spawn(run_admission_with_accounting(
             deps.clone(),
             bid,
             to_resume,
@@ -854,6 +899,7 @@ pub async fn resume_batches(deps: &BatchDeps, cap: u32) {
             batch.concurrency,
             token,
             cap,
+            accounting.clone(),
         ));
     }
 }
@@ -876,11 +922,26 @@ async fn fail_batch_unavailable(deps: &BatchDeps, bid: &BatchId) {
 pub async fn run_admission(
     deps: BatchDeps,
     bid: BatchId,
+    to_resume: VecDeque<TaskRecord>,
+    pending: VecDeque<BatchItem>,
+    concurrency: u32,
+    token: CancellationToken,
+    cap: u32,
+) {
+    run_admission_with_accounting(deps, bid, to_resume, pending, concurrency, token, cap, None)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_admission_with_accounting(
+    deps: BatchDeps,
+    bid: BatchId,
     mut to_resume: VecDeque<TaskRecord>,
     mut pending: VecDeque<BatchItem>,
     concurrency: u32,
     token: CancellationToken,
     cap: u32,
+    accounting: Option<AccountingV1>,
 ) {
     // Every child attempt's end-to-end clock begins when this batch owner starts,
     // before local pending and the serve-wide semaphore wait.
@@ -940,6 +1001,7 @@ pub async fn run_admission(
                     permit,
                     batch_attempt_started,
                     queue_ms,
+                    accounting.clone(),
                 )
                 .await
                 {
@@ -1233,35 +1295,29 @@ pub async fn run_admission(
                         observer: deps.detached.observer.clone(),
                         ..WorkflowRunContext::default()
                     };
-                    let handle = match admitted {
-                        Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
-                            &deps.detached,
-                            task.clone(),
-                            item.input.clone(),
-                            graph,
-                            identity.run_id().to_string(),
-                            ctok.clone(),
-                            HashMap::new(),
-                            run_context,
-                            hub,
-                            prompt_dispatch,
-                            Some(terminal_barrier),
-                            authority,
-                        ),
-                        None => spawn_detached_workflow_with_attempt_barriers(
-                            &deps.detached,
-                            task.clone(),
-                            item.input.clone(),
-                            graph,
-                            identity.run_id().to_string(),
-                            ctok.clone(),
-                            HashMap::new(),
-                            run_context,
-                            hub,
-                            prompt_dispatch,
-                            Some(terminal_barrier),
-                        ),
-                    };
+                    let invocation = accounting.clone().map(|service| {
+                        WorkflowAccountingInvocationV1::new(
+                            service,
+                            identity.clone(),
+                            graph.id.clone(),
+                        )
+                    });
+                    let handle = spawn_detached_workflow_accounted(
+                        &deps.detached,
+                        task.clone(),
+                        item.input.clone(),
+                        graph,
+                        identity.run_id().to_string(),
+                        ctok.clone(),
+                        HashMap::new(),
+                        run_context,
+                        hub,
+                        prompt_dispatch,
+                        Some(terminal_barrier),
+                        admitted,
+                        None,
+                        invocation,
+                    );
                     live.insert(task.clone(), ctok);
                     let queue_guard = queue_guard;
                     inflight.push(Box::pin(async move {

@@ -242,6 +242,8 @@ impl Default for TaskProgressHub {
 // WorkflowOutcome mapping, and the no-terminal guard — they differ only in sink.
 
 use bridge_core::error::BridgeError;
+use bridge_core::{accounting::AccountingV1, translator::AccountingFailureV1};
+use bridge_workflow::accounting::WorkflowAccountingInvocationV1;
 use bridge_workflow::executor::{
     WorkflowCleanupDisposition, WorkflowEvent, WorkflowOutcome, WorkflowStream,
 };
@@ -304,6 +306,36 @@ pub async fn drain_workflow<S: WorkflowSink>(
     sink: &mut S,
 ) -> Result<bool, BridgeError> {
     drain_workflow_inner(stream, sink, None).await
+}
+
+/// Drain every in-flight event while retaining the first typed failure. The final
+/// detached task projection receives both its original and persistence causes.
+async fn drain_accounted_workflow<S: WorkflowSink>(
+    mut stream: bridge_workflow::executor::WorkflowAccountingStreamV1,
+    sink: &mut S,
+    cancel: CancellationToken,
+) -> Result<bool, AccountingFailureV1> {
+    let mut terminal_seen = false;
+    let mut failure = None;
+    while let Some(item) = stream.next().await {
+        if failure.is_some() {
+            continue;
+        }
+        let result = match item {
+            Ok(event) => drain_workflow(Box::pin(futures::stream::iter([Ok(event)])), sink)
+                .await
+                .map_err(AccountingFailureV1::from),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(terminal) => terminal_seen |= terminal,
+            Err(error) => {
+                failure = Some(error);
+                cancel.cancel();
+            }
+        }
+    }
+    failure.map_or(Ok(terminal_seen), Err)
 }
 
 /// Detached-owner drain: preserve the first sink error, cancel the workflow,
@@ -3834,7 +3866,7 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
     prompt_dispatch: Option<PromptDispatchBarrier>,
     terminal_barrier: Option<TerminalSummaryBarrier>,
 ) -> tokio::task::JoinHandle<bool> {
-    spawn_detached_workflow_inner(
+    spawn_detached_workflow_accounted(
         deps,
         task,
         input,
@@ -3846,6 +3878,7 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
         hub,
         prompt_dispatch,
         terminal_barrier,
+        None,
         None,
         None,
     )
@@ -3866,7 +3899,7 @@ pub fn spawn_bound_detached_workflow_with_attempt_barriers(
     terminal_barrier: Option<TerminalSummaryBarrier>,
     authority: bridge_workflow::admission::AdmittedWorkflowRunV1,
 ) -> tokio::task::JoinHandle<bool> {
-    spawn_detached_workflow_inner(
+    spawn_detached_workflow_accounted(
         deps,
         task,
         input,
@@ -3879,6 +3912,7 @@ pub fn spawn_bound_detached_workflow_with_attempt_barriers(
         prompt_dispatch,
         terminal_barrier,
         Some(authority),
+        None,
         None,
     )
 }
@@ -3912,7 +3946,7 @@ pub fn spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
             )
         })
         .collect();
-    spawn_detached_workflow_inner(
+    spawn_detached_workflow_accounted(
         deps,
         task,
         input,
@@ -3926,11 +3960,14 @@ pub fn spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
         terminal_barrier,
         Some(authority),
         Some(seed),
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_detached_workflow_inner(
+/// Explicit invocation ownership, independent of optional history and observers.
+/// Compatibility entry points above intentionally pass no accounting service.
+pub fn spawn_detached_workflow_accounted(
     deps: &DetachedDeps,
     task: TaskId,
     input: String,
@@ -3944,6 +3981,7 @@ fn spawn_detached_workflow_inner(
     terminal_barrier: Option<TerminalSummaryBarrier>,
     authority: Option<bridge_workflow::admission::AdmittedWorkflowRunV1>,
     structured_seed: Option<StructuredWorkflowSeedV1>,
+    accounting: Option<WorkflowAccountingInvocationV1>,
 ) -> tokio::task::JoinHandle<bool> {
     if ctx.make_rich_sink.is_none() {
         if let Some(barrier) = terminal_barrier.as_ref() {
@@ -4131,30 +4169,25 @@ fn spawn_detached_workflow_inner(
             },
             None => diagnostic_context,
         };
-        let stream = match structured_seed {
-            Some(seed) => executor.run_from_v2_with_diagnostic_context(
-                graph,
-                input,
-                run_id,
-                token,
-                seed,
-                diagnostic_context,
-            ),
-            None => executor.run_from_with_diagnostic_context(
-                graph,
-                input,
-                run_id,
-                token,
-                seed,
-                diagnostic_context,
-            ),
+        let diagnostic_context = match accounting {
+            Some(invocation) => diagnostic_context.with_accounting(invocation),
+            None => diagnostic_context,
         };
+        let stream = executor.run_from_with_accounting_failures(
+            graph,
+            input,
+            run_id,
+            token,
+            seed,
+            structured_seed,
+            diagnostic_context,
+        );
         // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
         // has already written `set_terminal_sequenced` AND published the Terminal frame.
         let mut sink =
             DetachedProgressSink::new(deps.task_store.clone(), task.clone(), hub.clone())
                 .with_terminal_barrier(terminal_barrier.clone());
-        let drained = drain_workflow_cancel_on_sink_error(stream, &mut sink, drain_cancel).await;
+        let drained = drain_accounted_workflow(stream, &mut sink, drain_cancel).await;
         let observed_cleanup = sink
             .cleanup_observation
             .map(|(disposition, _)| disposition.as_str())
@@ -4197,7 +4230,7 @@ fn spawn_detached_workflow_inner(
                     &task,
                     bridge_core::task_store::TaskRecordStatus::Failed,
                     None,
-                    Some("checkpoint write failed"),
+                    Some(&format!("{e:?}")),
                     Some(&hub),
                     terminal_barrier.as_ref(),
                     observed_cleanup,
@@ -4916,6 +4949,91 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
     safe_to_interrupt
 }
 
+/// Validate the same V2 checkpoint evidence for detached and batch recovery.
+/// Refusals precede resume claims and preserve the prior attempt's evidence.
+pub(crate) async fn load_structured_resume_seed(
+    deps: &DetachedDeps,
+    task: &TaskId,
+    checkpoints: &[(
+        NodeId,
+        String,
+        bool,
+        Option<bridge_core::orch::UsageSnapshot>,
+    )],
+) -> Result<StructuredWorkflowSeedV1, &'static str> {
+    let evidence = deps
+        .task_store
+        .node_terminal_evidence(task)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                task = task.as_str(),
+                ?error,
+                "resume: V2 node terminal evidence read failed"
+            );
+            "not resumable: V2 node terminal evidence unavailable"
+        })?;
+    if evidence.len() != checkpoints.len() {
+        return Err("not resumable: V2 checkpoint terminal set mismatch");
+    }
+    let mut nodes = std::collections::BTreeMap::new();
+    for (node, output, ok, usage) in checkpoints {
+        let evidence = evidence
+            .iter()
+            .find(|evidence| evidence.node == *node)
+            .ok_or("not resumable: V2 checkpoint terminal missing")?;
+        let terminal = bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+            evidence.terminal_json.as_bytes(),
+        )
+        .map_err(|_| "not resumable: corrupt V2 node terminal")?;
+        if nodes
+            .insert(
+                node.clone(),
+                StructuredNodeSeedV1 {
+                    output: output.clone(),
+                    ok: *ok,
+                    usage: usage.clone(),
+                    terminal,
+                },
+            )
+            .is_some()
+        {
+            return Err("not resumable: duplicate V2 checkpoint terminal");
+        }
+    }
+    let task_evidence = deps
+        .task_store
+        .workflow_task_evidence(task)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                task = task.as_str(),
+                ?error,
+                "resume: V2 task evidence read failed"
+            );
+            "not resumable: V2 task evidence unavailable"
+        })?;
+    if task_evidence.workflow_outcome.is_some() {
+        return Err("not resumable: V2 terminal projection is already pending");
+    }
+    let policy_trigger = task_evidence
+        .policy_trigger_json
+        .map(|encoded| {
+            bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(encoded.as_bytes())
+                .map_err(|_| "not resumable: corrupt V2 policy trigger")
+        })
+        .transpose()?;
+    // A committed trigger crossed the commit-before-cancel barrier. A successor
+    // cannot safely replay cancellation or derive new outcomes for unknown effects.
+    if policy_trigger.is_some() {
+        return Err("not resumable: committed V2 policy trigger");
+    }
+    Ok(StructuredWorkflowSeedV1 {
+        nodes,
+        policy_trigger,
+    })
+}
+
 /// Boot-time crash-resume scan (W3b Task 10a). Replaces the W3a behavior of sweeping
 /// every `Working` row to `Interrupted`: instead, for each `Working` task this either
 /// (a) **short-circuits** it to terminal if its terminal node already has a checkpoint
@@ -4935,6 +5053,15 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
 /// The cancel token is registered in `workflow_cancels` BEFORE the spawn so a
 /// concurrent `tasks/cancel` arriving during resume can find and fire it.
 pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: u32) {
+    resume_one_working_task_with_accounting(deps, wt, cap, None).await;
+}
+
+pub async fn resume_one_working_task_with_accounting(
+    deps: &DetachedDeps,
+    wt: &TaskRecord,
+    cap: u32,
+    accounting: Option<AccountingV1>,
+) {
     let task = wt.id.clone();
 
     // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
@@ -5014,187 +5141,25 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
         })
         .collect();
     let structured_seed = if is_v2 {
-        let terminal_evidence = match deps.task_store.node_terminal_evidence(&task).await {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                tracing::warn!(task = task.as_str(), error = ?error, "resume scan: V2 node terminal evidence read failed");
+        match load_structured_resume_seed(deps, &task, &cps).await {
+            Ok(seed) => Some(seed),
+            Err(reason) => {
                 let _ = finalize_detached(
                     &deps.task_store,
                     &deps.progress_hubs,
                     &task,
                     TaskRecordStatus::Interrupted,
                     None,
-                    Some("not resumable: V2 node terminal evidence unavailable"),
-                    None,
-                )
-                .await;
-                return;
-            }
-        };
-        if terminal_evidence.len() != cps.len() {
-            let _ = finalize_detached(
-                &deps.task_store,
-                &deps.progress_hubs,
-                &task,
-                TaskRecordStatus::Interrupted,
-                None,
-                Some("not resumable: V2 checkpoint terminal set mismatch"),
-                None,
-            )
-            .await;
-            return;
-        }
-        let mut nodes = std::collections::BTreeMap::new();
-        for (node, output, ok, usage) in &cps {
-            let Some(evidence) = terminal_evidence
-                .iter()
-                .find(|evidence| evidence.node == *node)
-            else {
-                let _ = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: V2 checkpoint terminal missing"),
-                    None,
-                )
-                .await;
-                return;
-            };
-            let terminal = match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
-                evidence.terminal_json.as_bytes(),
-            ) {
-                Ok(terminal) => terminal,
-                Err(_) => {
-                    let _ = finalize_detached(
-                        &deps.task_store,
-                        &deps.progress_hubs,
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: corrupt V2 node terminal"),
-                        None,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if nodes
-                .insert(
-                    node.clone(),
-                    StructuredNodeSeedV1 {
-                        output: output.clone(),
-                        ok: *ok,
-                        usage: usage.clone(),
-                        terminal,
-                    },
-                )
-                .is_some()
-            {
-                let _ = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: duplicate V2 checkpoint terminal"),
+                    Some(reason),
                     None,
                 )
                 .await;
                 return;
             }
         }
-        let task_evidence = match deps.task_store.workflow_task_evidence(&task).await {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                tracing::warn!(task = task.as_str(), error = ?error, "resume scan: V2 task evidence read failed");
-                let _ = finalize_detached(
-                    &deps.task_store,
-                    &deps.progress_hubs,
-                    &task,
-                    TaskRecordStatus::Interrupted,
-                    None,
-                    Some("not resumable: V2 task evidence unavailable"),
-                    None,
-                )
-                .await;
-                return;
-            }
-        };
-        if task_evidence.workflow_outcome.is_some() {
-            let _ = finalize_detached(
-                &deps.task_store,
-                &deps.progress_hubs,
-                &task,
-                TaskRecordStatus::Interrupted,
-                None,
-                Some("not resumable: V2 terminal projection is already pending"),
-                None,
-            )
-            .await;
-            return;
-        }
-        let policy_trigger = match task_evidence.policy_trigger_json {
-            Some(encoded) => {
-                match bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
-                    encoded.as_bytes(),
-                ) {
-                    Ok(trigger) => Some(trigger),
-                    Err(_) => {
-                        let _ = finalize_detached(
-                            &deps.task_store,
-                            &deps.progress_hubs,
-                            &task,
-                            TaskRecordStatus::Interrupted,
-                            None,
-                            Some("not resumable: corrupt V2 policy trigger"),
-                            None,
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            None => None,
-        };
-        Some(StructuredWorkflowSeedV1 {
-            nodes,
-            policy_trigger,
-        })
     } else {
         None
     };
-
-    // A durable policy trigger proves the prior process crossed the
-    // commit-before-cancel barrier. Resuming that attempt would either replay
-    // cancellation under a new lineage or publish a newly derived outcome for
-    // work whose exact post-trigger effects are unknowable after the crash.
-    // Preserve the trigger/node bytes and interrupt the existing task before a
-    // resume slot, successor identity, session, or provider effect is created.
-    if structured_seed
-        .as_ref()
-        .is_some_and(|seed| seed.policy_trigger.is_some())
-    {
-        if let Err(error) = finalize_detached(
-            &deps.task_store,
-            &deps.progress_hubs,
-            &task,
-            TaskRecordStatus::Interrupted,
-            None,
-            Some("not resumable: committed V2 policy trigger"),
-            None,
-        )
-        .await
-        {
-            tracing::warn!(
-                task = task.as_str(),
-                error = ?error,
-                "resume scan: committed V2 policy trigger interruption failed"
-            );
-        }
-        return;
-    }
 
     // (4) A terminal checkpoint is owned exclusively by the attempt-first
     //     reconciliation pass. Reaching it here means that pass could not prove
@@ -5526,52 +5491,25 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 .insert(task.clone(), token.clone());
             let run_id = identity.run_id().to_string();
             let graph = Arc::new(graph);
-            let _handle = match (authority, structured_seed) {
-                (Some(authority), Some(structured_seed)) => {
-                    spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
-                        deps,
-                        task.clone(),
-                        wt.input.clone(),
-                        graph,
-                        run_id.clone(),
-                        token,
-                        structured_seed,
-                        ctx,
-                        hub,
-                        prompt_dispatch,
-                        Some(terminal_barrier),
-                        authority,
-                    )
-                }
-                (None, None) => spawn_detached_workflow_with_attempt_barriers(
-                    deps,
-                    task.clone(),
-                    wt.input.clone(),
-                    graph,
-                    run_id.clone(),
-                    token,
-                    seed,
-                    ctx,
-                    hub,
-                    prompt_dispatch,
-                    Some(terminal_barrier),
-                ),
-                _ => {
-                    let _ = finalize_detached_with_barrier(
-                        &deps.task_store,
-                        &deps.progress_hubs,
-                        &task,
-                        TaskRecordStatus::Interrupted,
-                        None,
-                        Some("not resumable: V2 resume evidence mismatch"),
-                        Some(&hub),
-                        Some(&terminal_barrier),
-                        "not_needed",
-                    )
-                    .await;
-                    return;
-                }
-            };
+            let invocation = accounting.map(|service| {
+                WorkflowAccountingInvocationV1::new(service, identity.clone(), graph.id.clone())
+            });
+            let _handle = spawn_detached_workflow_accounted(
+                deps,
+                task.clone(),
+                wt.input.clone(),
+                graph,
+                run_id.clone(),
+                token,
+                seed,
+                ctx,
+                hub,
+                prompt_dispatch,
+                Some(terminal_barrier),
+                authority,
+                structured_seed,
+                invocation,
+            );
             tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
         }
         Err(e) => {
@@ -5581,6 +5519,14 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
 }
 
 pub async fn resume_non_batch_tasks(deps: &DetachedDeps, cap: u32) {
+    resume_non_batch_tasks_with_accounting(deps, cap, None).await;
+}
+
+pub async fn resume_non_batch_tasks_with_accounting(
+    deps: &DetachedDeps,
+    cap: u32,
+    accounting: Option<AccountingV1>,
+) {
     let working = match deps.task_store.working_tasks().await {
         Ok(w) => w,
         Err(e) => {
@@ -5595,7 +5541,7 @@ pub async fn resume_non_batch_tasks(deps: &DetachedDeps, cap: u32) {
         if wt.batch_id.is_some() {
             continue;
         }
-        resume_one_working_task(deps, &wt, cap).await;
+        resume_one_working_task_with_accounting(deps, &wt, cap, accounting.clone()).await;
     }
 }
 
