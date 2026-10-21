@@ -5166,6 +5166,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             .into());
         }
     }
+    // Accounting is mandatory for local workflows and owns the selected durable allocation,
+    // independently of optional history reservation/telemetry degradation below. Never allocate
+    // a second store or install accounting on the remote-client early-return path.
+    let accounting_store = selected_history.as_ref().map_err(|error| {
+        format!(
+            "run-workflow: accounting storage unavailable ({})",
+            error.reason.as_str()
+        )
+    })?;
+    let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
+        bridge_core::accounting::AccountingV1::new(accounting_store.clone()),
+        identity.clone(),
+        wf_id,
+    );
     let configured_harvest_store = cfg
         .store
         .as_ref()
@@ -5636,6 +5650,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None => diagnostic_ctx,
     };
     let diagnostic_ctx = diagnostic_ctx
+        .with_accounting(accounting)
         .with_admitted_workflow_run(authority)
         .map_err(|error| format!("run-workflow: frozen authority refused: {error:?}"))?;
 
