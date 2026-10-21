@@ -95,6 +95,10 @@ use bridge_store::sqlite::SqliteStore;
 use config::{FileConfigSource, RegistryConfig, ServerConfig};
 use route::SkillRoute;
 
+#[cfg(all(test, unix))]
+#[path = "../tests/accounting/implement_support.rs"]
+mod implement_accounting_support;
+
 /// Path of the on-disk registry config the bridge watches + hot-reloads.
 const CONFIG_PATH: &str = "a2a-bridge.toml";
 const DEFAULT_ARTIFACT_ALLOWLIST_PATH: &str = ".github/workflow-artifact-allowlist.txt";
@@ -2253,21 +2257,27 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
 }
 
 /// B2b-3a: drain a review workflow stream → (completed, synth_output, reviewers_failed). Collects events +
-/// delegates the reduction to the PURE `review::reduce`. `run_with_context` already returns a boxed
-/// `WorkflowStream`, so take it directly (no `Box::pin`). Keeps polling to the end so the executor runs its
+/// delegates event reduction to `review::reduce`, retaining composite failures through the drain.
+/// Keeps polling to the end so the executor runs its
 /// cancel cleanup (backend.cancel/forget_session) even after a timeout cancel.
 async fn drain_review(
-    mut stream: bridge_workflow::executor::WorkflowStream,
+    mut stream: bridge_workflow::executor::WorkflowAccountingStreamV1,
+    telemetry: &ImplementAttemptTelemetry,
 ) -> (bool, String, usize) {
     use futures::StreamExt;
     let mut events = Vec::new();
+    let mut failed = false;
     while let Some(item) = stream.next().await {
         match item {
             Ok(ev) => events.push(ev),
-            Err(e) => eprintln!("[implement] review: stream error: {e:?}"),
+            Err(failure) => {
+                failed = true;
+                telemetry.record_accounting_failure(failure);
+            }
         }
     }
-    review::reduce(&events)
+    let (completed, output, reviewers_failed) = review::reduce(&events);
+    (completed && !failed, output, reviewers_failed)
 }
 
 /// Resolve the single ContainerRw agent that drives BOTH the edit and fix turns of one warm session, or a
@@ -2778,7 +2788,7 @@ async fn run_review_step(
     );
     let mut ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
-        make_rich_sink: Some(telemetry),
+        make_rich_sink: Some(telemetry.clone()),
         ..bridge_workflow::executor::WorkflowRunContext::default()
     };
     let token = tokio_util::sync::CancellationToken::new();
@@ -2825,15 +2835,30 @@ async fn run_review_step(
         .as_ref()
         .map(|(_, id)| *id)
         .or_else(|| bridge_controller::evidence::begin_review(clone_path).ok());
-    let stream = executor.run_with_context(
+    let mut diagnostic = bridge_workflow::executor::WorkflowDiagnosticContext::new(
+        ctx,
+        Arc::new(bridge_core::diagnostics::NoopDiagnosticObserverFactory),
+    );
+    if let Some((accounting, owner)) = &telemetry.accounting {
+        diagnostic = diagnostic.with_accounting(
+            bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
+                accounting.clone(),
+                owner.clone(),
+                graph_id,
+            ),
+        );
+    }
+    let stream = executor.run_from_with_accounting_failures(
         graph,
         input,
         format!("impl-review-{task_id}-{attempt}"),
         token.clone(),
-        ctx,
+        Default::default(),
+        None,
+        diagnostic,
     );
     eprintln!("[implement] review: running implement-review (attempt {attempt})");
-    let mut drain = std::pin::pin!(drain_review(stream));
+    let mut drain = std::pin::pin!(drain_review(stream, telemetry.as_ref()));
     let mut timed_out = false;
     let (completed, synth, reviewers_failed) = tokio::select! {
         r = &mut drain => r,
@@ -2993,6 +3018,16 @@ async fn run_direct_implement_turn(
     parts: Vec<bridge_core::domain::Part>,
     telemetry: &ImplementAttemptTelemetry,
 ) -> bool {
+    run_implement_turn(runner, session, parts, telemetry, "implement_edit").await
+}
+
+async fn run_implement_turn(
+    runner: &dyn turn::TurnRunner,
+    session: &bridge_core::ids::SessionId,
+    parts: Vec<bridge_core::domain::Part>,
+    telemetry: &ImplementAttemptTelemetry,
+    role: &str,
+) -> bool {
     let turn = match telemetry.next_direct_turn(session) {
         Ok(turn) => turn,
         Err(error) => {
@@ -3000,14 +3035,40 @@ async fn run_direct_implement_turn(
             return false;
         }
     };
-    runner
-        .run_turn_with_telemetry(session, parts, direct_diagnostic_observer(), turn)
-        .await
+    if telemetry.accounting.is_some() && telemetry.warm_accounting.lock().unwrap().is_none() {
+        telemetry.record_accounting_failure(BridgeError::StoreFailure.into());
+        return false;
+    }
+    if let Some(accounting) = telemetry.warm_turn_accounting(role) {
+        let result = runner
+            .run_turn_accounted_v1(
+                session,
+                parts,
+                direct_diagnostic_observer(),
+                turn,
+                accounting,
+            )
+            .await;
+        for failure in result.failures {
+            telemetry.record_accounting_failure(failure);
+        }
+        result.completed
+    } else {
+        runner
+            .run_turn_with_telemetry(session, parts, direct_diagnostic_observer(), turn)
+            .await
+    }
 }
 
 struct ImplementAttemptTelemetry {
     factory: bridge_core::attempt_activity::AttemptTelemetrySinkFactory,
     next_generation: std::sync::Mutex<u64>,
+    accounting: Option<(
+        bridge_core::accounting::AccountingV1,
+        bridge_core::ids::AttemptIdentity,
+    )>,
+    warm_accounting: std::sync::Mutex<Option<turn::WarmTurnAccountingV1>>,
+    accounting_failures: std::sync::Mutex<Vec<bridge_core::translator::AccountingFailureV1>>,
 }
 
 impl ImplementAttemptTelemetry {
@@ -3015,7 +3076,122 @@ impl ImplementAttemptTelemetry {
         Arc::new(Self {
             factory: bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(attempt_id),
             next_generation: std::sync::Mutex::new(1),
+            accounting: None,
+            warm_accounting: Default::default(),
+            accounting_failures: Default::default(),
         })
+    }
+
+    /// Admit durable ownership before any implementation backend preparation. Legacy
+    /// checkpoints acquire ownership here without backfilling historical charges.
+    fn admit(
+        task_id: &str,
+        store_path: Option<&str>,
+        base: &Path,
+        clone: &Path,
+    ) -> Result<Arc<Self>, BoxError> {
+        let owner = implement_resume::admit_accounting_owner(clone)?;
+        let store = match store_path {
+            Some(path) => {
+                let path = Path::new(path);
+                SqliteStore::open_shared_history(&base.join(path))
+            }
+            None => bridge_store::sqlite::select_platform_history()
+                .and_then(|selection| selection.open_concurrent()),
+        }
+        .map_err(|error| {
+            format!(
+                "implement: accounting storage unavailable ({})",
+                error.reason.as_str()
+            )
+        })?;
+        let mut telemetry = Self::new(task_id);
+        Arc::get_mut(&mut telemetry)
+            .expect("new attempt telemetry")
+            .accounting = Some((
+            bridge_core::accounting::AccountingV1::new(Arc::new(store)),
+            owner,
+        ));
+        Ok(telemetry)
+    }
+
+    async fn prepare_warm(
+        &self,
+        agent: &bridge_core::ids::AgentId,
+        spec: &bridge_core::domain::SessionSpec,
+        role: &str,
+    ) -> Result<Option<turn::WarmTurnAccountingV1>, BridgeError> {
+        let Some((accounting, owner)) = &self.accounting else {
+            return Ok(None);
+        };
+        let mut context = turn::WarmTurnAccountingV1 {
+            accounting: accounting.clone(),
+            owner: owner.clone(),
+            attribution: bridge_core::accounting::UsageAttributionV1 {
+                agent: agent.as_str().into(),
+                attempt_kind: role.into(),
+                effective_model: spec.config.model.clone(),
+                effective_effort: spec
+                    .config
+                    .effort
+                    .map(|e| format!("{e:?}").to_ascii_lowercase()),
+                effective_mode: spec.config.mode.clone(),
+                ..Default::default()
+            },
+            prepared: None,
+        };
+        context.prepared = Some(context.prepare().await?);
+        Ok(Some(context))
+    }
+
+    async fn setup_result<T>(
+        &self,
+        result: Result<T, BoxError>,
+        context: &mut Option<turn::WarmTurnAccountingV1>,
+    ) -> Result<T, BoxError> {
+        if let Err(error) = &result {
+            if let Some(prepared) = context.as_mut().and_then(|c| c.prepared.take()) {
+                let original = error
+                    .downcast_ref::<BridgeError>()
+                    .cloned()
+                    .unwrap_or(BridgeError::FrameError);
+                self.record_accounting_failure(prepared.reject_preparation(original).await);
+            }
+        }
+        result
+    }
+
+    fn warm_turn_accounting(&self, role: &str) -> Option<turn::WarmTurnAccountingV1> {
+        let mut guard = self.warm_accounting.lock().unwrap();
+        guard.as_mut().map(|context| {
+            let mut attribution = context.attribution.clone();
+            attribution.attempt_kind = role.into();
+            turn::WarmTurnAccountingV1 {
+                accounting: context.accounting.clone(),
+                owner: context.owner.clone(),
+                attribution,
+                prepared: context.prepared.take(),
+            }
+        })
+    }
+
+    fn record_accounting_failure(&self, failure: bridge_core::translator::AccountingFailureV1) {
+        eprintln!("[implement] accounted failure: {failure:?}");
+        self.accounting_failures.lock().unwrap().push(failure);
+    }
+
+    async fn settle_unused_preparation(&self) {
+        let prepared = self
+            .warm_accounting
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|c| c.prepared.take());
+        if let Some(prepared) = prepared {
+            if let Err(error) = prepared.into_attempt().preparation_failed().await {
+                self.record_accounting_failure(error.into());
+            }
+        }
     }
 
     fn recorder(&self) -> Arc<dyn bridge_core::attempt_activity::AttemptRecorder> {
@@ -3231,11 +3407,12 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         // Every fix turn is its own logical provider turn: a fresh bounded
         // local scope keeps its resetting provider counters comparable while
         // the attempt-global tally stays shared.
-        run_direct_implement_turn(
+        run_implement_turn(
             self.runner,
             self.impl_session,
             parts,
             self.telemetry.as_ref(),
+            "implement_fix",
         )
         .await
     }
@@ -3412,21 +3589,41 @@ async fn build_warm_impl(
     impl_lsp_cache_vol: Option<&str>,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     repo: &std::path::Path,
+    telemetry: &ImplementAttemptTelemetry,
+    role: &str,
 ) -> Result<WarmImpl, BoxError> {
     let impl_entry =
         resolve_impl_identity(graph, fix_graph, snapshot).map_err(|e| format!("implement: {e}"))?;
     let edit_template = graph.nodes[0].prompt_template.clone();
     let fix_template = fix_graph.map(|g| g.nodes[0].prompt_template.clone());
+    let session_spec = bridge_core::domain::SessionSpec {
+        config: bridge_core::domain::effective_config(&impl_entry, None),
+        cwd: Some(clone_cwd.clone()),
+    };
+    let mut accounting = telemetry
+        .prepare_warm(&impl_entry.id, &session_spec, role)
+        .await?;
     // Fail fast with a clear message if the claude impl agent's mounted OAuth creds are already expired,
     // instead of spawning a container that crashes opaquely on session/prompt (the recurring footgun).
     if let Some(sb) = impl_entry.sandbox.as_ref() {
-        implement::claude_cred_preflight(
-            impl_entry.cmd.as_deref(),
-            &sb.volumes,
-            implement::now_ms(),
-        )?;
+        telemetry
+            .setup_result(
+                implement::claude_cred_preflight(
+                    impl_entry.cmd.as_deref(),
+                    &sb.volumes,
+                    implement::now_ms(),
+                )
+                .map_err(Into::into),
+                &mut accounting,
+            )
+            .await?;
     }
-    let mut ccfg = container_rw_cfg_from_entry(&impl_entry, run)?;
+    let mut ccfg = telemetry
+        .setup_result(
+            container_rw_cfg_from_entry(&impl_entry, run).map_err(Into::into),
+            &mut accounting,
+        )
+        .await?;
     // Slice B: runtime-derived LSP nav mounts for the in-container implementor's rust-analyzer (these
     // back the lsp MCP server delivered into this container via the ADR-0028 CodexNative path).
     // These are NAMED volumes mounting at absolute container paths OUTSIDE the `:rw` repo mount, so they
@@ -3456,23 +3653,37 @@ async fn build_warm_impl(
         permission_registry: None,
         perm_timeout_ms: 120_000,
     }) as Arc<dyn bridge_container::ContainerSpawn>;
-    let warm = bridge_container::ContainerRwBackend::new_warm(
-        ccfg.clone(),
-        cspawn.clone(),
-        warm_owner.clone(),
-    )
-    .await?;
+    let warm = telemetry
+        .setup_result(
+            bridge_container::ContainerRwBackend::new_warm(
+                ccfg.clone(),
+                cspawn.clone(),
+                warm_owner.clone(),
+            )
+            .await
+            .map_err(Into::into),
+            &mut accounting,
+        )
+        .await?;
     let session_id = match session_suffix {
         Some(suffix) => format!("implement-{task_id}-{suffix}"),
         None => format!("implement-{task_id}"),
     };
-    let impl_session = bridge_core::ids::SessionId::parse(session_id)
-        .map_err(|e| format!("implement: session id: {e:?}"))?;
-    let session_spec = bridge_core::domain::SessionSpec {
-        config: bridge_core::domain::effective_config(&impl_entry, None),
-        cwd: Some(clone_cwd.clone()),
-    };
-    warm.configure_session(&impl_session, &session_spec).await?;
+    let impl_session = telemetry
+        .setup_result(
+            bridge_core::ids::SessionId::parse(session_id).map_err(Into::into),
+            &mut accounting,
+        )
+        .await?;
+    telemetry
+        .setup_result(
+            warm.configure_session(&impl_session, &session_spec)
+                .await
+                .map_err(Into::into),
+            &mut accounting,
+        )
+        .await?;
+    *telemetry.warm_accounting.lock().unwrap() = accounting;
 
     Ok(WarmImpl {
         warm: Arc::new(warm) as Arc<dyn bridge_core::ports::AgentBackend>,
@@ -3560,6 +3771,8 @@ async fn run_warm_loop(
         )
         .await
     };
+
+    telemetry.settle_unused_preparation().await;
 
     let mut handoff = implement::handoff_text(
         &clone.to_string_lossy(),
@@ -3845,6 +4058,45 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // 3. clone (committed-only) + checkout the base SHA + the task branch.
     implement::do_clone(&repo.to_string_lossy(), &clone.to_string_lossy())?;
+    let branch = implement::branch_for(&task_id);
+    let mut no_commit_checkpoint = implement_resume::ImplementCheckpoint {
+        schema_version: implement_resume::SCHEMA_VERSION,
+        resume_id: task_id.clone(),
+        task_id: task_id.clone(),
+        task_brief: task.clone(),
+        source_repo: repo.clone(),
+        clone_path: clone.clone(),
+        config_path: config_path.clone(),
+        branch: branch.clone(),
+        base_ref: base_ref.clone(),
+        base_commit: base_sha.clone(),
+        current_commit: None,
+        original_message: None,
+        edit_workflow: workflow.clone(),
+        fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
+        loop_max_attempts: loop_cfg.max_attempts,
+        review_invocation: 0,
+        final_review: None,
+        attempt_next: 1,
+        forced_depth: depth.unwrap_or(review::Depth::Auto).to_forced_str(),
+        resolved_lang: None,
+        activity_tally: None,
+        terminal_evidence_counts: None,
+        phase: implement_resume::ImplementPhase::Abort,
+        created_at_ms: implement_resume::now_ms(),
+        updated_at_ms: implement_resume::now_ms(),
+    };
+    let mut refusal_finalizer = RefusedResumeFinalizer {
+        clone: clone.clone(),
+        ck: no_commit_checkpoint.clone(),
+        cfg: cfg.custody.clone(),
+        armed: true,
+        clone_ready: false,
+        abort: true,
+        evidence: cfg.evidence.clone(),
+    };
+    // The terminal archive requires the admitted brief even if later config/setup fails.
+    write_implement_task_file(&clone, &spec)?;
     let _clone_policy = bridge_controller::clone_config::ClonePolicyScope::install(
         &clone,
         loop_cfg.clone_config.clone(),
@@ -3858,7 +4110,6 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         )
         .into());
     }
-    let branch = implement::branch_for(&task_id);
     implement::do_checkout_branch(&clone, &branch)?;
     write_implement_brief_lint_artifact(&clone, &brief_lint, strict_brief);
     let pre = implement::head_sha(&clone)?;
@@ -3902,6 +4153,15 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         _ => review::Depth::Auto,
     };
     let depth = depth.unwrap_or(default_depth);
+    no_commit_checkpoint.forced_depth = depth.to_forced_str();
+    no_commit_checkpoint.resolved_lang = Some(
+        profile
+            .as_ref()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "none".into()),
+    );
+    refusal_finalizer.ck = no_commit_checkpoint.clone();
+    let accounting_store_path = cfg.store.as_ref().map(|store| store.path.clone());
     let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("implement: snapshot: {e}"))?;
@@ -3915,13 +4175,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // VerifyOutcome::ConfigError (verify never runs on the wrong engine). snapshot.allowed_cmds is the
     // verbatim resolved list (no duplicated union to drift). verify_cfg is owned, so this shadows it.
     let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
-    preflight_runtimes(
-        &snapshot,
-        verify_cfg
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .and_then(|v| v.runtime.as_deref()),
-    );
+
     // Canonical config path: the owner token must match between the sweeps and the spawn factory.
     let owner_config_path =
         std::fs::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
@@ -3939,6 +4193,37 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         start: epoch_secs(),
     };
     operation.lease = Some(_lease);
+    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+    let spawn = make_spawn_fn(
+        Arc::clone(&policy),
+        owner_config_path.clone(),
+        run.clone(),
+        None,
+        120_000,
+        worktree_cfg.clone(),
+        None,
+    );
+    let registry = Arc::new(
+        bridge_registry::registry::Registry::new_bound_observed(snapshot.clone(), spawn)
+            .map_err(|e| format!("implement: registry: {e:?}"))?,
+    );
+    let executor = bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+    );
+    preflight_runtimes(
+        &snapshot,
+        verify_cfg
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|v| v.runtime.as_deref()),
+    );
+
+    let telemetry = ImplementAttemptTelemetry::admit(
+        &task_id,
+        accounting_store_path.as_deref(),
+        &base,
+        &clone,
+    )?;
     // F-1 item 1 (review fix): the verify sweep target, keyed on the STABLE source `repo` — the same key
     // `verify::cache_volume_name` hashes over — NEVER the per-run quarantine `clone` (a fresh nonce every
     // run, which would make a SIGKILL-orphaned verify container's owner unrecoverable by the NEXT
@@ -3992,14 +4277,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             )
         })
     });
-    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol =
         warm_lsp_deps_step(&verify_cfg, profile.as_ref(), &repo, &clone, false);
 
-    // B2b-3c: build the WARM :rw backend for the impl agent BEFORE the snapshot / owner_config_path moves
-    // below. The edit + fix turns run on this ONE container + ONE ACP session (off the executor); review
-    // still uses the registry/executor built afterward. All reads of `snapshot`/`owner_config_path` happen
-    // here, before the moves.
+    // The admitted registry serves review; edit/fix share this lazy warm backend and ACP session.
     if loop_cfg.clone_config.enabled {
         implement_resume::record_container_run(&clone, &run.instance_id)?;
     }
@@ -4016,6 +4297,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         impl_lsp_cache_vol.as_deref(),
         profile.as_ref(),
         &repo,
+        telemetry.as_ref(),
+        "implement_edit",
     )
     .await?;
     let warm_runner = Arc::new(
@@ -4032,37 +4315,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .with_clone_config_guard(loop_cfg.clone_config.enabled),
     );
 
-    // The registry + executor are still built — REVIEW runs through them (edit/fix are off-executor).
-    // `run` is CLONED here (not moved): `run_warm_loop` below still needs it to name/label verify
-    // containers (F-1 item 1).
-    let spawn = make_spawn_fn(
-        Arc::clone(&policy),
-        owner_config_path,
-        run.clone(),
-        None,
-        120_000,
-        worktree_cfg.clone(),
-        None,
-    );
-    let registry = Arc::new(
-        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
-            .map_err(|e| format!("implement: registry: {e:?}"))?,
-    );
-    let executor = bridge_workflow::executor::WorkflowExecutor::new(
-        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
-    );
-
-    // Deliver the task to the agent via a FILE in the clone, NOT the ACP session/prompt payload: a large
-    // task that contains non-ASCII chars crashes the in-container claude session/prompt (the large x
-    // non-ASCII interaction; ASCII or small is fine). Writing it to `.git/A2A_TASK.md` keeps the prompt
-    // small + ASCII while the agent reads the full (arbitrarily large / unicode) task from the file
-    // (file-read of unicode is safe — validated). implement-edit.md reads this file instead of {{input}}.
-    write_implement_task_file(&clone, &spec)?;
     // First edit turn — on the WARM session (off the executor). The edit template now points the agent at
     // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
     let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
-    let telemetry = ImplementAttemptTelemetry::new(&task_id);
     // The edit turn is the attempt's first logical provider turn and gets its
     // own bounded local comparison scope off the shared attempt tally.
     let completed = run_direct_implement_turn(
@@ -4073,38 +4329,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     )
     .await;
 
-    let no_commit_checkpoint = implement_resume::ImplementCheckpoint {
-        schema_version: implement_resume::SCHEMA_VERSION,
-        resume_id: task_id.clone(),
-        task_id: task_id.clone(),
-        task_brief: task.clone(),
-        source_repo: repo.clone(),
-        clone_path: clone.clone(),
-        config_path: config_path.clone(),
-        branch: branch.clone(),
-        base_ref: base_ref.clone(),
-        base_commit: base_sha.clone(),
-        current_commit: None,
-        original_message: None,
-        edit_workflow: workflow.clone(),
-        fix_workflow: loop_cfg.fix_workflow.as_str().to_string(),
-        loop_max_attempts: loop_cfg.max_attempts,
-        review_invocation: 0,
-        final_review: None,
-        attempt_next: 1,
-        forced_depth: depth.to_forced_str(),
-        resolved_lang: Some(
-            profile
-                .as_ref()
-                .map(|p| p.id.clone())
-                .unwrap_or_else(|| "none".to_string()),
-        ),
-        activity_tally: None,
-        terminal_evidence_counts: None,
-        phase: implement_resume::ImplementPhase::NoCommitClean,
-        created_at_ms: implement_resume::now_ms(),
-        updated_at_ms: implement_resume::now_ms(),
-    };
+    telemetry.settle_unused_preparation().await;
+
     // 5. the pure soft-gate decision, then execute its Action. A container exists now, so any post-edit
     // early-return must `retire()` (the RunEndGuard is only the backstop).
     if let Err(e) = warm_runner.acquire_host_custody().await {
@@ -4123,6 +4349,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 Some(implement_resume::ImplementPhase::Abort),
                 &evidence_cfg,
             );
+            refusal_finalizer.armed = false;
             return Err(format!("implement: stage check: {e}").into());
         }
     };
@@ -4138,6 +4365,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // R5: the settlement epilogue wraps EVERY handled arm. Previously only `Commit` settled, so
     // `Abort` / `NoCommitClean` / `NoCommitDirty` — three of the four terminals, and the common
     // ones — fell through to `Drop` unsettled.
+    refusal_finalizer.armed = false;
     settle_worktree_run_end(
         _wt_run_guard.as_ref(),
         match finish_initial_implement_action(
@@ -4303,11 +4531,17 @@ struct RefusedResumeFinalizer {
     cfg: bridge_controller::custody_push::CustodyConfig,
     armed: bool,
     clone_ready: bool,
+    abort: bool,
     evidence: bridge_controller::evidence::EvidenceConfig,
 }
 impl Drop for RefusedResumeFinalizer {
     fn drop(&mut self) {
         if self.armed {
+            if self.abort {
+                self.ck.phase = implement_resume::ImplementPhase::Abort;
+                self.ck.updated_at_ms = implement_resume::now_ms();
+                let _ = implement_resume::save_checkpoint(&self.clone, &self.ck);
+            }
             if self.clone_ready {
                 finalize_implement_terminal(&self.clone, &self.cfg, &self.ck, None, &self.evidence);
             } else {
@@ -4370,15 +4604,52 @@ async fn implement_resume_cmd(
         cfg: cfg.custody.clone(),
         armed: true,
         clone_ready: false,
+        abort: false,
         evidence: cfg.evidence.clone(),
     };
-    // Recovery and a fail-closed runtime inventory precede ALL repository-aware clone Git.
+    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
+    // Admit the registry before recovery effects, retaining parsed cfg for later workflow admission.
+    let mut snapshot = config::RegistryConfig::parse(&raw)?.into_snapshot()?;
+    for entry in &mut snapshot.entries {
+        entry.session_cwd = Some(clone_cwd.as_str().to_string());
+    }
+    let owner_config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let host = bridge_core::liveness::host_id();
+    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
+    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
+        .map_err(|e| format!("implement --resume: acquire run lease: {e}"))?;
+    let run = bridge_core::run_identity::RunHandle {
+        instance_id: instance_id.clone(),
+        host: host.clone(),
+        lease: _lease.path().to_string_lossy().to_string(),
+        start: epoch_secs(),
+    };
+    _operation.lease = Some(_lease);
+    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
+    let spawn = make_spawn_fn(
+        Arc::clone(&policy),
+        owner_config_path.clone(),
+        run.clone(),
+        None,
+        120_000,
+        worktree_cfg.clone(),
+        None,
+    );
+    let registry = Arc::new(
+        bridge_registry::registry::Registry::new_bound_observed(snapshot.clone(), spawn)
+            .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
+    );
+    let executor = bridge_workflow::executor::WorkflowExecutor::new(
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+    );
+    // Registry admission precedes recovery; runtime-confirmed custody precedes clone Git.
     let entry_runtimes =
         prepare_clone_entry(&raw, config_path, &clone, &ck.source_repo, true).await?;
     refusal_finalizer.clone_ready = true;
     implement_resume::validate_resumable(&ck)?;
     let resume_sha = implement_resume::reconcile_head(&clone, &ck)?;
-    let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
+    refusal_finalizer.abort = true;
 
     let base = config_path
         .parent()
@@ -4416,17 +4687,10 @@ async fn implement_resume_cmd(
     let custody_cfg = cfg.custody.clone();
     custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
-    let mut snapshot = cfg
-        .into_snapshot()
-        .map_err(|e| format!("implement --resume: snapshot: {e}"))?;
-    // Stamp the clone cwd into every entry's `session_cwd` (mirrors implement_cmd + run_workflow_cmd).
-    // Ensures codex's native MCP `{cwd}` (baked from the static entry at spawn) targets the clone,
-    // not the launch cwd — so prism indexes the right repo during the review step.
-    for e in &mut snapshot.entries {
-        e.session_cwd = Some(clone_cwd.as_str().to_string());
-    }
+    let accounting_store_path = cfg.store.as_ref().map(|store| store.path.clone());
     // Same verify-runtime gate as the implement path (reject a disallowed runtime into ConfigError).
     let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
+
     preflight_runtimes(
         &snapshot,
         verify_cfg
@@ -4435,19 +4699,23 @@ async fn implement_resume_cmd(
             .and_then(|v| v.runtime.as_deref()),
     );
 
-    let owner_config_path =
-        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    let host = bridge_core::liveness::host_id();
-    let instance_id = format!("{}-{}", std::process::id(), implement::nonce(8));
-    let _lease = bridge_core::liveness::acquire_lease(&instance_id)
-        .map_err(|e| format!("implement --resume: acquire run lease: {e}"))?;
-    let run = bridge_core::run_identity::RunHandle {
-        instance_id: instance_id.clone(),
-        host: host.clone(),
-        lease: _lease.path().to_string_lossy().to_string(),
-        start: epoch_secs(),
-    };
-    _operation.lease = Some(_lease);
+    let subject = implement::commit_subject(&clone).unwrap_or_else(|_| {
+        ck.original_message
+            .as_deref()
+            .and_then(|m| m.lines().next())
+            .unwrap_or("")
+            .to_string()
+    });
+    let original_message = ck
+        .original_message
+        .clone()
+        .unwrap_or_else(|| subject.clone());
+    let telemetry = ImplementAttemptTelemetry::admit(
+        &ck.task_id,
+        accounting_store_path.as_deref(),
+        &base,
+        &clone,
+    )?;
     // F-1 item 1 (review fix): same STABLE-repo-keyed derivation as implement_cmd — `ck.source_repo` is
     // the persisted SOURCE repo path (survives across resumes), never the resume clone. See
     // `verify_owner_token`'s doc for why the owner must be repo-keyed, not clone-keyed.
@@ -4488,7 +4756,6 @@ async fn implement_resume_cmd(
         })
     });
 
-    let policy: Arc<dyn PolicyEngine> = Arc::new(AutoPolicy);
     let impl_lsp_cache_vol = warm_lsp_deps_step(
         &verify_cfg,
         profile.as_ref(),
@@ -4500,7 +4767,7 @@ async fn implement_resume_cmd(
     if loop_cfg.clone_config.enabled {
         implement_resume::record_container_run(&clone, &run.instance_id)?;
     }
-    // Setup may spawn a writer; until the loop takes custody, a refused entry only saves metadata.
+    // The loop owns future writer custody; entry failures preserve metadata without clone Git.
     refusal_finalizer.clone_ready = false;
     let warm_impl = build_warm_impl(
         &graph,
@@ -4515,6 +4782,8 @@ async fn implement_resume_cmd(
         impl_lsp_cache_vol.as_deref(),
         profile.as_ref(),
         &ck.source_repo,
+        telemetry.as_ref(),
+        "implement_fix",
     )
     .await?;
     let warm_runner = Arc::new(
@@ -4531,38 +4800,10 @@ async fn implement_resume_cmd(
         .with_clone_config_guard(loop_cfg.clone_config.enabled),
     );
 
-    let spawn = make_spawn_fn(
-        Arc::clone(&policy),
-        owner_config_path,
-        run.clone(),
-        None,
-        120_000,
-        worktree_cfg.clone(),
-        None,
-    );
-    let registry = Arc::new(
-        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
-            .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
-    );
-    let executor = bridge_workflow::executor::WorkflowExecutor::new(
-        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
-    );
-
     let mut prod_ckpt = implement_resume::ProdCheckpoint {
         clone: clone.clone(),
         ck: ck.clone(),
     };
-    let subject = implement::commit_subject(&clone).unwrap_or_else(|_| {
-        ck.original_message
-            .as_deref()
-            .and_then(|m| m.lines().next())
-            .unwrap_or("")
-            .to_string()
-    });
-    let original_message = ck
-        .original_message
-        .clone()
-        .unwrap_or_else(|| subject.clone());
     let task = format!(
         "{}\n\nPrior session state is unavailable; the repository tree and committed diff are authoritative.",
         ck.task_brief
@@ -4579,7 +4820,6 @@ async fn implement_resume_cmd(
         prod_ckpt.ck.forced_depth = depth.to_forced_str();
         let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
     }
-    let telemetry = ImplementAttemptTelemetry::new(&ck.task_id);
     refusal_finalizer.armed = false;
     let outcome_phase = run_warm_loop(
         &clone,
@@ -13128,6 +13368,261 @@ inputs = []
             params["decision"],
             serde_json::json!({ "decision": "approve", "optionId": "approved" })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_capture_failures_settle_custody_and_publish_abort() {
+        for mode in ["terminal_error", "usage_write_fail"] {
+            let f = implement_accounting_support::Fixture::new(3);
+            std::fs::write(f.dir.path().join("mode"), mode).unwrap();
+            let result = implement_cmd(&[
+                "--input".into(),
+                f.dir.path().join("task.md").to_str().unwrap().into(),
+                "--repo".into(),
+                f.dir.path().join("source").to_str().unwrap().into(),
+                "--config".into(),
+                f.config.to_str().unwrap().into(),
+                "--lang".into(),
+                "none".into(),
+            ])
+            .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("workflow did not complete"));
+            let ck = implement_resume::load_checkpoint(&f.clone_path()).unwrap();
+            assert_eq!(ck.phase, implement_resume::ImplementPhase::Abort);
+            let custody = implement_resume::load_custody(&f.clone_path()).unwrap();
+            assert!(
+                custody
+                    .as_ref()
+                    .and_then(|c| c.last_error.as_deref())
+                    .is_none(),
+                "{custody:?}"
+            );
+            assert_eq!(f.prompts().len(), usize::from(mode == "usage_write_fail"));
+            let rows = f.rows();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].dispatched && !rows[0].finalized);
+            let archive = f
+                .dir
+                .path()
+                .join("evidence")
+                .join(bridge_controller::evidence::repo_key(&ck.source_repo).unwrap())
+                .join(format!("{}.tar.gz", ck.task_id));
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+                std::fs::File::open(archive).unwrap(),
+            ));
+            let entry = archive
+                .entries()
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.path().unwrap().as_ref() == Path::new("manifest.json"))
+                .unwrap();
+            let manifest: bridge_controller::evidence::Manifest =
+                serde_json::from_reader(entry).unwrap();
+            assert_eq!(manifest.terminal_phase, "abort");
+            assert_eq!(manifest.task_id, ck.task_id);
+            assert!(manifest.included.iter().any(|item| item.kind == "spec"));
+        }
+    }
+
+    #[tokio::test]
+    async fn implement_review_drain_preserves_composite_failures() {
+        use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
+        let telemetry = ImplementAttemptTelemetry::new("review-failure");
+        let mut failure =
+            bridge_core::translator::AccountingFailureV1::from(BridgeError::ModelNotAvailable);
+        failure.persistence = Some(BridgeError::StoreFailure);
+        let stream = Box::pin(futures::stream::iter([
+            Err(failure.clone()),
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output: "payload".into(),
+            }),
+        ]));
+        let (completed, output, _) = drain_review(stream, telemetry.as_ref()).await;
+        assert!(!completed);
+        assert_eq!(output, "payload");
+        assert_eq!(
+            *telemetry.accounting_failures.lock().unwrap(),
+            vec![failure]
+        );
+    }
+
+    struct AccountingImplementBackend {
+        mode: u8,
+        prompts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentBackend for AccountingImplementBackend {
+        async fn prompt(
+            &self,
+            _: &bridge_core::ids::SessionId,
+            _: Vec<bridge_core::domain::Part>,
+        ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            self.prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode {
+                0 => Err(BridgeError::AgentOverloaded),
+                1 => Err(BridgeError::ModelNotAvailable),
+                _ => Ok(Box::pin(futures::stream::iter([Ok(
+                    bridge_core::ports::Update::done("end_turn"),
+                )]))),
+            }
+        }
+        async fn cancel(&self, _: &bridge_core::ids::SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn retire(&self) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        fn resource_flight_v1(
+            &self,
+        ) -> Result<bridge_core::ports::BackendResourceFlightV1, BridgeError> {
+            Ok(bridge_core::ports::BackendResourceFlightV1::LegacyV2)
+        }
+        async fn set_host_custody(&self, _: bool) -> Result<(), BridgeError> {
+            if self.mode == 2 {
+                Err(BridgeError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl resilient::WarmRebuild for AccountingImplementBackend {
+        async fn rebuild(&self) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+            Ok(Arc::new(Self {
+                mode: 3,
+                prompts: Default::default(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn production_implement_accounting_keeps_typed_failures_and_rebuild_roles() {
+        for mode in 0..4 {
+            let (root, source, clone, config) = custody_fixture();
+            let provider = implement_accounting_support::Fixture::new(3);
+            let cfg = RegistryConfig::parse(&format!(
+                "default='writer'\nallowed_cwd_root={0:?}\n[store]\npath='usage.sqlite'\n[[agents]]\nid='writer'\nkind='container_rw'\ncmd='fixture'\nmodel='good'\neffort='high'\nmode='write'\n[agents.sandbox]\nruntime={1:?}\nimage='fixture'\nmount={0:?}\naccess='rw'\negress='open'\n[[workflows]]\nid='edit'\n[[workflows.nodes]]\nid='edit'\nagent='writer'\nprompt_text='EDIT'\ninputs=[]\n[server]\n", root.path().to_str().unwrap(), provider.dir.path().join("runtime").to_str().unwrap()
+            )).unwrap();
+            let graph = cfg
+                .load_workflows(root.path())
+                .unwrap()
+                .into_values()
+                .next()
+                .unwrap();
+            let telemetry = ImplementAttemptTelemetry::admit(
+                "fixture",
+                cfg.store.as_ref().map(|store| store.path.as_str()),
+                root.path(),
+                &clone,
+            )
+            .unwrap();
+            let snapshot = cfg.into_snapshot().unwrap();
+            let run = bridge_core::run_identity::RunHandle {
+                instance_id: "fixture".into(),
+                host: "fixture".into(),
+                lease: "/unused".into(),
+                start: "0".into(),
+            };
+            let cwd = bridge_core::SessionCwd::parse(clone.to_str().unwrap()).unwrap();
+            let warm = build_warm_impl(
+                &graph,
+                None,
+                &snapshot,
+                &config,
+                &run,
+                Arc::new(AutoPolicy),
+                &cwd,
+                "fixture",
+                None,
+                None,
+                None,
+                &source,
+                telemetry.as_ref(),
+                "implement_edit",
+            )
+            .await
+            .unwrap();
+            warm.warm.retire().await.unwrap();
+            if mode == 3 {
+                std::fs::write(provider.dir.path().join("mode"), "replacement_reject").unwrap();
+            }
+            let backend = Arc::new(AccountingImplementBackend {
+                mode: if mode == 3 { 0 } else { mode },
+                prompts: Default::default(),
+            });
+            let runner = resilient::ResilientWarm::new(
+                backend.clone(),
+                warm.rebuild.clone(),
+                warm.session_spec,
+                1,
+                Arc::new(|| Ok(())),
+            );
+            assert_eq!(
+                run_direct_implement_turn(
+                    &runner,
+                    &warm.impl_session,
+                    vec![bridge_core::domain::Part {
+                        text: "EDIT".into()
+                    }],
+                    telemetry.as_ref()
+                )
+                .await,
+                mode == 0
+            );
+            let failures = telemetry.accounting_failures.lock().unwrap().clone();
+            assert_eq!(
+                failures[0].original,
+                match mode {
+                    0 | 3 => BridgeError::AgentOverloaded,
+                    1 => BridgeError::ModelNotAvailable,
+                    _ => BridgeError::PermissionDenied,
+                }
+            );
+            assert!(failures[0].persistence.is_none());
+            if mode == 3 {
+                assert_eq!(failures.len(), 2);
+                let BridgeError::AgentFailure { diagnostic } = &failures[1].original else {
+                    panic!("replacement setup lost its typed failure");
+                };
+                assert_eq!(
+                    diagnostic.failed_phase(),
+                    bridge_core::diagnostics::DiagnosticPhase::ConfigApply
+                );
+                assert!(!diagnostic.prompt_may_have_been_accepted());
+                assert!(failures[1].persistence.is_none());
+            }
+            assert_eq!(
+                backend.prompts.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(mode != 2)
+            );
+            runner.retire().await.unwrap();
+            let store =
+                rusqlite::Connection::open(root.path().join("usage.sqlite.usage-v1.sqlite"))
+                    .unwrap();
+            let rows: Vec<bridge_core::accounting::UsageAttemptV1> = store
+                .prepare("SELECT record_json FROM usage_attempts_v1 ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+                .collect();
+            assert_eq!(rows.len(), if mode == 0 || mode == 3 { 2 } else { 1 });
+            assert_eq!(rows[0].dispatched, mode != 2);
+            assert_eq!(rows[0].finalized, mode == 2);
+            if mode == 0 || mode == 3 {
+                assert_eq!(provider.setups().len(), 1);
+                assert_ne!(rows[0].id, rows[1].id);
+                assert_eq!(rows[1].attribution.attempt_kind, "implement_edit_rebuild");
+                assert!(rows[1].dispatched);
+                assert_eq!(rows[1].finalized, mode == 0);
+            }
+        }
     }
 
     struct FakeTurnRunner {
