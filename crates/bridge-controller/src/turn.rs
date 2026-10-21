@@ -25,6 +25,16 @@ impl WarmTurnAccountingV1 {
             .start(&self.accounting)
             .await
     }
+    /// Keep the operation role while distinguishing an eligible replacement candidate.
+    pub(crate) async fn prepare_replacement(
+        &self,
+    ) -> Result<PreparedAccountingTurnV1, BridgeError> {
+        let mut attribution = self.attribution.clone();
+        attribution.attempt_kind.push_str("_rebuild");
+        AccountingSelectionV1::new(self.owner.clone(), attribution)?
+            .start(&self.accounting)
+            .await
+    }
     pub(crate) fn validate(
         &self,
         spec: &bridge_core::domain::SessionSpec,
@@ -193,6 +203,7 @@ struct RawTurnEvidence {
 struct RawTurnView {
     inner: Arc<dyn AgentBackend>,
     evidence: Arc<Mutex<RawTurnEvidence>>,
+    stream: Arc<tokio::sync::Mutex<Option<BackendStream>>>,
 }
 #[async_trait::async_trait]
 impl AgentBackend for RawTurnView {
@@ -216,32 +227,50 @@ impl AgentBackend for RawTurnView {
         parts: Vec<Part>,
         observers: BackendObservers,
     ) -> Result<BackendStream, BridgeError> {
-        let mut stream = self
+        let stream = self
             .inner
             .prompt_with_observers(session, parts, observers)
             .await
             .inspect_err(|error| {
                 self.evidence.lock().unwrap().error = Some(error.clone());
             })?;
+        *self.stream.lock().await = Some(stream);
+        let stream = self.stream.clone();
         let evidence = self.evidence.clone();
-        Ok(Box::pin(futures::stream::poll_fn(move |cx| {
-            let next = stream.as_mut().poll_next(cx);
-            match &next {
-                std::task::Poll::Ready(Some(Err(error))) => {
-                    evidence.lock().unwrap().error = Some(error.clone())
+        use futures::StreamExt;
+        Ok(Box::pin(futures::stream::unfold(
+            (stream, evidence),
+            |(stream, evidence)| async move {
+                let mut guard = stream.lock().await;
+                let raw = guard.as_mut().expect("raw turn installed");
+                let Some(item) = raw.next().await else {
+                    evidence.lock().unwrap().ended = true;
+                    return None;
+                };
+                match &item {
+                    Err(error) => {
+                        evidence.lock().unwrap().error = Some(error.clone());
+                        // Capture stops on the first error too. Await raw stream
+                        // settlement before the caller requests writer custody.
+                        while raw.next().await.is_some() {}
+                    }
+                    Ok(bridge_core::ports::Update::Done { stop_reason, .. }) => {
+                        evidence.lock().unwrap().cancelled =
+                            stop_reason == bridge_core::ports::STOP_REASON_CANCELLED;
+                        // Capture stops at Done. Finish the raw warm stream first so
+                        // its awaited custody/active-turn settlement is not detached
+                        // by capture dropping it. Post-terminal items cannot change
+                        // the already observed provider terminal.
+                        while raw.next().await.is_some() {}
+                        // Only proxy EOF marks ended: capture may still fail its
+                        // terminal write and must retain that persistence error.
+                    }
+                    _ => {}
                 }
-                std::task::Poll::Ready(Some(Ok(bridge_core::ports::Update::Done {
-                    stop_reason,
-                    ..
-                }))) => {
-                    evidence.lock().unwrap().cancelled =
-                        stop_reason == bridge_core::ports::STOP_REASON_CANCELLED;
-                }
-                std::task::Poll::Ready(None) => evidence.lock().unwrap().ended = true,
-                _ => {}
-            }
-            next
-        })))
+                drop(guard);
+                Some((item, (stream, evidence)))
+            },
+        )))
     }
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         self.inner.cancel(session).await
@@ -256,10 +285,12 @@ pub(crate) async fn drain_accounted_turn_v1(
     prepared: PreparedAccountingTurnV1,
 ) -> (TurnOutcome, Option<BridgeError>, bool) {
     let evidence = Arc::new(Mutex::new(RawTurnEvidence::default()));
+    let raw_stream = Arc::new(tokio::sync::Mutex::new(None));
     let capture =
         bridge_core::accounting_backend::AccountingBackendV1::new(Arc::new(RawTurnView {
-            inner: backend,
+            inner: backend.clone(),
             evidence: evidence.clone(),
+            stream: raw_stream.clone(),
         }));
     let mut outcome = match capture
         .prompt_accounted_v1(session, parts, prepared.into_attempt(), Some(observers))
@@ -271,12 +302,25 @@ pub(crate) async fn drain_accounted_turn_v1(
             last_err: Some(error),
         },
     };
-    let raw = evidence.lock().unwrap();
-    let persistence = if outcome.last_err.is_some() && raw.error.is_none() && !raw.ended {
-        outcome.last_err.clone()
-    } else {
-        None
+    let persistence = {
+        let raw = evidence.lock().unwrap();
+        if outcome.last_err.is_some() && raw.error.is_none() && !raw.ended {
+            outcome.last_err.clone()
+        } else {
+            None
+        }
     };
+    // Capture may stop on a failed usage write before the raw terminal. Retain
+    // that stream outside capture so its TurnGuard cannot detach on drop; cancel
+    // and await its settlement before returning to host Git custody.
+    if persistence.is_some() {
+        let _ = backend.cancel(session).await;
+        if let Some(mut stream) = raw_stream.lock().await.take() {
+            use futures::StreamExt;
+            while stream.next().await.is_some() {}
+        }
+    }
+    let raw = evidence.lock().unwrap();
     if raw.error.is_some() {
         outcome.last_err = raw.error.clone();
     }

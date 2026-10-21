@@ -323,7 +323,7 @@ impl ResilientWarm {
                 return result;
             }
             if let Some(context) = &accounting {
-                match context.prepare().await {
+                match context.prepare_replacement().await {
                     Ok(attempt) => prepared = Some(attempt),
                     Err(error) => {
                         result
