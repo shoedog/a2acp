@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
 const ALLOWED: &[&str] = &[
+    "bridge-workflow/src/executor.rs:run_from_with_context_inner",
     "bridge-coordinator/src/coordinator.rs:prompt_with_identity",
     "bridge-coordinator/src/coordinator.rs:continue_turn_with_identity",
     "bridge-a2a-inbound/src/server.rs:stream_message",

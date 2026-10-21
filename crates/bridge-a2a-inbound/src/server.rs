@@ -982,6 +982,19 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             )
             .await?;
         Ok(NodeTurn {
+            selection: Some((
+                turn.agent,
+                bridge_core::domain::EffectiveConfig {
+                    model: turn.model,
+                    effort: turn
+                        .effort
+                        .as_deref()
+                        .map(str::parse)
+                        .transpose()
+                        .map_err(|reason| BridgeError::ConfigInvalid { reason })?,
+                    mode: turn.mode,
+                },
+            )),
             backend: turn.backend,
             session: turn.session,
             seed: turn.seed,
