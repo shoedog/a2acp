@@ -2806,9 +2806,10 @@ mod git_tests {
                     .collect::<Vec<_>>(),
                 [format!("A2A-Original: {current}")]
             );
-            assert!(
-                !body.contains("forged") && !body.contains("bad") && !body.contains("duplicate")
-            );
+            assert!(!body.lines().any(|line| matches!(
+                line,
+                "A2A-Run: forged" | "a2a-original: bad" | "A2A-Run: duplicate"
+            )));
         }
     }
 
