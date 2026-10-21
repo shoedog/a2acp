@@ -30,10 +30,10 @@ use tokio_util::sync::CancellationToken;
 use crate::batch::{BatchDeps, BatchParams, BatchRuntime};
 use crate::clock::Clock;
 use crate::detached::{
-    reconcile_pending_terminal_projections, reconcile_terminal_checkpoints, resume_working_tasks,
-    spawn_bound_detached_workflow_with_attempt_barriers,
-    spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
-    workflow_terminal_summary_barrier, AttemptTelemetryState, DetachedDeps, TaskProgressHub,
+    reconcile_pending_terminal_projections, reconcile_terminal_checkpoints,
+    resume_non_batch_tasks_with_accounting, spawn_detached_workflow_accounted,
+    workflow_prompt_dispatch_barrier_with_state, workflow_terminal_summary_barrier,
+    AttemptTelemetryState, DetachedDeps, TaskProgressHub,
 };
 use crate::dispatch::{TaskBinding, WarmCompletionExit, WarmCompletionGuard};
 use crate::params::{OpParams, PermitParams};
@@ -931,7 +931,7 @@ impl Coordinator {
         let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
             field: "batch (not configured)",
         })?;
-        crate::batch::run_batch(&bdeps, p).await
+        crate::batch::run_batch_with_accounting(&bdeps, p, self.accounting.clone()).await
     }
 
     pub async fn batch_status(&self, id: &BatchId) -> Result<BatchSummary, BridgeError> {
@@ -1942,35 +1942,29 @@ impl Coordinator {
             observer_key: Some(task.as_str().to_owned()),
             ..WorkflowRunContext::default()
         };
-        let runner = match admitted {
-            Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
-                &deps,
-                task.clone(),
-                input,
-                graph,
-                identity.run_id().to_string(),
-                token.clone(),
-                HashMap::new(),
-                run_context,
-                hub,
-                prompt_dispatch,
-                Some(terminal_barrier),
-                authority,
-            ),
-            None => spawn_detached_workflow_with_attempt_barriers(
-                &deps,
-                task.clone(),
-                input,
-                graph,
-                identity.run_id().to_string(),
-                token.clone(),
-                HashMap::new(),
-                run_context,
-                hub,
-                prompt_dispatch,
-                Some(terminal_barrier),
-            ),
-        };
+        let accounting = self.accounting.clone().map(|service| {
+            bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
+                service,
+                identity.clone(),
+                wf_id.clone(),
+            )
+        });
+        let runner = spawn_detached_workflow_accounted(
+            &deps,
+            task.clone(),
+            input,
+            graph,
+            identity.run_id().to_string(),
+            token.clone(),
+            HashMap::new(),
+            run_context,
+            hub,
+            prompt_dispatch,
+            Some(terminal_barrier),
+            admitted,
+            None,
+            accounting,
+        );
         if let Some(context) = context {
             let workflow_runs = self.workflow_runs.clone();
             tokio::spawn(async move {
@@ -2238,8 +2232,17 @@ impl Coordinator {
             }
         }
         match self.batch_deps() {
-            Some(bdeps) => crate::batch::resume_all(&bdeps, cap).await,
-            None => resume_working_tasks(&self.detached_deps(), cap).await,
+            Some(bdeps) => {
+                crate::batch::resume_all_with_accounting(&bdeps, cap, self.accounting.clone()).await
+            }
+            None => {
+                resume_non_batch_tasks_with_accounting(
+                    &self.detached_deps(),
+                    cap,
+                    self.accounting.clone(),
+                )
+                .await
+            }
         }
         Ok(())
     }
