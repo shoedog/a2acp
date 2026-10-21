@@ -123,15 +123,94 @@ pub fn workflow_review_checkpoint(clone: &Path) -> Result<Option<ImplementCheckp
     }))
 }
 
-/// Optional host custody metadata wraps the stable run checkpoint. Keeping the
+/// Optional custody and accounting metadata wrap the stable run checkpoint. Keeping the
 /// envelope separate lets existing checkpoint consumers retain their core model;
-/// every disk write preserves the custody lease, including attempt/terminal writes.
+/// every disk write preserves ownership, including stale attempt/terminal writes.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CheckpointFile<T> {
     #[serde(flatten)]
     checkpoint: T,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     custody: Option<crate::custody_push::CustodyState>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_accounting_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    accounting_owner: Option<bridge_core::ids::AttemptIdentity>,
+}
+
+// Missing means legacy/disabled. Present-but-null or an inconsistent chain must
+// never silently mint a replacement execution and detach previously recorded usage.
+fn deserialize_accounting_owner<'de, D>(
+    deserializer: D,
+) -> Result<Option<bridge_core::ids::AttemptIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let owner =
+        <bridge_core::ids::AttemptIdentity as serde::Deserialize>::deserialize(deserializer)?;
+    if (owner.ordinal == 0) != owner.parent_attempt_id.is_none()
+        || owner.parent_attempt_id.as_ref() == Some(&owner.attempt_id)
+    {
+        return Err(serde::de::Error::custom(
+            "invalid accounting ownership chain",
+        ));
+    }
+    Ok(Some(owner))
+}
+
+type CheckpointFields = serde_json::Map<String, serde_json::Value>;
+
+/// Before progress exists, the envelope contains only accounting ownership. Once
+/// any progress fields exist, require the same complete checkpoint as legacy writes.
+fn read_checkpoint_file(clone: &Path) -> Result<Option<CheckpointFile<CheckpointFields>>, String> {
+    let bytes = match std::fs::read(checkpoint_path(clone)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("checkpoint read before update failed".into()),
+    };
+    let file: CheckpointFile<CheckpointFields> =
+        serde_json::from_slice(&bytes).map_err(|_| "checkpoint decode before update failed")?;
+    if !file.checkpoint.is_empty() || file.accounting_owner.is_none() {
+        serde_json::from_value::<ImplementCheckpoint>(serde_json::Value::Object(
+            file.checkpoint.clone(),
+        ))
+        .map_err(|_| "checkpoint decode before update failed")?;
+    }
+    Ok(Some(file))
+}
+
+/// Reopen ownership without admitting a new attempt or requiring a progress
+/// checkpoint. Loading never admits an attempt or creates historical usage rows.
+pub fn load_accounting_owner(
+    clone: &Path,
+) -> Result<Option<bridge_core::ids::AttemptIdentity>, String> {
+    Ok(read_checkpoint_file(clone)?.and_then(|file| file.accounting_owner))
+}
+
+/// Explicit enabled admission, under the run's existing operation lock. Call once
+/// before any accounted work: first admission mints an execution; every subsequent
+/// admission resumes it with a fresh linked attempt. Merely loading/saving progress
+/// never admits ownership. No provider or usage-store work occurs here.
+///
+/// The ownership-only envelope is valid before the first full progress save;
+/// `load_checkpoint` still requires full progress. An error returns no admitted
+/// owner, including when publication succeeded but its durability check failed.
+pub fn admit_accounting_owner(clone: &Path) -> Result<bridge_core::ids::AttemptIdentity, String> {
+    let mut file = read_checkpoint_file(clone)?.unwrap_or(CheckpointFile {
+        checkpoint: CheckpointFields::new(),
+        custody: None,
+        accounting_owner: None,
+    });
+    let owner = match &file.accounting_owner {
+        Some(previous) => previous.resume(),
+        None => bridge_core::ids::AttemptIdentity::initial(),
+    }
+    .map_err(|_| "accounting ownership admission failed")?;
+    file.accounting_owner = Some(owner.clone());
+    write_checkpoint_file(clone, &file)?;
+    Ok(owner)
 }
 
 pub fn load_custody(clone: &Path) -> Result<Option<crate::custody_push::CustodyState>, String> {
@@ -250,15 +329,7 @@ pub fn record_container_run(clone: &Path, instance_id: &str) -> Result<(), Strin
 
 /// Atomic write: serialize to a temp file in the same dir, then rename over the target.
 pub fn save_checkpoint(clone: &Path, ck: &ImplementCheckpoint) -> Result<(), String> {
-    let custody = match std::fs::read(checkpoint_path(clone)) {
-        Ok(bytes) => {
-            let file: CheckpointFile<ImplementCheckpoint> = serde_json::from_slice(&bytes)
-                .map_err(|_| "checkpoint decode before update failed")?;
-            file.custody
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err("checkpoint read before update failed".into()),
-    };
+    let custody = read_checkpoint_file(clone)?.and_then(|file| file.custody);
     save_checkpoint_with_custody(clone, ck, custody)
 }
 
@@ -281,10 +352,7 @@ pub(crate) fn save_custody_only(
                 serde_json::to_value(custody).map_err(|_| "custody encode failed")?,
             );
     }
-    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| "custody encode failed")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes).map_err(|_| "custody checkpoint write failed")?;
-    std::fs::rename(tmp, path).map_err(|_| "custody checkpoint rename failed".into())
+    write_checkpoint_file(clone, &value)
 }
 
 pub(crate) fn save_checkpoint_with_custody(
@@ -292,6 +360,7 @@ pub(crate) fn save_checkpoint_with_custody(
     ck: &ImplementCheckpoint,
     custody: Option<crate::custody_push::CustodyState>,
 ) -> Result<(), String> {
+    let accounting_owner = read_checkpoint_file(clone)?.and_then(|file| file.accounting_owner);
     let mut ck = ck.clone();
     if let Ok(previous) = load_checkpoint(clone) {
         if previous.review_invocation > ck.review_invocation {
@@ -299,16 +368,38 @@ pub(crate) fn save_checkpoint_with_custody(
             ck.final_review = previous.final_review;
         }
     }
+    write_checkpoint_file(
+        clone,
+        &CheckpointFile {
+            checkpoint: &ck,
+            custody,
+            accounting_owner,
+        },
+    )
+}
+
+fn write_checkpoint_file<T: serde::Serialize>(clone: &Path, file: &T) -> Result<(), String> {
+    use std::io::Write;
     let dir = clone.join(".git").join("a2a-bridge");
     std::fs::create_dir_all(&dir).map_err(|e| format!("checkpoint mkdir {dir:?}: {e}"))?;
     let tmp = dir.join("implement-checkpoint.json.tmp");
-    let bytes = serde_json::to_vec_pretty(&CheckpointFile {
-        checkpoint: &ck,
-        custody,
-    })
-    .map_err(|e| format!("checkpoint encode: {e}"))?;
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("checkpoint write {tmp:?}: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(file).map_err(|e| format!("checkpoint encode: {e}"))?;
+    let mut output =
+        std::fs::File::create(&tmp).map_err(|e| format!("checkpoint create {tmp:?}: {e}"))?;
+    output
+        .write_all(&bytes)
+        .and_then(|_| output.sync_all())
+        .map_err(|e| format!("checkpoint write {tmp:?}: {e}"))?;
+    drop(output);
     std::fs::rename(&tmp, checkpoint_path(clone)).map_err(|e| format!("checkpoint rename: {e}"))?;
+    std::fs::File::open(&dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("checkpoint directory sync: {e}"))?;
+    // Admission can create a2a-bridge before the first progress checkpoint. Its
+    // directory entry in .git must be durable as well as the file entry within it.
+    std::fs::File::open(clone.join(".git"))
+        .and_then(|git| git.sync_all())
+        .map_err(|e| format!("checkpoint parent sync: {e}"))?;
     Ok(())
 }
 
@@ -579,6 +670,293 @@ mod tests {
         drop((held, other));
         let reacquired = acquire_operation_lock(&b).unwrap();
         drop(reacquired);
+    }
+
+    #[test]
+    fn accounting_ownership_round_trips_in_checkpoint_envelope() {
+        let td = tempfile::tempdir().unwrap();
+        let owner = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let mut value = serde_json::to_value(sample(td.path())).unwrap();
+        value["accounting_owner"] = serde_json::to_value(&owner).unwrap();
+        let envelope: CheckpointFile<ImplementCheckpoint> = serde_json::from_value(value).unwrap();
+        let back = serde_json::to_value(envelope).unwrap();
+        assert_eq!(
+            back["accounting_owner"],
+            serde_json::to_value(owner).unwrap()
+        );
+    }
+
+    #[test]
+    fn accounting_ownership_survives_stale_progress_save() {
+        let td = tempfile::tempdir().unwrap();
+        let stale = sample(td.path());
+        save_checkpoint(td.path(), &stale).unwrap();
+        let owner = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let mut value = serde_json::to_value(&stale).unwrap();
+        value["accounting_owner"] = serde_json::to_value(&owner).unwrap();
+        std::fs::write(
+            checkpoint_path(td.path()),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        save_checkpoint(td.path(), &stale).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint_path(td.path())).unwrap()).unwrap();
+        assert_eq!(
+            back["accounting_owner"],
+            serde_json::to_value(owner).unwrap()
+        );
+    }
+
+    fn checkpoint_value(clone: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(checkpoint_path(clone)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn accounting_fresh_admission_precedes_progress_and_reopens_unchanged() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir(td.path().join(".git")).unwrap();
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), None);
+        let first = admit_accounting_owner(td.path()).unwrap();
+        assert_eq!(first.ordinal, 0);
+        assert_eq!(first.parent_attempt_id, None);
+        assert!(load_checkpoint(td.path()).is_err(), "no invented progress");
+        assert_eq!(checkpoint_value(td.path()).as_object().unwrap().len(), 1);
+        assert_eq!(
+            load_accounting_owner(td.path()).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            load_accounting_owner(td.path()).unwrap(),
+            Some(first.clone())
+        );
+
+        // A resume can also arrive before progress was ever written.
+        let resumed = admit_accounting_owner(td.path()).unwrap();
+        assert_eq!(resumed.execution_id, first.execution_id);
+        assert_ne!(resumed.attempt_id, first.attempt_id);
+        assert_eq!(resumed.ordinal, 1);
+        assert_eq!(resumed.parent_attempt_id, Some(first.attempt_id));
+        save_checkpoint(td.path(), &sample(td.path())).unwrap();
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), Some(resumed));
+        assert_eq!(load_checkpoint(td.path()).unwrap().task_id, "impl-1-ab");
+    }
+
+    #[test]
+    fn accounting_resume_admission_links_each_attempt_without_changing_progress() {
+        let td = tempfile::tempdir().unwrap();
+        save_checkpoint(td.path(), &sample(td.path())).unwrap();
+        let mut previous = admit_accounting_owner(td.path()).unwrap();
+        for ordinal in 1..=3 {
+            let mut before = checkpoint_value(td.path());
+            let next = admit_accounting_owner(td.path()).unwrap();
+            assert_eq!(next.execution_id, previous.execution_id);
+            assert_ne!(next.attempt_id, previous.attempt_id);
+            assert_eq!(next.ordinal, ordinal);
+            assert_eq!(next.parent_attempt_id.as_ref(), Some(&previous.attempt_id));
+            assert_eq!(next.run_id(), next.attempt_id.as_str());
+            assert_eq!(
+                load_accounting_owner(td.path()).unwrap(),
+                Some(next.clone())
+            );
+            before["accounting_owner"] = serde_json::to_value(&next).unwrap();
+            assert_eq!(checkpoint_value(td.path()), before);
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn accounting_legacy_admission_adds_only_ownership_without_usage_backfill() {
+        let td = tempfile::tempdir().unwrap();
+        save_checkpoint(td.path(), &sample(td.path())).unwrap();
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), None);
+        assert_eq!(load_checkpoint(td.path()).unwrap().attempt_next, 2);
+        let mut before = checkpoint_value(td.path());
+        before["future_progress_field"] = serde_json::json!({"preserve": true});
+        std::fs::write(
+            checkpoint_path(td.path()),
+            serde_json::to_vec(&before).unwrap(),
+        )
+        .unwrap();
+        let owner = admit_accounting_owner(td.path()).unwrap();
+        assert_eq!(owner.ordinal, 0, "legacy work is not fabricated attempts");
+        assert_eq!(owner.parent_attempt_id, None);
+        let mut after = checkpoint_value(td.path());
+        assert_eq!(
+            after.as_object_mut().unwrap().remove("accounting_owner"),
+            Some(serde_json::to_value(owner).unwrap())
+        );
+        assert_eq!(after, before, "admission changes no legacy fields");
+        let files: Vec<_> = std::fs::read_dir(td.path().join(".git/a2a-bridge"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            files,
+            ["implement-checkpoint.json"],
+            "ownership creates no usage records"
+        );
+    }
+
+    #[test]
+    fn accounting_owner_survives_all_checkpoint_writers_and_review_reconciliation() {
+        use crate::tweak::CheckpointSink;
+        use bridge_core::attempt_activity::AttemptRecorder;
+        let td = tempfile::tempdir().unwrap();
+        let stale = sample(td.path());
+        save_checkpoint(td.path(), &stale).unwrap();
+        admit_accounting_owner(td.path()).unwrap();
+        let latest = admit_accounting_owner(td.path()).unwrap();
+        let check_owner = || {
+            assert_eq!(
+                load_accounting_owner(td.path()).unwrap(),
+                Some(latest.clone())
+            )
+        };
+        let mut sink = ProdCheckpoint {
+            clone: td.path().into(),
+            ck: stale.clone(),
+        };
+        sink.record(3, "progress-sha");
+        check_owner();
+        assert_eq!(
+            load_checkpoint(td.path())
+                .unwrap()
+                .current_commit
+                .as_deref(),
+            Some("progress-sha")
+        );
+        let state = crate::custody_push::CustodyState {
+            destination: "host:backup.git".into(),
+            ..Default::default()
+        };
+        save_custody_only(td.path(), Some(state.clone())).unwrap();
+        check_owner();
+        assert_eq!(
+            load_custody(td.path()).unwrap().unwrap().destination,
+            state.destination
+        );
+        let invocation = crate::evidence::begin_review(td.path()).unwrap();
+        check_owner();
+        crate::evidence::complete_review(td.path(), 3, invocation, "review evidence").unwrap();
+        check_owner();
+        save_checkpoint_with_custody(td.path(), &stale, Some(state)).unwrap();
+        check_owner();
+        assert_eq!(
+            load_checkpoint(td.path()).unwrap().review_invocation,
+            invocation
+        );
+        assert_eq!(
+            load_checkpoint(td.path()).unwrap().final_review.as_deref(),
+            Some("review-3-1.md")
+        );
+        let terminal = write_terminal(td.path(), stale, ImplementPhase::Approved).unwrap();
+        check_owner();
+        let recorder = bridge_core::attempt_activity::SharedAttemptRecorder::new(
+            bridge_core::attempt_activity::SystemMonotonicClock::start(),
+        );
+        let tally = recorder.tally().unwrap();
+        write_attempt_telemetry(td.path(), terminal, tally, Default::default());
+        check_owner();
+        let back = load_checkpoint(td.path()).unwrap();
+        assert_eq!(back.phase, ImplementPhase::Approved);
+        assert_eq!(back.activity_tally, Some(tally));
+        assert_eq!(back.review_invocation, invocation);
+        assert_eq!(back.final_review.as_deref(), Some("review-3-1.md"));
+        assert_eq!(
+            load_custody(td.path()).unwrap().unwrap().destination,
+            "host:backup.git"
+        );
+    }
+
+    #[test]
+    fn accounting_malformed_ownership_refuses_admission_and_progress_overwrite() {
+        let td = tempfile::tempdir().unwrap();
+        save_checkpoint(td.path(), &sample(td.path())).unwrap();
+        let owner = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let valid = serde_json::to_value(&owner).unwrap();
+        let mut invalid_id = valid.clone();
+        invalid_id["execution_id"] = serde_json::json!("exec-invalid");
+        let mut missing_parent = valid.clone();
+        missing_parent["ordinal"] = serde_json::json!(1);
+        let mut initial_parent = valid.clone();
+        initial_parent["parent_attempt_id"] = serde_json::to_value(&owner.attempt_id).unwrap();
+        let mut self_parent = initial_parent.clone();
+        self_parent["ordinal"] = serde_json::json!(1);
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            invalid_id,
+            missing_parent,
+            initial_parent,
+            self_parent,
+        ] {
+            let mut value = serde_json::to_value(sample(td.path())).unwrap();
+            value["accounting_owner"] = invalid;
+            let bytes = serde_json::to_vec(&value).unwrap();
+            std::fs::write(checkpoint_path(td.path()), &bytes).unwrap();
+            assert!(admit_accounting_owner(td.path()).is_err());
+            assert!(load_accounting_owner(td.path()).is_err());
+            assert!(load_checkpoint(td.path()).is_err());
+            assert!(save_checkpoint(td.path(), &sample(td.path())).is_err());
+            assert!(save_checkpoint_with_custody(td.path(), &sample(td.path()), None).is_err());
+            assert_eq!(std::fs::read(checkpoint_path(td.path())).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn accounting_ordinal_overflow_never_publishes_a_new_owner() {
+        let td = tempfile::tempdir().unwrap();
+        save_checkpoint(td.path(), &sample(td.path())).unwrap();
+        let mut owner = bridge_core::ids::AttemptIdentity::initial()
+            .unwrap()
+            .resume()
+            .unwrap();
+        owner.ordinal = u32::MAX;
+        let mut value = checkpoint_value(td.path());
+        value["accounting_owner"] = serde_json::to_value(&owner).unwrap();
+        std::fs::write(
+            checkpoint_path(td.path()),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(checkpoint_path(td.path())).unwrap();
+        assert!(admit_accounting_owner(td.path()).is_err());
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), Some(owner));
+        assert_eq!(std::fs::read(checkpoint_path(td.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn accounting_persistence_failure_returns_no_admitted_owner() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join(".git/a2a-bridge");
+        std::fs::create_dir_all(dir.join("implement-checkpoint.json.tmp")).unwrap();
+        assert!(admit_accounting_owner(td.path()).is_err());
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), None);
+        assert!(!checkpoint_path(td.path()).exists());
+        std::fs::remove_dir(dir.join("implement-checkpoint.json.tmp")).unwrap();
+        let owner = admit_accounting_owner(td.path()).unwrap();
+        let before = std::fs::read(checkpoint_path(td.path())).unwrap();
+        std::fs::create_dir(dir.join("implement-checkpoint.json.tmp")).unwrap();
+        assert!(admit_accounting_owner(td.path()).is_err());
+        assert_eq!(load_accounting_owner(td.path()).unwrap(), Some(owner));
+        assert_eq!(std::fs::read(checkpoint_path(td.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn accounting_unreadable_or_malformed_checkpoint_is_not_a_fresh_admission() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(checkpoint_path(td.path())).unwrap();
+        assert!(admit_accounting_owner(td.path()).is_err());
+        std::fs::remove_dir(checkpoint_path(td.path())).unwrap();
+        for bytes in ["{", "null", "{}", r#"{"task_id":"incomplete"}"#] {
+            std::fs::write(checkpoint_path(td.path()), bytes).unwrap();
+            assert!(admit_accounting_owner(td.path()).is_err());
+            assert_eq!(
+                std::fs::read_to_string(checkpoint_path(td.path())).unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]
