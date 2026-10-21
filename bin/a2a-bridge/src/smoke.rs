@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bridge_core::accounting::{AccountingV1, PreparedUsageAttemptV1, UsageAttributionV1};
 use bridge_core::catalog::{is_blocked_model_id, AgentCaps};
 use bridge_core::diagnostics::{
     diagnostic_timestamp_ms, DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor,
@@ -67,6 +68,7 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_RESOLVED_BACKEND: Arc<dyn AgentBackend>;
+    static TEST_ACCOUNTING_CLOCK: bridge_core::task_store::PersistenceClock;
 }
 
 fn smoke_resolved_backend(default: Arc<dyn AgentBackend>) -> Arc<dyn AgentBackend> {
@@ -834,6 +836,7 @@ async fn finalize_smoke_with_history(
 }
 
 struct ArtifactState {
+    accounting: Option<PreparedUsageAttemptV1>,
     artifact: SmokeArtifactV2,
     failure: Option<FailureDiagnostic>,
     observer: Arc<InMemoryDiagnosticObserver>,
@@ -921,6 +924,7 @@ impl ArtifactState {
                 },
                 cleanup: CleanupRecord::default(),
             },
+            accounting: None,
             failure: None,
             observer: Arc::new(
                 InMemoryDiagnosticObserver::new(DIAGNOSTIC_CAPACITY)
@@ -1040,6 +1044,23 @@ impl ArtifactState {
     }
 
     async fn finalize(mut self, include_stderr: bool) -> SmokeArtifactV2 {
+        if let Some(attempt) = self.accounting.take() {
+            if let Err(error) = attempt.preparation_failed().await {
+                tracing::warn!(
+                    reason = error.client_message(),
+                    "smoke accounting settlement unavailable"
+                );
+                if self.failure.is_none() {
+                    self.fail_static(
+                        DiagnosticPhase::Teardown,
+                        DiagnosticFailureClass::Persistence,
+                        "smoke.durable_evidence_unavailable",
+                        "Smoke accounting preparation refusal could not be persisted",
+                        false,
+                    );
+                }
+            }
+        }
         self.artifact.attempt.ended_at_ms = diagnostic_timestamp_ms();
         let events = self.observer.snapshot().await;
         self.artifact.diagnostics.dropped_events = self.observer.dropped_count().await;
@@ -1347,6 +1368,48 @@ where
     }
 }
 
+// Used only for the prompt handoff, never registry storage, configuration, or cleanup.
+// Accounting writes its dispatch barrier before this boundary observes the actual inner poll.
+struct SmokePromptBoundary {
+    inner: Arc<dyn AgentBackend>,
+    polled: Arc<std::sync::atomic::AtomicBool>,
+    deadline: tokio::time::Instant,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for SmokePromptBoundary {
+    async fn prompt(
+        &self,
+        _: &SessionId,
+        _: Vec<Part>,
+    ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observers: BackendObservers,
+    ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+        match deadline_first(self.deadline, async {
+            self.polled.store(true, Ordering::Relaxed);
+            self.inner
+                .prompt_with_observers(session, parts, observers)
+                .await
+        })
+        .await
+        {
+            DeadlineFirst::Completed(result) => result,
+            DeadlineFirst::TimedOut { .. } => Err(BridgeError::AgentTimedOut),
+        }
+    }
+
+    async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.inner.cancel(session).await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_one(
     backend: Arc<dyn AgentBackend>,
@@ -1355,6 +1418,7 @@ async fn execute_one(
     observer: Arc<InMemoryDiagnosticObserver>,
     rich: Arc<SmokeRichSink>,
     mut history: Option<&mut SmokeHistoryGuard>,
+    accounting: &mut Option<PreparedUsageAttemptV1>,
     deadline: tokio::time::Instant,
     fallback_cwd: Option<&crate::local_file::PinnedDirectory>,
 ) -> DrainResult {
@@ -1418,23 +1482,29 @@ async fn execute_one(
 
     let rich_dyn: Arc<dyn RichEventSink> = rich.clone();
     let diagnostic_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
-    let provider_prompt_polled = std::sync::atomic::AtomicBool::new(false);
+    let provider_prompt_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt_backend = Arc::new(SmokePromptBoundary {
+        inner: backend,
+        polled: provider_prompt_polled.clone(),
+        deadline,
+    });
     let prompt = async {
         if let Some(history) = history.as_deref_mut() {
             history.mark_prompt_dispatch().await?;
         }
-        // This store occurs immediately before constructing and polling the
-        // provider future in the same async poll.
-        provider_prompt_polled.store(true, Ordering::Relaxed);
-        backend
-            .prompt_with_observers(
-                session,
-                vec![Part {
-                    text: FIXED_PROMPT.to_owned(),
-                }],
-                BackendObservers::new(diagnostic_dyn, Some(rich_dyn)),
-            )
-            .await
+        let parts = vec![Part {
+            text: FIXED_PROMPT.to_owned(),
+        }];
+        let observers = BackendObservers::new(diagnostic_dyn, Some(rich_dyn));
+        if let Some(attempt) = accounting.take() {
+            bridge_core::accounting_backend::AccountingBackendV1::new(prompt_backend)
+                .prompt_accounted_v1(session, parts, attempt, Some(observers))
+                .await
+        } else {
+            prompt_backend
+                .prompt_with_observers(session, parts, observers)
+                .await
+        }
     };
     let stream = match deadline_first(deadline, prompt).await {
         DeadlineFirst::TimedOut { .. } => {
@@ -1450,6 +1520,23 @@ async fn execute_one(
                     failed_phase: DiagnosticPhase::PromptStart,
                     last_completed_phase: Some(DiagnosticPhase::ConfigApply),
                     prompt_may_have_been_accepted: provider_polled,
+                }),
+            };
+        }
+        DeadlineFirst::Completed(Err(BridgeError::AgentTimedOut))
+            if !provider_prompt_polled.load(Ordering::Relaxed)
+                && tokio::time::Instant::now() >= deadline =>
+        {
+            turn.terminal_state = "timeout";
+            return DrainResult {
+                turn,
+                configure_calls,
+                error: Some(BridgeError::AgentTimedOut),
+                static_failure: None,
+                deadline_timeout: Some(DeadlineTimeoutContext {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                    prompt_may_have_been_accepted: false,
                 }),
             };
         }
@@ -1915,6 +2002,28 @@ fn apply_cleanup_outcome(state: &mut ArtifactState, primary_failed: bool, cleanu
     }
 }
 
+async fn prepare_smoke_accounting(
+    accounting: Option<&AccountingV1>,
+    owner: bridge_core::ids::AttemptIdentity,
+    agent: &AgentId,
+    effective: &EffectiveConfig,
+) -> Result<bridge_core::translator::PreparedAccountingTurnV1, BridgeError> {
+    let accounting = accounting.ok_or(BridgeError::StoreFailure)?;
+    bridge_core::translator::AccountingSelectionV1::new(
+        owner,
+        UsageAttributionV1 {
+            agent: agent.as_str().into(),
+            effective_model: effective.model.clone(),
+            effective_effort: effective.effort.as_ref().map(crate::effort_to_string),
+            effective_mode: effective.mode.clone(),
+            attempt_kind: "smoke".into(),
+            ..Default::default()
+        },
+    )?
+    .start(accounting)
+    .await
+}
+
 async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let mut state = ArtifactState::new(args);
     eprintln!(
@@ -2003,7 +2112,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
-    let history_selection: bridge_coordinator::WorkflowHistorySelection = match cfg.store.as_ref() {
+    let selected_store = match cfg.store.as_ref() {
         Some(store) => {
             let base = config_path.parent().unwrap_or_else(|| Path::new("."));
             let path = Path::new(&store.path);
@@ -2013,7 +2122,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 base.join(path)
             };
             let opened = bridge_store::sqlite::SqliteStore::open_shared_history(&path)
-                .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
+                .map(Arc::new)
                 .map_err(|error| error.reason);
             #[cfg(test)]
             crate::history_route_witness("Smoke", "ConfiguredShared");
@@ -2022,13 +2131,25 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         None => {
             let opened = bridge_store::sqlite::select_platform_history()
                 .and_then(|selection| selection.open_concurrent())
-                .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
+                .map(Arc::new)
                 .map_err(|error| error.reason);
             #[cfg(test)]
             crate::history_route_witness("Smoke", "SelectedConcurrent");
             opened
         }
     };
+    let accounting = selected_store.as_ref().ok().map(|store| {
+        #[cfg(test)]
+        if let Ok(clock) = TEST_ACCOUNTING_CLOCK.try_with(Arc::clone) {
+            return AccountingV1 {
+                clock,
+                ..AccountingV1::new(store.clone())
+            };
+        }
+        AccountingV1::new(store.clone())
+    });
+    let history_selection: bridge_coordinator::WorkflowHistorySelection =
+        selected_store.map(|store| store as Arc<dyn WorkflowHistoryStore>);
     let identity = bridge_core::ids::AttemptIdentity {
         execution_id: state.artifact.attempt.execution_id.clone(),
         attempt_id: state.artifact.attempt.attempt_id.clone(),
@@ -2038,7 +2159,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let mut history_guard = match bridge_coordinator::admit_direct_attempt_with_history(
         history_selection,
         smoke_workflow_observer(),
-        identity,
+        identity.clone(),
         bridge_core::workflow_history::ExecutionSurface::Smoke,
         "smoke",
         "direct",
@@ -2065,6 +2186,56 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+
+    // Start the one absolute deadline before accounting/configuration preparation and provenance. These
+    // pre-spawn phases therefore consume the same bounded budget as resolve/configure/prompt/drain;
+    // an eventually-returning recovery can never age an accepted OAuth credential past the
+    // preflight runway and then receive a fresh turn deadline.
+    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    // Freeze available selection metadata before validation can refuse the admitted attempt.
+    // This does not authorize resolution or provider execution.
+    let selected = cfg
+        .agents
+        .iter()
+        .find(|entry| entry.id == args.agent.as_str());
+    let selected_config = EffectiveConfig {
+        model: args
+            .model
+            .clone()
+            .or_else(|| selected.and_then(|entry| entry.model.clone())),
+        effort: args
+            .effort
+            .or_else(|| selected.and_then(|entry| entry.effort.as_deref()?.parse().ok())),
+        mode: args
+            .mode
+            .clone()
+            .or_else(|| selected.and_then(|entry| entry.mode.clone())),
+    };
+    // This preparation shares smoke's absolute deadline and freezes a distinct concrete turn
+    // under the artifact's operation owner. No provider work may proceed without durable admission.
+    let prepare =
+        prepare_smoke_accounting(accounting.as_ref(), identity, &args.agent, &selected_config);
+    match deadline_first(deadline, prepare).await {
+        DeadlineFirst::Completed(Ok(prepared)) => state.accounting = Some(prepared.into_attempt()),
+        result => {
+            let timed_out = matches!(result, DeadlineFirst::TimedOut { .. });
+            state.artifact.attempt.timed_out = timed_out;
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                if timed_out {
+                    DiagnosticFailureClass::Timeout
+                } else {
+                    DiagnosticFailureClass::Persistence
+                },
+                "smoke.durable_evidence_unavailable",
+                "Smoke accounting preparation did not complete",
+                false,
+            );
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
+        }
+    }
 
     let snapshot = match crate::validate_registry_config_contents(raw) {
         Ok(snapshot) => snapshot,
@@ -2218,12 +2389,12 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
     sanitize_optional_artifact_text(&mut state.artifact.request.model, &artifact_redactor);
     sanitize_optional_artifact_text(&mut state.artifact.request.mode, &artifact_redactor);
-    // Start the one absolute deadline before credential provenance and orphan recovery. Those
-    // pre-spawn phases therefore consume the same bounded budget as resolve/configure/prompt/drain;
-    // an eventually-returning recovery can never age an accepted OAuth credential past the
-    // preflight runway and then receive a fresh turn deadline.
-    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    let overrides = AgentOverride {
+        model: args.model.clone(),
+        effort: args.effort,
+        mode: args.mode.clone(),
+    };
+    let effective = effective_config(&entry, Some(&overrides));
     let provenance = artifact_provenance(&snapshot, &args.agent, &artifact_redactor);
     let stale_oauth = doctor::provenance_blocks_smoke_spawn(&provenance);
     state.artifact.target = Some(TargetRecord {
@@ -2244,12 +2415,6 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             .await;
     }
 
-    let overrides = AgentOverride {
-        model: args.model.clone(),
-        effort: args.effort,
-        mode: args.mode.clone(),
-    };
-    let effective = effective_config(&entry, Some(&overrides));
     // Guarded host fallback uses the ACP child's pinned process cwd and an object-addressed absolute
     // session cwd installed by make_spawn_fn. Ordinary smoke retains the explicit SessionSpec cwd.
     let execution_session_cwd = pinned_session_cwd
@@ -2389,6 +2554,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         Arc::clone(&state.observer),
         rich,
         Some(&mut history_guard),
+        &mut state.accounting,
         deadline,
         pinned_session_cwd.as_ref(),
     )
@@ -3090,6 +3256,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             None,
+            &mut None,
             tokio::time::Instant::now() + timeout,
             None,
         )
@@ -3534,6 +3701,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounting_preparation_and_configuration_share_the_smoke_deadline() {
+        use bridge_core::task_store::TaskStore;
+        for slow_preparation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history.sqlite");
+            let store =
+                Arc::new(bridge_store::sqlite::SqliteStore::open_shared_history(&path).unwrap());
+            let mut accounting = AccountingV1::new(store);
+            if slow_preparation {
+                accounting.clock = Arc::new(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    bridge_core::task_store::system_wall_now_ms()
+                });
+            }
+            let mut state = ArtifactState::new(&args());
+            let owner = bridge_core::ids::AttemptIdentity {
+                execution_id: state.artifact.attempt.execution_id.clone(),
+                attempt_id: state.artifact.attempt.attempt_id.clone(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            };
+            let spec = SessionSpec {
+                config: EffectiveConfig::default(),
+                cwd: None,
+            };
+            let deadline = tokio::time::Instant::now()
+                + if slow_preparation {
+                    Duration::from_millis(25)
+                } else {
+                    Duration::from_secs(5)
+                };
+            let prepared = deadline_first(
+                deadline,
+                prepare_smoke_accounting(Some(&accounting), owner, &args().agent, &spec.config),
+            )
+            .await;
+            if let DeadlineFirst::Completed(Ok(prepared)) = prepared {
+                state.accounting = Some(prepared.into_attempt());
+            } else {
+                assert!(slow_preparation);
+            }
+            let backend = Arc::new(FakeBackend::new(Behavior::ConfigFailure));
+            let result = execute_one(
+                backend.clone(),
+                &SessionId::parse("accounted-config").unwrap(),
+                &spec,
+                state.observer.clone(),
+                Arc::new(SmokeRichSink::default()),
+                None,
+                &mut state.accounting,
+                deadline,
+                None,
+            )
+            .await;
+            assert!(result.error.is_some());
+            assert_eq!(result.turn.prompt_calls, 0);
+            assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                backend.configure_calls.load(Ordering::SeqCst),
+                usize::from(!slow_preparation)
+            );
+            apply_execute_result(&mut state, result);
+            let artifact = state.finalize(false).await;
+            assert!(!artifact.attempt.prompt_may_have_been_accepted);
+            if !slow_preparation {
+                let reopened =
+                    bridge_store::sqlite::SqliteStore::open_history_read_only(&path).unwrap();
+                let summary = reopened
+                    .usage_summary_v1(&Default::default())
+                    .await
+                    .unwrap();
+                let bucket = &summary.buckets[0];
+                assert_eq!(
+                    (bucket.attempted, bucket.dispatched, bucket.pending),
+                    (1, 0, 0)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_attempt_accounting_exhaustion_prevents_resolution_and_provider_work() {
+        for fallback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bridge.toml");
+            fs::write(
+                &path,
+                format!(
+                    "default = 'test'\n[store]\npath = {:?}\n[server]\n\
+             [[agents]]\nid = 'test'\nkind = 'api'\nbase_url = 'http://127.0.0.1:9/v1'\n",
+                    dir.path().join("history.sqlite"),
+                ),
+            )
+            .unwrap();
+            let mut smoke_args = args();
+            smoke_args.config = path;
+            smoke_args.timeout_secs = 1;
+            if fallback {
+                let cwd = crate::local_file::snapshot_directory(dir.path(), "test cwd").unwrap();
+                smoke_args.fallback_guard = Some(FallbackSmokeGuard {
+                    expected_config_sha256: crate::local_file::read_regular_file_bounded(
+                        &smoke_args.config,
+                        "test config",
+                        MAX_CONFIG_BYTES,
+                    )
+                    .unwrap()
+                    .sha256,
+                    expected_executable_sha256: crate::local_file::read_regular_file_bounded(
+                        &std::env::current_exe().unwrap(),
+                        "test executable",
+                        MAX_EXECUTABLE_BYTES,
+                    )
+                    .unwrap()
+                    .sha256,
+                    expected_session_cwd: cwd.canonical_cwd.clone(),
+                    expected_session_cwd_identity: cwd.identity.clone(),
+                    expected_source_mount: cwd.canonical_cwd,
+                    expected_source_mount_identity: cwd.identity,
+                    source_agent: smoke_args.agent.clone(),
+                });
+            }
+            let clock: bridge_core::task_store::PersistenceClock = Arc::new(move || {
+                // Synchronous persistence preparation completes after expiry in the same poll.
+                if !fallback {
+                    std::thread::sleep(Duration::from_millis(1100));
+                }
+                bridge_core::task_store::system_wall_now_ms()
+            });
+            let backend = Arc::new(FakeBackend::new(Behavior::Exact));
+            let artifact = TEST_ACCOUNTING_CLOCK
+                .scope(
+                    clock,
+                    TEST_RESOLVED_BACKEND.scope(
+                        backend.clone() as Arc<dyn AgentBackend>,
+                        run_attempt(&smoke_args),
+                    ),
+                )
+                .await;
+            assert_eq!(artifact.attempt.timed_out, !fallback);
+            if fallback {
+                assert_eq!(
+                    artifact.diagnostics.failure.as_ref().unwrap()["code"],
+                    "smoke.fallback_target_drift"
+                );
+            }
+            assert_eq!(artifact.session.configure_calls, 0);
+            assert_eq!(artifact.turn.prompt_calls, 0);
+            assert!(!artifact.attempt.prompt_may_have_been_accepted);
+            assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
+            assert!(!artifact
+                .diagnostics
+                .lifecycle
+                .iter()
+                .any(|event| event["transition"]["phase"] == "resolve"
+                    && event["transition"]["status"] == "started"));
+            use bridge_core::task_store::TaskStore;
+            let store = bridge_store::sqlite::SqliteStore::open_history_read_only(
+                &dir.path().join("history.sqlite"),
+            )
+            .unwrap();
+            let summary = store.usage_summary_v1(&Default::default()).await.unwrap();
+            let row = &summary.buckets[0];
+            assert_eq!((row.attempted, row.dispatched, row.pending), (1, 0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_prompt_boundary_never_polls_the_inner_provider() {
+        let backend = Arc::new(FakeBackend::new(Behavior::Exact));
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let boundary = SmokePromptBoundary {
+            inner: backend.clone(),
+            polled: polled.clone(),
+            deadline: tokio::time::Instant::now(),
+        };
+        let result = boundary
+            .prompt_with_observers(
+                &SessionId::parse("expired-dispatch").unwrap(),
+                vec![],
+                BackendObservers::new(Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()), None),
+            )
+            .await;
+        assert!(matches!(result, Err(BridgeError::AgentTimedOut)));
+        assert!(!polled.load(Ordering::Relaxed));
+        assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn exact_pong_terminal_is_one_configure_and_one_fixed_prompt() {
         let (backend, result) = execute(Behavior::Exact, Duration::from_secs(1)).await;
         assert!(result.error.is_none());
@@ -3694,6 +4050,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             None,
+            &mut None,
             tokio::time::Instant::now() + Duration::from_secs(1),
             Some(&pin),
         )
@@ -3747,6 +4104,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             None,
+            &mut None,
             tokio::time::Instant::now() - Duration::from_millis(1),
             None,
         )
@@ -3793,6 +4151,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             None,
+            &mut None,
             tokio::time::Instant::now() + Duration::from_millis(100),
             None,
         )
@@ -3844,6 +4203,7 @@ mod tests {
             observer(),
             Arc::new(SmokeRichSink::default()),
             None,
+            &mut None,
             tokio::time::Instant::now() + Duration::from_millis(100),
             None,
         )
