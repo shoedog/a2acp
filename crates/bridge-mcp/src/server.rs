@@ -74,16 +74,20 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
         ) {
             (Ok(p), Ok(identity)) => {
                 let locator = identity.clone();
-                coord.prompt_with_identity(p, identity).await.map(|o| {
-                    json!({
-                        "text": o.text,
-                        "stop_reason": o.stop_reason,
-                        "context": o.context.as_str(),
-                        "execution_id": locator.execution_id.as_str(),
-                        "attempt_id": locator.attempt_id.as_str(),
-                        "attempt_ordinal": locator.ordinal,
+                coord
+                    .prompt_with_identity_outcome(p, identity)
+                    .await
+                    .map_err(|failure| failure.surfaced_error())
+                    .map(|o| {
+                        json!({
+                            "text": o.text,
+                            "stop_reason": o.stop_reason,
+                            "context": o.context.as_str(),
+                            "execution_id": locator.execution_id.as_str(),
+                            "attempt_id": locator.attempt_id.as_str(),
+                            "attempt_ordinal": locator.ordinal,
+                        })
                     })
-                })
             }
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
@@ -94,8 +98,9 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
             (Ok(p), Ok(identity)) => {
                 let locator = identity.clone();
                 coord
-                    .continue_turn_with_identity(p, identity)
+                    .continue_turn_with_identity_outcome(p, identity)
                     .await
+                    .map_err(|failure| failure.surfaced_error())
                     .map(|o| {
                         json!({
                             "text": o.text,

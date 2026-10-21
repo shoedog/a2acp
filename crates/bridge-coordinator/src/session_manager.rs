@@ -153,6 +153,25 @@ impl WarmExpiryIntent {
     }
 }
 
+/// Exact retained selection, validated under the same lock as the compaction claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionSnapshot {
+    handle: SessionHandleId,
+    generation: SessionGeneration,
+    pub agent: AgentId,
+    pub config: bridge_core::domain::EffectiveConfig,
+}
+impl From<&WarmHandle> for CompactionSnapshot {
+    fn from(h: &WarmHandle) -> Self {
+        Self {
+            handle: h.id.clone(),
+            generation: h.generation,
+            agent: h.agent.clone(),
+            config: h.fingerprint.config.clone(),
+        }
+    }
+}
+
 struct WarmHandle {
     #[allow(dead_code)] // surfaced by handle ops in later slices
     id: SessionHandleId,
@@ -663,6 +682,29 @@ impl SessionManager {
         {
             self.lock2_pause_started.notified().await;
         }
+    }
+
+    pub async fn compaction_snapshot(&self, ctx: &ContextId) -> Option<CompactionSnapshot> {
+        self.by_context
+            .lock()
+            .await
+            .get(ctx)
+            .map(CompactionSnapshot::from)
+    }
+
+    /// Retained configuration only; this never supplies accounting ownership.
+    pub async fn accounting_selection(
+        &self,
+        ctx: &ContextId,
+    ) -> Option<(
+        bridge_core::ids::AgentId,
+        bridge_core::domain::EffectiveConfig,
+    )> {
+        self.by_context
+            .lock()
+            .await
+            .get(ctx)
+            .map(|h| (h.agent.clone(), h.fingerprint.config.clone()))
     }
 
     fn warm_turn_from_handle(
@@ -2094,9 +2136,29 @@ impl SessionManager {
         F: FnOnce(Arc<dyn AgentBackend>, SessionId) -> Fut,
         Fut: std::future::Future<Output = Result<String, BridgeError>>,
     {
+        let snapshot = self.compaction_snapshot(ctx).await;
+        self.compact_session_prepared(ctx, &snapshot, summarize)
+            .await
+    }
+
+    pub async fn compact_session_prepared<F, Fut>(
+        &self,
+        ctx: &ContextId,
+        expected: &Option<CompactionSnapshot>,
+        summarize: F,
+    ) -> Result<ResetOutcome, BridgeError>
+    where
+        F: FnOnce(Arc<dyn AgentBackend>, SessionId) -> Fut,
+        Fut: std::future::Future<Output = Result<String, BridgeError>>,
+    {
         // (1) Claim Idle -> Compacting under one lock; capture incl. the fallible cwd parse BEFORE the flip (FIX-9).
         let (backend, old_id, claimed_id, new_gen, new_id, spec) = {
             let mut tab = self.by_context.lock().await;
+            if *expected != tab.get(ctx).map(CompactionSnapshot::from) {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "accounting selection",
+                });
+            }
             let Some(h) = tab.get_mut(ctx) else {
                 return Ok(ResetOutcome::NotFound);
             };

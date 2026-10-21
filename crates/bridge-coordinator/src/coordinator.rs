@@ -20,7 +20,7 @@ use bridge_core::ports::{
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
-use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
+use bridge_core::translator::{AccountingFailureV1, Event, EventKind, TaskOutcome, Translator};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
 use futures::StreamExt;
@@ -145,6 +145,7 @@ pub struct TaskStatusDto {
 }
 
 pub struct DirectAttemptHandle {
+    usage: Option<bridge_core::translator::PreparedAccountingTurnV1>,
     barrier: bridge_core::workflow_history::DirectAttemptBarrier,
     pub identity: bridge_core::ids::AttemptIdentity,
     observer: Arc<dyn Observer>,
@@ -525,6 +526,7 @@ pub async fn admit_direct_attempt_with_history(
         surface: surface.as_str(),
     });
     Ok(DirectAttemptHandle {
+        usage: None,
         barrier,
         identity,
         observer,
@@ -603,6 +605,7 @@ impl From<&TaskRecord> for TaskStatusDto {
 /// The stable Rust service API. ONE owner of the orchestration state; A2A/CLI/MCP are thin adapters
 /// over it. Concrete struct (one impl, no trait).
 pub struct Coordinator {
+    accounting: Option<bridge_core::accounting::AccountingV1>,
     pub session_manager: Arc<crate::session_manager::SessionManager>,
     executor: Option<Arc<WorkflowExecutor>>,
     workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
@@ -661,6 +664,7 @@ impl Coordinator {
         resume_attempt_cap: u32,
     ) -> Self {
         Self {
+            accounting: None,
             session_manager,
             executor,
             workflows,
@@ -685,6 +689,71 @@ impl Coordinator {
             )),
             workflow_admission: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_accounting(mut self, accounting: bridge_core::accounting::AccountingV1) -> Self {
+        self.accounting = Some(accounting);
+        self
+    }
+
+    pub async fn prepare_usage(
+        &self,
+        owner: bridge_core::ids::AttemptIdentity,
+        agent: &AgentId,
+        overrides: Option<&AgentOverride>,
+        retained: Option<&ContextId>,
+        kind: &str,
+        node: Option<String>,
+    ) -> Result<Option<bridge_core::translator::PreparedAccountingTurnV1>, BridgeError> {
+        if self.accounting.is_none() {
+            return Ok(None);
+        }
+        let retained_requested = retained.is_some();
+        let retained = match retained {
+            Some(ctx) => self.session_manager.accounting_selection(ctx).await,
+            None => None,
+        };
+        let (agent, config) = match retained {
+            Some(selection) => (selection.0.as_str().to_owned(), Some(selection.1)),
+            None if retained_requested => ("unknown".into(), None),
+            None => (
+                agent.as_str().to_owned(),
+                self.registry
+                    .entry_snapshot(agent)
+                    .map(|entry| bridge_core::domain::effective_config(&entry, overrides)),
+            ),
+        };
+        self.prepare_usage_selection(owner, agent, config, kind, node)
+            .await
+    }
+
+    pub async fn prepare_usage_selection(
+        &self,
+        owner: bridge_core::ids::AttemptIdentity,
+        agent: String,
+        config: Option<bridge_core::domain::EffectiveConfig>,
+        kind: &str,
+        node: Option<String>,
+    ) -> Result<Option<bridge_core::translator::PreparedAccountingTurnV1>, BridgeError> {
+        let Some(accounting) = &self.accounting else {
+            return Ok(None);
+        };
+        let selection = bridge_core::translator::AccountingSelectionV1::new(
+            owner,
+            bridge_core::accounting::UsageAttributionV1 {
+                agent,
+                node,
+                effective_model: config.as_ref().and_then(|c| c.model.clone()),
+                effective_effort: config
+                    .as_ref()
+                    .and_then(|c| c.effort.map(|e| format!("{e:?}").to_ascii_lowercase())),
+                effective_mode: config.and_then(|c| c.mode),
+                attempt_kind: kind.into(),
+                ..Default::default()
+            },
+        )?;
+        selection.start(accounting).await.map(Some)
     }
 
     #[must_use]
@@ -959,7 +1028,7 @@ impl Coordinator {
     }
 
     /// Compatibility-only service entry used by embedders with no selected history.
-    /// Production MCP/A2A callers must use `prompt_with_identity`.
+    /// Production adapters use `prompt_with_identity_outcome`.
     #[cfg(test)]
     pub async fn prompt(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
         if matches!(&self.workflow_history, Some(Ok(_))) {
@@ -967,14 +1036,27 @@ impl Coordinator {
                 field: "execution_id/attempt_id",
             });
         }
-        self.prompt_inner(p, None).await
+        self.prompt_inner(p, None)
+            .await
+            .map_err(|failure| failure.surfaced_error())
     }
 
+    /// Compatibility projection; production adapters retain the composite outcome.
     pub async fn prompt_with_identity(
         &self,
         p: OpParams,
         identity: bridge_core::ids::AttemptIdentity,
     ) -> Result<TurnOutput, BridgeError> {
+        self.prompt_with_identity_outcome(p, identity)
+            .await
+            .map_err(|failure| failure.surfaced_error())
+    }
+
+    pub async fn prompt_with_identity_outcome(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         let _ = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
         let fingerprint_agent = p.agent.clone().unwrap_or_else(|| {
             AgentId::parse("unresolved").expect("fixed unresolved agent id is valid")
@@ -994,11 +1076,29 @@ impl Coordinator {
         self.prompt_inner(p, Some(attempt)).await
     }
 
+    async fn settle_preparation_failure(
+        mut attempt: Option<&mut DirectAttemptHandle>,
+        error: BridgeError,
+    ) -> AccountingFailureV1 {
+        let mut failure = AccountingFailureV1::from(error)
+            .settle(attempt.as_mut().and_then(|a| a.usage.take()))
+            .await;
+        if failure.persistence.is_none() {
+            if let Some(attempt) = attempt {
+                failure.persistence = attempt
+                    .finish("failed", "pre_prompt_failure", true, "not_needed")
+                    .await
+                    .err();
+            }
+        }
+        failure
+    }
+
     async fn prompt_inner(
         &self,
         p: OpParams,
         mut attempt: Option<DirectAttemptHandle>,
-    ) -> Result<TurnOutput, BridgeError> {
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         let _deferred_cold_bindings = &self.bindings;
         let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
         let agent = p
@@ -1006,6 +1106,18 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.usage = self
+                .prepare_usage(
+                    attempt.identity.clone(),
+                    &agent,
+                    Some(&p.agent_override()),
+                    None,
+                    "direct",
+                    None,
+                )
+                .await?;
+        }
         let diagnostic = direct_diagnostic_observer();
         let turn = match self
             .session_manager
@@ -1020,12 +1132,7 @@ impl Coordinator {
         {
             Ok(turn) => turn,
             Err(error) => {
-                if let Some(attempt) = attempt.as_mut() {
-                    attempt
-                        .finish("failed", "pre_prompt_failure", true, "not_needed")
-                        .await?;
-                }
-                return Err(error);
+                return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
@@ -1043,16 +1150,29 @@ impl Coordinator {
                 field: "execution_id/attempt_id",
             });
         }
-        self.continue_turn_inner(p, None).await
+        self.continue_turn_inner(p, None)
+            .await
+            .map_err(|failure| failure.surfaced_error())
     }
 
+    /// Compatibility projection; production adapters retain the composite outcome.
     pub async fn continue_turn_with_identity(
         &self,
         p: OpParams,
         identity: bridge_core::ids::AttemptIdentity,
     ) -> Result<TurnOutput, BridgeError> {
+        self.continue_turn_with_identity_outcome(p, identity)
+            .await
+            .map_err(|failure| failure.surfaced_error())
+    }
+
+    pub async fn continue_turn_with_identity_outcome(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         if p.context.is_none() {
-            return Err(BridgeError::InvalidRequest { field: "context" });
+            return Err(BridgeError::InvalidRequest { field: "context" }.into());
         }
         let fingerprint_agent =
             AgentId::parse("unresolved").expect("fixed unresolved agent id is valid");
@@ -1074,21 +1194,29 @@ impl Coordinator {
         &self,
         p: OpParams,
         mut attempt: Option<DirectAttemptHandle>,
-    ) -> Result<TurnOutput, BridgeError> {
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         let ctx = p
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
         let diagnostic = direct_diagnostic_observer();
+        if let Some(attempt) = attempt.as_mut() {
+            let unknown = AgentId::parse("unknown")?;
+            attempt.usage = self
+                .prepare_usage(
+                    attempt.identity.clone(),
+                    &unknown,
+                    None,
+                    Some(&ctx),
+                    "direct",
+                    None,
+                )
+                .await?;
+        }
         let turn = match self.session_manager.checkout_existing_turn(&ctx).await {
             Ok(turn) => turn,
             Err(error) => {
-                if let Some(attempt) = attempt.as_mut() {
-                    attempt
-                        .finish("failed", "pre_prompt_failure", true, "not_needed")
-                        .await?;
-                }
-                return Err(error);
+                return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
@@ -1164,6 +1292,7 @@ impl Coordinator {
     ) -> Result<TurnOutput, BridgeError> {
         self.collect_turn_observed_with_attempt(ctx, turn, input, diagnostic, None)
             .await
+            .map_err(|failure| failure.surfaced_error())
     }
 
     async fn collect_turn_observed_with_attempt(
@@ -1173,7 +1302,7 @@ impl Coordinator {
         input: String,
         diagnostic: Arc<dyn DiagnosticObserver>,
         attempt: Option<DirectAttemptHandle>,
-    ) -> Result<TurnOutput, BridgeError> {
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         self.collect_turn_observed_with_attempt_and_turn_id(
             ctx,
             turn,
@@ -1193,7 +1322,7 @@ impl Coordinator {
         diagnostic: Arc<dyn DiagnosticObserver>,
         mut attempt: Option<DirectAttemptHandle>,
         turn_id: Result<bridge_core::ids::TurnId, BridgeError>,
-    ) -> Result<TurnOutput, BridgeError> {
+    ) -> Result<TurnOutput, AccountingFailureV1> {
         // The caller has already checked out this exact warm operation. Arm
         // completion before task/turn identity minting or any later fallible
         // setup so an early return cannot strand the handle in Running.
@@ -1209,7 +1338,15 @@ impl Coordinator {
             Some(attempt) => TaskId::parse(attempt.identity.execution_id.as_str().to_string())?,
             None => self.mint_prompt_task_id(),
         };
-        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn, turn_id)?;
+        let (obs_ctx, usage) = bridge_core::translator::settle_usage_preparation_v1(
+            Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn, turn_id)
+                .map_err(Into::into),
+            attempt.as_mut().and_then(|a| a.usage.take()),
+        )
+        .await?;
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.usage = usage;
+        }
         let started = Instant::now();
         let mut ttft = None;
         let mut last_usage: Option<UsageSnapshot> = None;
@@ -1262,13 +1399,17 @@ impl Coordinator {
             )
             .await;
 
-        let (activity_recorder, terminal_evidence) = match attempt.as_ref() {
+        let (activity_recorder, terminal_evidence) = match attempt.as_mut() {
             Some(attempt) => {
-                attempt.prepare_terminal_evidence(
+                if let Err(error) = attempt.prepare_terminal_evidence(
                     turn.generation.get(),
                     &turn.session,
                     &obs_ctx.turn_id,
-                )?;
+                ) {
+                    return Err(bridge_core::translator::AccountingFailureV1::from(error)
+                        .settle(attempt.usage.take())
+                        .await);
+                }
                 let capability = turn.backend.terminal_evidence_capability();
                 match capability {
                     bridge_core::terminal_evidence::EvidenceCapability::V1 => {
@@ -1291,7 +1432,10 @@ impl Coordinator {
                     as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
             ),
         };
-        let translator = Translator::new();
+        let translator = match attempt.as_mut().and_then(|a| a.usage.take()) {
+            Some(usage) => Translator::for_turn(turn.backend.clone(), Some(usage)),
+            None => Translator::new(), // Explicit compatibility entry without installed accounting.
+        };
         let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
             bridge_core::task_store::TaskStoreHarvestAuditStore::new(self.task_store.clone()),
         );
@@ -1339,7 +1483,8 @@ impl Coordinator {
                     Ok(Some(ev)) => ev,
                     Ok(None) => break,
                     Err(error) => {
-                        finish_guard.observe_exit(WarmCompletionExit::Error(&error));
+                        let error = translator.reject_preparation(error.into()).await;
+                        finish_guard.observe_exit(WarmCompletionExit::Error(&error.original));
                         collected.push(Err(error));
                         break;
                     }
@@ -1363,7 +1508,7 @@ impl Coordinator {
                 Err(error) => {
                     // Arm expiry synchronously at the error observation site,
                     // before collection/formatting or any cleanup await.
-                    finish_guard.observe_exit(WarmCompletionExit::Error(error));
+                    finish_guard.observe_exit(WarmCompletionExit::Error(&error.original));
                     collected.push(ev);
                 }
                 Ok(event)
@@ -1401,7 +1546,7 @@ impl Coordinator {
         };
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
-            let outcome = TurnOutcome::Failed(classify_failure(e));
+            let outcome = TurnOutcome::Failed(classify_failure(&e.original));
             self.observer.record(&ObsEvent::TurnFinished {
                 ctx: &obs_ctx,
                 latency: started.elapsed(),
@@ -1429,7 +1574,7 @@ impl Coordinator {
                     .finish("failed", "cleanup_failed", true, "failed")
                     .await?;
             }
-            return Err(error);
+            return Err(error.into());
         }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
         let out_text = if let Some(artifact_text) = events
@@ -3201,6 +3346,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn preparation_failures_preserve_original_and_settlement_outcomes() {
+        for fail_settlement in [false, true] {
+            for selection_mismatch in [false, true] {
+                let store = Arc::new(OneShotPendingTaskStore::with_faults(false, false, false));
+                store
+                    .fail_usage_settlement
+                    .store(fail_settlement, AtomicOrdering::SeqCst);
+                let backend = Arc::new(FakeBackend::new(None));
+                let fixture =
+                    coordinator_fixture_with_backend(Arc::new(HashMap::new()), backend.clone());
+                let coordinator = fixture
+                    .coordinator
+                    .with_accounting(bridge_core::accounting::AccountingV1::new(store.clone()))
+                    .with_workflow_history(Ok(Arc::new(PromptBarrierFailureHistory::default())));
+                let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+                let failure = if selection_mismatch {
+                    let usage = coordinator
+                        .prepare_usage(
+                            identity,
+                            &AgentId::parse("codex").unwrap(),
+                            None,
+                            None,
+                            "direct",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let translator = Translator::for_turn(backend.clone(), usage);
+                    let session = SessionId::parse("mismatch").unwrap();
+                    let context = TurnContext {
+                        turn_id: Coordinator::new_turn_id().unwrap(),
+                        session_id: ctx("mismatch"),
+                        task_id: None,
+                        agent: "codex".into(),
+                        model: Some("different-model".into()),
+                        effort: None,
+                        mode: None,
+                        workflow: None,
+                        node: None,
+                        attempt: 0,
+                        prompt_id: None,
+                        traceparent: None,
+                    };
+                    let failure = translator
+                        .run_observed(
+                            backend.as_ref(),
+                            coordinator.session_store.as_ref(),
+                            coordinator.policy.as_ref(),
+                            &TaskId::parse("mismatch").unwrap(),
+                            &session,
+                            vec![],
+                            direct_diagnostic_observer(),
+                            context,
+                            Arc::new(bridge_core::harvest::NoopHarvestAuditStore),
+                        )
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap_err();
+                    failure
+                } else {
+                    match coordinator
+                        .prompt_with_identity_outcome(prompt_params("hi"), identity)
+                        .await
+                    {
+                        Ok(_) => panic!("barrier must refuse dispatch"),
+                        Err(failure) => failure,
+                    }
+                };
+                let original = if selection_mismatch {
+                    BridgeError::ConfigMismatch {
+                        field: "accounting selection",
+                    }
+                } else {
+                    BridgeError::DurableEvidenceUnavailable { reason: "io" }
+                };
+                assert_eq!(failure.original, original);
+                assert_eq!(
+                    failure.persistence,
+                    fail_settlement.then_some(BridgeError::StoreFailure)
+                );
+                assert_eq!(store.usage_settlements.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+            }
+        }
+    }
+
     async fn prompt_barrier_failure_terminal(
         backend: Arc<FakeBackend>,
     ) -> bridge_core::workflow_history::AttemptTerminal {
@@ -3858,6 +4091,8 @@ mod tests {
         fail_after_pending_once: std::sync::atomic::AtomicBool,
         fail_pending_read_once: std::sync::atomic::AtomicBool,
         fail_scan_once: std::sync::atomic::AtomicBool,
+        fail_usage_settlement: std::sync::atomic::AtomicBool,
+        usage_settlements: AtomicUsize,
     }
 
     impl OneShotPendingTaskStore {
@@ -3886,6 +4121,8 @@ mod tests {
                 ),
                 fail_pending_read_once: std::sync::atomic::AtomicBool::new(fail_pending_read_once),
                 fail_scan_once: std::sync::atomic::AtomicBool::new(false),
+                fail_usage_settlement: std::sync::atomic::AtomicBool::new(false),
+                usage_settlements: AtomicUsize::new(0),
             }
         }
 
@@ -3963,6 +4200,31 @@ mod tests {
 
     #[async_trait]
     impl TaskStore for OneShotPendingTaskStore {
+        async fn start_usage_attempt_v1(
+            &self,
+            _: &bridge_core::accounting::UsageAttemptV1,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+        async fn update_usage_attempt_v1(
+            &self,
+            _: &str,
+            dispatched: bool,
+            _: Option<UsageSnapshot>,
+            finalized: bool,
+        ) -> Result<(), BridgeError> {
+            assert!(
+                !dispatched && finalized,
+                "only preparation settlement is expected"
+            );
+            self.usage_settlements.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_usage_settlement.load(AtomicOrdering::SeqCst) {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
+        }
+
         async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
             self.inner.create(rec).await
         }
@@ -4834,7 +5096,13 @@ mod tests {
                 Err(BridgeError::IdentityUnavailable),
             )
             .await;
-        assert!(matches!(result, Err(BridgeError::IdentityUnavailable)));
+        assert!(matches!(
+            result,
+            Err(AccountingFailureV1 {
+                original: BridgeError::IdentityUnavailable,
+                ..
+            })
+        ));
         assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
 
         for _ in 0..100 {

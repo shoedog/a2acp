@@ -132,8 +132,138 @@ impl Event {
     }
 }
 
+/// Selection is public before `start`: an admitted routing owner may inspect or
+/// replace its own selection here. This seam grants no fallback authority.
+/// Each explicit candidate gets a fresh concrete ID under the same operation.
+pub struct AccountingSelectionV1 {
+    pub owner: crate::ids::AttemptIdentity,
+    pub concrete: crate::ids::AttemptId,
+    pub attribution: crate::accounting::UsageAttributionV1,
+}
+impl AccountingSelectionV1 {
+    pub fn new(
+        owner: crate::ids::AttemptIdentity,
+        attribution: crate::accounting::UsageAttributionV1,
+    ) -> Result<Self, BridgeError> {
+        let concrete = crate::ids::AttemptId::mint()?;
+        let mut attribution = attribution;
+        attribution.turn = Some(concrete.as_str().into());
+        Ok(Self {
+            owner,
+            concrete,
+            attribution,
+        })
+    }
+    pub async fn start(
+        self,
+        accounting: &crate::accounting::AccountingV1,
+    ) -> Result<PreparedAccountingTurnV1, BridgeError> {
+        self.start_with(accounting, |_| Ok(())).await
+    }
+
+    /// Observe the admitted selection before freezing it or writing accounting.
+    /// This hook receives no dispatch, fallback, or additional routing authority.
+    pub async fn start_with(
+        self,
+        accounting: &crate::accounting::AccountingV1,
+        hook: impl FnOnce(&Self) -> Result<(), BridgeError>,
+    ) -> Result<PreparedAccountingTurnV1, BridgeError> {
+        hook(&self)?;
+        let mut attribution = self.attribution;
+        attribution.execution = Some(self.owner.execution_id.as_str().into());
+        attribution.run_attempt = Some(self.owner.attempt_id.as_str().into());
+        let attempt = accounting
+            .start(&self.owner, self.concrete, attribution.clone())
+            .await?;
+        Ok(PreparedAccountingTurnV1 {
+            attempt,
+            attribution,
+        })
+    }
+}
+
+/// Frozen selection accompanying the single-use dispatch authority.
+pub struct PreparedAccountingTurnV1 {
+    attempt: crate::accounting::PreparedUsageAttemptV1,
+    attribution: crate::accounting::UsageAttributionV1,
+}
+impl PreparedAccountingTurnV1 {
+    pub fn attribution(&self) -> &crate::accounting::UsageAttributionV1 {
+        &self.attribution
+    }
+    pub fn into_attempt(self) -> crate::accounting::PreparedUsageAttemptV1 {
+        self.attempt
+    }
+
+    pub fn matches_config(
+        &self,
+        model: &Option<String>,
+        effort: &Option<String>,
+        mode: &Option<String>,
+    ) -> bool {
+        self.attribution.effective_model == *model
+            && self.attribution.effective_effort == *effort
+            && self.attribution.effective_mode == *mode
+    }
+    pub async fn reject_preparation(self, original: BridgeError) -> AccountingFailureV1 {
+        AccountingFailureV1::from(original).settle(Some(self)).await
+    }
+}
+
+/// Routing evidence remains caller-owned and conservative. Accounting settlement
+/// cannot erase the original typed failure or manufacture replay/cleanup evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountingFailureV1 {
+    pub original: BridgeError,
+    pub replay: crate::routing::ReplayEvidenceV1,
+    pub cleanup: crate::ports::BackendCleanupDispositionV1,
+    pub persistence: Option<BridgeError>,
+}
+impl From<BridgeError> for AccountingFailureV1 {
+    fn from(original: BridgeError) -> Self {
+        Self {
+            original,
+            replay: Default::default(),
+            cleanup: crate::ports::BackendCleanupDispositionV1::Unknown,
+            persistence: None,
+        }
+    }
+}
+impl AccountingFailureV1 {
+    pub async fn settle(mut self, attempt: Option<PreparedAccountingTurnV1>) -> Self {
+        if let Some(attempt) = attempt {
+            if let Err(error) = attempt.attempt.preparation_failed().await {
+                self.persistence = Some(error);
+            }
+        }
+        self
+    }
+    pub fn surfaced_error(&self) -> BridgeError {
+        self.persistence.as_ref().unwrap_or(&self.original).clone()
+    }
+}
+
+/// Settle only preparation failures. The original typed failure (including its
+/// evidence) passes through unchanged; persistence failure stays separate until
+/// the adapter projects `surfaced_error`.
+pub async fn settle_usage_preparation_v1<T>(
+    result: Result<T, AccountingFailureV1>,
+    attempt: Option<PreparedAccountingTurnV1>,
+) -> Result<(T, Option<PreparedAccountingTurnV1>), AccountingFailureV1> {
+    match result {
+        Ok(value) => Ok((value, attempt)),
+        Err(error) => Err(error.settle(attempt).await),
+    }
+}
+
+struct TurnCaptureV1 {
+    backend: crate::accounting_backend::AccountingBackendV1,
+    envelope: std::sync::Mutex<Option<PreparedAccountingTurnV1>>,
+}
+
 pub struct Translator {
     max_chunk: usize,
+    capture: Option<Arc<TurnCaptureV1>>,
 }
 
 fn default_turn_context(task: &TaskId, session: &SessionId) -> crate::ports::TurnContext {
@@ -157,7 +287,42 @@ fn default_turn_context(task: &TaskId, session: &SessionId) -> crate::ports::Tur
 
 impl Translator {
     pub fn new() -> Self {
-        Self { max_chunk: 1200 }
+        Self {
+            max_chunk: 1200,
+            capture: None,
+        }
+    }
+
+    /// A single-use capture view, never installed in registry/session storage.
+    pub fn for_turn(
+        backend: Arc<dyn AgentBackend>,
+        attempt: Option<PreparedAccountingTurnV1>,
+    ) -> Self {
+        let mut translator = Self::new();
+        translator.capture = Some(Arc::new(TurnCaptureV1 {
+            backend: crate::accounting_backend::AccountingBackendV1::new(backend),
+            envelope: std::sync::Mutex::new(attempt),
+        }));
+        translator
+    }
+
+    /// Settle an explicit refusal before the stream's first poll. Once dispatch
+    /// consumes the envelope, interruption deliberately retains pending actuals.
+    pub async fn reject_preparation(
+        &self,
+        mut failure: AccountingFailureV1,
+    ) -> AccountingFailureV1 {
+        let attempt = match &self.capture {
+            Some(capture) => match capture.envelope.lock() {
+                Ok(mut envelope) => envelope.take(),
+                Err(_) => {
+                    failure.persistence = Some(BridgeError::StoreFailure);
+                    None
+                }
+            },
+            None => None,
+        };
+        failure.settle(attempt).await
     }
 
     /// Drives `backend.prompt(session, parts)` and returns a stream of translated events.
@@ -170,7 +335,7 @@ impl Translator {
         task: &'a TaskId,
         session: &'a SessionId,
         parts: Vec<Part>,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, AccountingFailureV1>> + Send + 'a>> {
         self.run_observed(
             backend,
             store,
@@ -201,7 +366,7 @@ impl Translator {
         diagnostic: Arc<dyn DiagnosticObserver>,
         turn_context: crate::ports::TurnContext,
         harvest_audit_store: Arc<dyn HarvestAuditStore>,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, AccountingFailureV1>> + Send + 'a>> {
         self.run_observed_with_attempt_telemetry(
             backend,
             store,
@@ -231,17 +396,27 @@ impl Translator {
         harvest_audit_store: Arc<dyn HarvestAuditStore>,
         activity: Arc<dyn crate::attempt_activity::AttemptRecorder>,
         terminal_evidence: Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>,
-    ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, AccountingFailureV1>> + Send + 'a>> {
         let max_chunk = self.max_chunk;
+        let capture = self.capture.clone();
         Box::pin(async_stream::try_stream! {
-            let mut stream = backend
-                .prompt_with_observers(
-                    session,
-                    parts,
-                    BackendObservers::diagnostic_only(diagnostic)
-                        .with_attempt_telemetry(activity, terminal_evidence.clone()),
-                )
-                .await?;
+            let observers = BackendObservers::diagnostic_only(diagnostic)
+                .with_attempt_telemetry(activity, terminal_evidence.clone());
+            let mut stream = match capture {
+                Some(capture) => {
+                    let envelope = {
+                        let result = capture.envelope.lock().map(|mut pending| pending.take())
+                            .map_err(|_| BridgeError::StoreFailure);
+                        result?.ok_or(BridgeError::StoreFailure)?
+                    };
+                    if envelope.attribution.agent != turn_context.agent || !envelope.matches_config(&turn_context.model, &turn_context.effort, &turn_context.mode) {
+                        Err(envelope.reject_preparation(BridgeError::ConfigMismatch { field: "accounting selection" }).await)?;
+                        unreachable!();
+                    }
+                    capture.backend.prompt_accounted_v1(session, parts, envelope.attempt, Some(observers)).await?
+                }
+                None => backend.prompt_with_observers(session, parts, observers).await?,
+            };
             // Accumulated text awaiting flush as a Status chunk.
             let mut acc = String::new();
             // Full text emitted by the backend, used as the Artifact payload on Done.
@@ -330,7 +505,7 @@ impl Translator {
                             prefix_attestation,
                             harvest_audit_store.as_ref(),
                         )
-                        .await?;
+                        .await.map_err(BridgeError::from)?;
                         yield Event::artifact(committed.effective_body);
                         // A cancelled Done drives a terminal Canceled outcome so the
                         // local-backend producer reports Canceled (not Completed) to the
@@ -811,7 +986,7 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(
-            last.unwrap_err(),
+            last.unwrap_err().original,
             BridgeError::PermissionRequired {
                 request_id: "r1".into()
             }
@@ -854,7 +1029,7 @@ mod tests {
             .collect()
             .await;
         assert_eq!(
-            items.last().unwrap().as_ref().unwrap_err(),
+            &items.last().unwrap().as_ref().unwrap_err().original,
             &BridgeError::FrameError
         );
     }
@@ -874,7 +1049,10 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].as_ref().unwrap().kind(), &EventKind::Status);
         assert_eq!(evs[0].as_ref().unwrap().text(), "trailing");
-        assert_eq!(evs[1].as_ref().unwrap_err(), &BridgeError::MissingTerminal);
+        assert_eq!(
+            &evs[1].as_ref().unwrap_err().original,
+            &BridgeError::MissingTerminal
+        );
     }
 
     #[tokio::test]
