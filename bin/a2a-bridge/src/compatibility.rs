@@ -1964,6 +1964,188 @@ struct ProcessSmokeInvoker<'a> {
     expected_sha256: String,
 }
 
+// Smoke owns accounting. The parent only proves that the selected destination will outlive
+// artifact/scratch cleanup; it must neither open a writer nor choose a replacement store.
+fn require_durable_child_accounting(
+    config: &Path,
+    scratch: &local_file::PinnedDirectory,
+) -> Result<(), &'static str> {
+    let Ok(snapshot) = local_file::read_regular_file_bounded(
+        config,
+        "compatibility child config",
+        MAX_MANIFEST_BYTES,
+    ) else {
+        // Let smoke retain its own configuration failure artifact.
+        return Ok(());
+    };
+    let Some(cfg) = std::str::from_utf8(&snapshot.bytes)
+        .ok()
+        .and_then(|raw| crate::config::RegistryConfig::parse(raw).ok())
+    else {
+        return Ok(());
+    };
+    let selected = match cfg.store {
+        Some(store) => {
+            let path = PathBuf::from(store.path);
+            if path.is_absolute() {
+                path
+            } else {
+                snapshot
+                    .canonical_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(path)
+            }
+        }
+        None => match bridge_store::sqlite::select_platform_history() {
+            Ok(selection) => selection.path().to_path_buf(),
+            Err(_) => return Ok(()), // Smoke records an unavailable platform writer itself.
+        },
+    };
+    let scratch = accounting_directory_ancestors(&scratch.file_handle())
+        .map_err(|_| "accounting_destination_unresolved")?;
+    let Some((selected, inside_scratch)) = resolve_accounting_destination(&selected, &scratch)?
+    else {
+        // An unresolvable external suffix cannot supply a writer. Smoke must retain its
+        // own durable-evidence failure, rather than aborting the matrix as a parent failure.
+        return Ok(());
+    };
+    if inside_scratch {
+        return Err("accounting_destination_inside_scratch");
+    }
+    // Usage is stored alongside the selected history DB, rather than in the smoke artifact.
+    // Check that companion independently as well, including an existing path alias.
+    let mut usage = selected.as_os_str().to_os_string();
+    usage.push(".usage-v1.sqlite");
+    if resolve_accounting_destination(Path::new(&usage), &scratch)?
+        .is_some_and(|(_, inside_scratch)| inside_scratch)
+    {
+        return Err("accounting_destination_inside_scratch");
+    }
+    Ok(())
+}
+
+fn resolve_accounting_destination(
+    path: &Path,
+    scratch: &[(u64, u64)],
+) -> Result<Option<(PathBuf, bool)>, &'static str> {
+    use std::path::Component;
+
+    // Destinations need not exist yet. Resolve existing components before handling `..`, so
+    // directory aliases (including descriptor-backed paths) cannot hide scratch containment.
+    let mut resolved = PathBuf::new();
+    let mut proven_prefix = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if proven_prefix.starts_with(&resolved) {
+                    proven_prefix = resolved.clone();
+                }
+            }
+            _ => {
+                resolved.push(component);
+                let resolution = match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => std::fs::canonicalize(&resolved).map(Some),
+                    // Absence permits future creation, but does not extend our proven prefix.
+                    // In particular, a dangling alias is NOT absence: its canonicalize fails.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                };
+                match resolution {
+                    Ok(Some(path)) => {
+                        resolved = path;
+                        proven_prefix = resolved.clone();
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Classify EVERY traversal failure by containment, including failures
+                        // resolving aliases. Only a genuinely resolved, disjoint prefix proves
+                        // external writer unavailability; an ancestor of scratch stays unknown.
+                        let ancestors = accounting_prefix_ancestors(&proven_prefix)?;
+                        return if !ancestors.contains(&scratch[0])
+                            && !scratch.contains(&ancestors[0])
+                        {
+                            Ok(None)
+                        } else {
+                            Err("accounting_destination_unresolved")
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let ancestors = accounting_prefix_ancestors(&proven_prefix)?;
+    Ok(Some((resolved, ancestors.contains(&scratch[0]))))
+}
+
+fn accounting_prefix_ancestors(path: &Path) -> Result<Vec<(u64, u64)>, &'static str> {
+    let inspect = || -> std::io::Result<Vec<(u64, u64)>> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.is_dir() {
+            if let Ok(ancestors) =
+                File::open(path).and_then(|directory| accounting_directory_ancestors(&directory))
+            {
+                return Ok(ancestors);
+            }
+        }
+        // A stat-able but inaccessible directory (or a non-directory) still has a known
+        // identity. Walk from its resolved parent without requiring access to its contents.
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("no parent"))?;
+        let mut ancestors = accounting_directory_ancestors(&File::open(parent)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            ancestors.insert(0, (metadata.dev(), metadata.ino()));
+        }
+        Ok(ancestors)
+    };
+    inspect().map_err(|_| "accounting_destination_unresolved")
+}
+
+// Walk actual directory objects, including on macOS where volfs and canonical path spellings
+// differ. Neither scratch's pathname nor lexical ancestry establishes containment.
+fn accounting_directory_ancestors(directory: &File) -> std::io::Result<Vec<(u64, u64)>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let mut directory = directory.try_clone()?;
+        let mut ancestors = Vec::new();
+        loop {
+            let metadata = directory.metadata()?;
+            let identity = (metadata.dev(), metadata.ino());
+            if ancestors.last() == Some(&identity) {
+                return Ok(ancestors); // `..` of the filesystem root is the root itself.
+            }
+            ancestors.push(identity);
+            // SAFETY: the directory descriptor and static NUL-terminated name are live;
+            // the successful descriptor is uniquely adopted below.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    c"..".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if fd == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: openat returned a new owned descriptor.
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Err(std::io::Error::other("directory identity unavailable"))
+    }
+}
+
 struct ResolutionSmokeInvoker<'a> {
     inner: ProcessSmokeInvoker<'a>,
     resolution: &'a compatibility_resolution::LoadedResolution,
@@ -2031,6 +2213,18 @@ impl ProcessSmokeInvoker<'_> {
             }
         };
         after_candidate_check();
+        if let Err(code) =
+            require_durable_child_accounting(&request.config, self.artifact_directory)
+        {
+            return InvocationResult {
+                artifact: None,
+                process_success: false,
+                runner_error_code: Some(code),
+                not_run_reason: None,
+                #[cfg(test)]
+                process_status: None,
+            };
+        }
         if let Some(reason) = admission.reason() {
             return InvocationResult::admission_rejected(reason);
         }
@@ -5715,6 +5909,143 @@ mod tests {
         )
         .unwrap();
         create_scratch_dir(&pin).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_accounting_uses_scratch_identity_across_path_spellings() {
+        use std::os::unix::fs::{symlink, MetadataExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = scratch_in(dir.path());
+        let real = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(&scratch.name);
+        let alias = dir.path().join("scratch-object-alias");
+        symlink(&real, &alias).unwrap();
+        assert_ne!(alias, real);
+        let identities = accounting_directory_ancestors(&scratch.pin.file_handle()).unwrap();
+        let metadata = std::fs::metadata(&real).unwrap();
+        assert_eq!(identities[0], (metadata.dev(), metadata.ino()));
+        let config = dir.path().join("bridge.toml");
+        let check = |path: &Path| {
+            let raw = format!(
+                "default = \"agent\"\n[store]\npath = {path:?}\n[server]\n\
+                 [[agents]]\nid = \"agent\"\ncmd = \"/bin/true\"\n"
+            );
+            crate::config::RegistryConfig::parse(&raw).unwrap();
+            std::fs::write(&config, raw).unwrap();
+            require_durable_child_accounting(&config, &scratch.pin)
+        };
+        for path in [
+            real.join("tasks.sqlite"),
+            real.join("new/nested/tasks.sqlite"),
+            alias.join("tasks.sqlite"),
+            alias.join("new/nested/tasks.sqlite"),
+        ] {
+            assert_eq!(check(&path), Err("accounting_destination_inside_scratch"));
+        }
+        assert_eq!(check(&dir.path().join("tasks.sqlite")), Ok(()));
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("missing"), &dangling).unwrap();
+        assert_eq!(
+            check(&dangling.join("tasks.sqlite")),
+            Err("accounting_destination_unresolved")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_accounting_checks_new_paths_aliases_and_the_retained_scratch_object() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = scratch_in(dir.path());
+        let real = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join(&scratch.name);
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let config = dir.path().join("bridge.toml");
+        let check = |store: &Path| {
+            let raw = format!(
+                "default = \"agent\"\n[store]\npath = {store:?}\n[server]\n\
+                 [[agents]]\nid = \"agent\"\ncmd = \"/bin/true\"\n"
+            );
+            crate::config::RegistryConfig::parse(&raw).unwrap();
+            std::fs::write(&config, raw).unwrap();
+            require_durable_child_accounting(&config, &scratch.pin)
+        };
+        for path in [
+            real.join("tasks.sqlite"),
+            real.join("new/nested/tasks.sqlite"),
+            alias.join("tasks.sqlite"),
+            alias.join("new/../tasks.sqlite"),
+        ] {
+            assert_eq!(check(&path), Err("accounting_destination_inside_scratch"));
+        }
+        let external = dir.path().join("tasks.sqlite");
+        assert_eq!(check(&external), Ok(()));
+        let unknown = dir.path().join("unresolved-alias");
+        symlink(dir.path().join("missing-target"), &unknown).unwrap();
+        assert_eq!(
+            check(&unknown.join("tasks.sqlite")),
+            Err("accounting_destination_unresolved")
+        );
+        let external_dir = dir.path().join("external");
+        std::fs::create_dir(&external_dir).unwrap();
+        let not_dir = external_dir.join("file");
+        std::fs::write(&not_dir, b"").unwrap();
+        let loop_alias = external_dir.join("loop");
+        symlink(&loop_alias, &loop_alias).unwrap();
+        let dangling = external_dir.join("dangling");
+        symlink(external_dir.join("missing"), &dangling).unwrap();
+        // Different traversal failures share the same containment decision. The dangling
+        // alias also exercises a canonicalize failure after successful symlink_metadata.
+        for path in [
+            not_dir.join("tasks.sqlite"),
+            loop_alias.join("tasks.sqlite"),
+            dangling.join("tasks.sqlite"),
+            external_dir.join("x".repeat(256)).join("tasks.sqlite"),
+        ] {
+            assert_eq!(check(&path), Ok(()), "{path:?}");
+        }
+        // A resolved ancestor of scratch cannot prove that an unresolved alias stays out.
+        let uncertain = dir.path().join("loop");
+        symlink(&uncertain, &uncertain).unwrap();
+        assert_eq!(
+            check(&uncertain.join("tasks.sqlite")),
+            Err("accounting_destination_unresolved")
+        );
+        assert_eq!(
+            check(&external_dir.join("../loop/tasks.sqlite")),
+            Err("accounting_destination_unresolved")
+        );
+        // Similar names and an alias resolving OUT of scratch remain valid destinations.
+        assert_eq!(
+            check(&dir.path().join(".a2a-compat-external/tasks.sqlite")),
+            Ok(())
+        );
+        let outside = real.join("outside");
+        symlink(dir.path(), &outside).unwrap();
+        assert_eq!(check(&outside.join("tasks.sqlite")), Ok(()));
+        let target = real.join("usage.sqlite");
+        std::fs::write(&target, b"").unwrap();
+        symlink(&target, external.with_extension("sqlite.usage-v1.sqlite")).unwrap();
+        assert_eq!(
+            check(&external),
+            Err("accounting_destination_inside_scratch")
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // Cleanup uses the retained directory, even if its original pathname changes.
+            let renamed = dir.path().join("renamed-scratch");
+            std::fs::rename(scratch.pin.canonical_path(), &renamed).unwrap();
+            assert_eq!(
+                check(&renamed.join("tasks.sqlite")),
+                Err("accounting_destination_inside_scratch")
+            );
+        }
     }
 
     fn isolated_test_name(test_name: &str) -> String {
