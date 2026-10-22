@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+// Staged admission API: workflow delivery is wired in the next slice.
+#[allow(dead_code)]
+pub(crate) mod skills;
+
 use bridge_controller::merge::MergeConfig;
 use bridge_controller::verify::VerifyConfig;
 use bridge_core::attestation::HarvestSanitizationMode;
@@ -1207,6 +1211,9 @@ pub struct AgentEntryToml {
     /// `[[agents.mcp]]` — MCP servers to offer this agent (ADR-0028). Converted + validated in `into_snapshot`.
     #[serde(default)]
     pub mcp: Vec<McpToml>,
+    /// Config-equivalent prompt trust; prefer operator-controlled sources outside untrusted checkouts.
+    #[serde(default, deserialize_with = "skills::deserialize_declarations")]
+    pub skills: Vec<skills::SkillDeclaration>,
     /// Override the auto-detected MCP delivery channel: `acp` | `codex_native` | `kiro_native`.
     #[serde(default)]
     pub mcp_delivery: Option<String>,
@@ -1976,12 +1983,35 @@ fn agent_posture(
 }
 
 impl RegistryConfig {
+    /// Freeze explicit attachments relative to the declaring config, without delivering them.
+    #[allow(dead_code)]
+    pub fn admit_skills(
+        &self,
+        declaring_config: &Path,
+        checkout: &Path,
+    ) -> Result<BTreeMap<String, skills::FrozenSkillSelection>, ConfigError> {
+        let mut selections = BTreeMap::new();
+        for agent in &self.agents {
+            if selections.contains_key(&agent.id) {
+                return Err(ConfigError::Registry(
+                    "skills: duplicate agent id at admission".into(),
+                ));
+            }
+            let selection = skills::admit(&agent.skills, declaring_config, checkout)?;
+            selections.insert(agent.id.clone(), selection);
+        }
+        Ok(selections)
+    }
+
     /// Parse a multi-agent TOML string into a `RegistryConfig`.
     /// TOML deserialization plus env-expansion of the `[delegation]` `peer_url`/`auth`
     /// strings (so a `${PEER_TOKEN}`-style secret is resolved from the environment,
     /// matching the inbound-server expectation that the auth header is already concrete).
     pub fn parse(s: &str) -> Result<Self, ConfigError> {
         let mut cfg: RegistryConfig = toml::from_str(s)?;
+        for agent in &cfg.agents {
+            skills::validate_declarations(&agent.skills)?;
+        }
         cfg.evidence.validate().map_err(ConfigError::Registry)?;
         if let Some(d) = cfg.delegation.as_mut() {
             d.peer_url = expand_env(&d.peer_url)?;
@@ -2470,6 +2500,12 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        if self.agents.iter().any(|agent| !agent.skills.is_empty()) {
+            return Err(ConfigError::Registry(
+                "skills are unsupported by this registry entrance until frozen delivery is wired"
+                    .into(),
+            ));
+        }
         self.validate_provider_governance()?;
         if let Some(implement) = &self.implement {
             implement.clone_config_policy()?;
