@@ -55,7 +55,7 @@ pub async fn request(
     use tower::ServiceExt;
     let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":{
         "message":{"text":"go", "taskId":owner.execution_id.as_str(), "contextId":context,
-            "metadata":{"a2a-bridge.execution_id":owner.execution_id.as_str(), "a2a-bridge.attempt_id":owner.attempt_id.as_str()}}
+            "metadata":{"a2a-bridge.model":"model", "account_group":"forged", "billing_mode":"subscription", "a2a-bridge.execution_id":owner.execution_id.as_str(), "a2a-bridge.attempt_id":owner.attempt_id.as_str()}}
     }});
     let response = router
         .oneshot(
@@ -661,7 +661,7 @@ async fn review_served_disconnect_drops_consumption_and_preserves_pending_actual
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
-    let mut response = client.post(url).header("A2A-Version","1.0").json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"text":"go", "taskId":owner.execution_id.as_str(), "metadata":{"a2a-bridge.execution_id":owner.execution_id.as_str(),"a2a-bridge.attempt_id":owner.attempt_id.as_str()}}}})).send().await.unwrap();
+    let mut response = client.post(url).header("A2A-Version","1.0").json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"text":"go", "taskId":owner.execution_id.as_str(), "metadata":{"a2a-bridge.model":"model", "account_group":"forged", "billing_mode":"subscription", "a2a-bridge.execution_id":owner.execution_id.as_str(),"a2a-bridge.attempt_id":owner.attempt_id.as_str()}}}})).send().await.unwrap();
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk())
             .await
@@ -1043,4 +1043,41 @@ async fn production_preparation_outcomes_keep_typed_cause_and_persistence_separa
             }
         }
     }
+}
+
+#[tokio::test]
+async fn billing_change_after_start_does_not_relabel_reopened_rows() {
+    use bridge_core::translator::AccountingSelectionV1;
+    let f = Fixture::new();
+    let owner = AttemptIdentity::initial().unwrap();
+    let mut accounting = billing_accounting(f.store.clone());
+    let attribution = UsageAttributionV1 {
+        agent: "agent".into(),
+        effective_model: Some("model".into()),
+        ..Default::default()
+    };
+    let old = AccountingSelectionV1::new(owner.clone(), attribution.clone())
+        .unwrap()
+        .start(&accounting)
+        .await
+        .unwrap();
+    let expected = old.attribution().clone();
+    accounting.billing = None;
+    old.into_attempt().preparation_failed().await.unwrap();
+    let next = AccountingSelectionV1::new(owner, attribution)
+        .unwrap()
+        .start(&accounting)
+        .await
+        .unwrap();
+    assert!(next.attribution().billing.is_none());
+    next.into_attempt().preparation_failed().await.unwrap();
+    let rows = f.rows();
+    assert_eq!(rows.len(), 2);
+    let old = rows
+        .iter()
+        .find(|r| r.attribution.billing.is_some())
+        .unwrap();
+    assert_eq!(old.attribution, expected);
+    assert_billing(old);
+    assert!(rows.iter().all(|r| r.finalized && !r.dispatched));
 }

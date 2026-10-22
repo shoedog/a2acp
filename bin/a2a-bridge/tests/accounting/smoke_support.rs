@@ -39,12 +39,23 @@ done
         } else {
             ""
         };
+        let billing_config = if configured {
+            r#"[[billing_identities]]
+agent = "agent"
+model = "good"
+account_group = "fixture"
+billing_mode = "metered"
+"#
+        } else {
+            ""
+        };
         fs::write(
             &config,
             format!(
                 r#"
 default = "agent"
 {store_config}
+{billing_config}
 [registry]
 allowed_cmds = [{adapter:?}]
 [metrics]

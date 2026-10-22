@@ -43,6 +43,12 @@ async fn standalone_smoke_reopens_exact_usage_under_artifact_owner() {
             "Reply exactly PONG. Do not use tools."
         );
         let rows = cli.rows();
+        for row in &rows {
+            assert_eq!(row.attribution.billing.is_some(), configured);
+            if let Some(billing) = &row.attribution.billing {
+                assert_eq!(billing.account_group, "fixture");
+            }
+        }
         assert_eq!(
             rows.len(),
             1,

@@ -7,10 +7,7 @@ mod support;
 #[path = "accounting/workflow_support.rs"]
 mod workflow_support;
 
-use bridge_core::{
-    accounting::AccountingV1,
-    ids::{AttemptIdentity, WorkflowId},
-};
+use bridge_core::ids::{AttemptIdentity, WorkflowId};
 use bridge_workflow::{
     accounting::WorkflowAccountingInvocationV1,
     executor::{WorkflowDiagnosticContext, WorkflowExecutor, WorkflowRunContext},
@@ -33,7 +30,7 @@ fn graph() -> Arc<WorkflowGraph> {
 fn context(f: &Fixture, owner: &AttemptIdentity) -> WorkflowDiagnosticContext {
     WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default()).with_accounting(
         WorkflowAccountingInvocationV1::new(
-            AccountingV1::new(f.store.clone()),
+            support::billing_accounting(f.store.clone()),
             owner.clone(),
             WorkflowId::parse("accounted").unwrap(),
         ),
@@ -46,9 +43,13 @@ async fn expanded_prompts_keep_invocation_owner_and_nodes_without_telemetry() {
     let backend = Arc::new(WorkflowRecording::default());
     let executor = WorkflowExecutor::new(common::single_agent_registry("agent", backend.clone()));
     let owner = AttemptIdentity::initial().unwrap().resume().unwrap();
+    let mut mapped_graph = (*graph()).clone();
+    for node in &mut mapped_graph.nodes {
+        node.model = Some("good".into());
+    }
     let events = executor
         .run_with_diagnostic_context(
-            graph(),
+            Arc::new(mapped_graph),
             "BRIEF".into(),
             "run".into(),
             CancellationToken::new(),
@@ -86,6 +87,7 @@ async fn expanded_prompts_keep_invocation_owner_and_nodes_without_telemetry() {
             row.attribution.run_attempt.as_deref(),
             Some(owner.attempt_id.as_str())
         );
+        support::assert_billing(row);
         assert_eq!(row.attribution.workflow.as_deref(), Some("accounted"));
         assert_eq!(row.attribution.turn.as_deref(), Some(row.id.as_str()));
         assert_ne!(row.id, owner.attempt_id.as_str());
@@ -643,7 +645,7 @@ fn frozen_context(
         ..Default::default()
     })
     .with_accounting(WorkflowAccountingInvocationV1::new(
-        AccountingV1::new(f.store.clone()),
+        support::billing_accounting(f.store.clone()),
         owner.clone(),
         g.id.clone(),
     ))

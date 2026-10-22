@@ -2099,8 +2099,11 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
-    let cfg = match crate::config::RegistryConfig::parse(raw) {
-        Ok(cfg) => cfg,
+    let (cfg, billing) = match crate::config::RegistryConfig::parse(raw).and_then(|cfg| {
+        let billing = cfg.billing_provider_v1()?;
+        Ok((cfg, billing))
+    }) {
+        Ok(configured) => configured,
         Err(_) => {
             state.fail_static(
                 DiagnosticPhase::Resolve,
@@ -2139,14 +2142,18 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         }
     };
     let accounting = selected_store.as_ref().ok().map(|store| {
+        let accounting = AccountingV1 {
+            billing: Some(billing.clone()),
+            ..AccountingV1::new(store.clone())
+        };
         #[cfg(test)]
         if let Ok(clock) = TEST_ACCOUNTING_CLOCK.try_with(Arc::clone) {
             return AccountingV1 {
                 clock,
-                ..AccountingV1::new(store.clone())
+                ..accounting
             };
         }
-        AccountingV1::new(store.clone())
+        accounting
     });
     let history_selection: bridge_coordinator::WorkflowHistorySelection =
         selected_store.map(|store| store as Arc<dyn WorkflowHistoryStore>);
