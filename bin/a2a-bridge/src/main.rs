@@ -67,6 +67,7 @@ mod storage_reap;
 mod storage_reap_clones;
 mod storage_report;
 mod storage_verify_cache;
+mod usage;
 
 pub(crate) use bridge_controller::{
     implement, implement_resume, merge, resilient, review, turn, tweak, verify,
@@ -169,6 +170,7 @@ USAGE:
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
                       --input <file> --session-cwd <repo> [--config <f>] [--out <f>] [--strict-brief]
+  usage               Report locally persisted usage accounting (offline only).
   workflow-stats      Read workflow history or pin/unpin one incident attempt.
                       [get|pin|unpin <attempt-id>] [--config <f> | --store <db>] [--json]
   run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
@@ -301,6 +303,7 @@ are never overwritten, and key bytes are never printed.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TopSubcommand {
     RunWorkflow,
+    Usage,
     WorkflowStats,
     RunBatch,
     Batch,
@@ -331,6 +334,7 @@ enum TopSubcommand {
 fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => TopSubcommand::RunWorkflow,
+        Some("usage") => TopSubcommand::Usage,
         Some("workflow-stats") => TopSubcommand::WorkflowStats,
         Some("run-batch") => TopSubcommand::RunBatch,
         Some("batch") => TopSubcommand::Batch,
@@ -1868,7 +1872,8 @@ usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <re
   --strict-brief abort before spawning/contacting serve when brief lint reports a VIOLATION
   --heartbeat-secs <n>  print a [heartbeat] line on stderr every n seconds while the run is in
                   flight (default 60, or A2A_BRIDGE_HEARTBEAT_SECS; 0 disables)
-  --no-heartbeat  no heartbeat";
+  --no-heartbeat  no heartbeat
+  --usage-config <path> | --usage-store <absolute-path>  select a local reporting ledger for --serve";
 
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
@@ -5255,7 +5260,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         std::env::var(heartbeat::HEARTBEAT_ENV).ok().as_deref(),
     )
     .map_err(|error| format!("run-workflow: {error}"))?;
-    let args = &heartbeat::strip_heartbeat_flags(args);
+    let (report_args, usage_selection) = usage::client_args(args);
+    let args = &heartbeat::strip_heartbeat_flags(&report_args);
     let (
         workflow_id,
         input_path,
@@ -5322,7 +5328,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             );
         }
         let context = context.expect("parse_run_workflow_args requires --context with --serve");
-        return run_workflow_serve_client(
+        let result = run_workflow_serve_client(
             &workflow_id,
             &input,
             out_path.as_deref(),
@@ -5333,6 +5339,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             heartbeat,
         )
         .await;
+        usage::print_selected(&usage_selection, identity.execution_id.as_str()).await;
+        return result;
     }
 
     // Load config.
@@ -5374,13 +5382,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // Freeze exactly one history allocation before registry/session/provider effects.
     let selected_history = match cfg.store.as_ref() {
-        Some(store) => {
-            let path = std::path::Path::new(&store.path);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                base.join(path)
-            };
+        Some(_) => {
+            let path = usage::configured_store_path(&cfg, &base).expect("configured store");
             let opened = SqliteStore::open_shared_history(&path).map(Arc::new);
             #[cfg(test)]
             history_route_witness("Offline", "ConfiguredShared");
@@ -5415,6 +5418,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             error.reason.as_str()
         )
     })?;
+    let usage_store = accounting_store.clone();
     let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
         bridge_core::accounting::AccountingV1::new(accounting_store.clone()),
         identity.clone(),
@@ -5964,6 +5968,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     node.as_str(),
                     if node_ok { "ok" } else { "failed" }
                 );
+                usage::print_local_node(
+                    usage_store.as_ref(),
+                    identity.execution_id.as_str(),
+                    node.as_str(),
+                )
+                .await;
                 if let (Some(store), Some(terminal_json)) =
                     (history_store.as_ref(), terminal_json.as_deref())
                 {
@@ -7230,7 +7240,8 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --heartbeat-secs <n>  print a [heartbeat] line on stderr every n seconds while waiting
                   (default 60, or A2A_BRIDGE_HEARTBEAT_SECS; 0 disables). While it is on the
                   turn is watched: it dies with this client and has no default 2 h work cutoff
-  --no-heartbeat  no heartbeat; the turn keeps the 2 h work cutoff (for scripts)";
+  --no-heartbeat  no heartbeat; the turn keeps the 2 h work cutoff (for scripts)
+  --usage-config <path> | --usage-store <absolute-path>  select a local reporting ledger";
 
 fn submit_failure_message(error: &serde_json::Value) -> &str {
     error
@@ -7246,13 +7257,23 @@ fn submit_failure_message(error: &serde_json::Value) -> &str {
 }
 
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
+    let (args, selection) = usage::client_args(args);
+    let identity = bridge_core::ids::AttemptIdentity::initial()?;
+    let result = submit_cmd_inner(&args, &identity).await;
+    usage::print_selected(&selection, identity.execution_id.as_str()).await;
+    result
+}
+
+async fn submit_cmd_inner(
+    args: &[String],
+    identity: &bridge_core::ids::AttemptIdentity,
+) -> Result<(), BoxError> {
     let heartbeat = heartbeat::heartbeat_interval(
         args,
         std::env::var(heartbeat::HEARTBEAT_ENV).ok().as_deref(),
     )
     .map_err(|error| format!("submit: {error}"))?;
     let args = &heartbeat::strip_heartbeat_flags(args);
-    let identity = bridge_core::ids::AttemptIdentity::initial()?;
     println!("execution_id={}", identity.execution_id.as_str());
     println!("attempt_id={}", identity.attempt_id.as_str());
     std::io::Write::flush(&mut std::io::stdout())
@@ -7260,7 +7281,7 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let text = std::fs::read_to_string(input_path)?;
-    let message = submit_message(args, &identity, text, heartbeat.is_some());
+    let message = submit_message(args, identity, text, heartbeat.is_some());
     // Unary SEND_MESSAGE stays the one request whose answer is the output; the heartbeat
     // races it on stderr, polling the turn's liveness under the task id (the execution id).
     let beat = heartbeat::spawn_heartbeat(
@@ -10990,6 +11011,7 @@ async fn main() -> Result<(), BoxError> {
     }
     match sub {
         TopSubcommand::RunWorkflow => return run_workflow_cmd(&raw_args[2..]).await,
+        TopSubcommand::Usage => return usage::usage_cmd(&raw_args[2..]).await,
         TopSubcommand::WorkflowStats => return workflow_stats_cmd(&raw_args[2..]).await,
         TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
@@ -11026,7 +11048,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | storage | workflow-stats | submit | task | task-spec | provider-effect-key | provider-refresh | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | usage | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | storage | workflow-stats | submit | task | task-spec | provider-effect-key | provider-refresh | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
