@@ -5,7 +5,7 @@ use std::path::Path;
 pub const MAX_SKILL_BYTES: usize = 32 * 1024;
 pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub struct SkillDeclaration {
     #[serde(default, deserialize_with = "string_or_empty")]
     id: String,
@@ -15,6 +15,24 @@ pub struct SkillDeclaration {
     delivery: String,
     #[serde(flatten)]
     unsupported: std::collections::BTreeMap<String, toml::Value>,
+}
+
+// Deserialize all valid TOML shapes without exposing serde's raw-source diagnostics.
+// Invalid shapes become invalid declarations and are refused by static validation.
+pub fn deserialize_declarations<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SkillDeclaration>, D::Error> {
+    use serde::Deserialize;
+    Ok(match toml::Value::deserialize(deserializer)? {
+        toml::Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                toml::Value::Table(_) => value.try_into().unwrap_or_default(),
+                _ => SkillDeclaration::default(),
+            })
+            .collect(),
+        _ => vec![SkillDeclaration::default()],
+    })
 }
 
 // Defer schema refusals to validation so serde does not attach the raw config
@@ -103,7 +121,13 @@ impl FrozenSkill {
 }
 impl std::fmt::Debug for FrozenSkill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.preview(ExecutionRoute::Direct).fmt(f)
+        f.debug_struct("FrozenSkill")
+            .field("id", &self.id)
+            .field("sha256", &self.sha256)
+            .field("bytes", &self.byte_count())
+            .field("delivery", &self.delivery())
+            .field("origin", &self.origin)
+            .finish()
     }
 }
 #[derive(Debug, Default)]
@@ -128,6 +152,11 @@ pub fn validate_declarations(declarations: &[SkillDeclaration]) -> Result<(), Co
         }
         if declaration.id.trim().is_empty() {
             return Err(error("id must be a nonempty string"));
+        }
+        if declaration.id.trim() != declaration.id || declaration.id.chars().any(char::is_control) {
+            return Err(error(
+                "id must not contain edge whitespace or control characters",
+            ));
         }
         if declaration.path.trim().is_empty() {
             return Err(error("path must be a nonempty string"));
@@ -179,7 +208,9 @@ fn admit_platform(
     }
     let base = config
         .parent()
-        .ok_or_else(|| error("config has no parent"))?;
+        .ok_or_else(|| error("config has no parent"))?
+        .canonicalize()
+        .map_err(|_| error("declaring config directory unavailable"))?;
     let checkout = checkout
         .canonicalize()
         .map_err(|_| error("checkout context unavailable"))?;
@@ -342,9 +373,23 @@ fn validate_frontmatter(source: &str) -> Result<(), ConfigError> {
             *seen = true;
         }
         let value = value.trim_start();
+        if !is_required && strip_comment(value).trim().is_empty() {
+            // Ignore opaque nested metadata/list content, never required strings.
+            while index < header.len() {
+                let content = header[index];
+                if !content.trim().is_empty() && !content.starts_with(' ') {
+                    break;
+                }
+                if content.contains('\t') {
+                    return Err(error("unsupported tab in nested frontmatter"));
+                }
+                index += 1;
+            }
+            continue;
+        }
         let nonempty = if value.starts_with(['|', '>']) {
-            if key != "description" {
-                return Err(error("unsupported block scalar outside description"));
+            if !is_required {
+                return Err(error("unsupported block scalar outside required strings"));
             }
             let indicator = strip_comment(value).trim_end();
             if !matches!(indicator, "|" | "|-" | "|+" | ">" | ">-" | ">+") {

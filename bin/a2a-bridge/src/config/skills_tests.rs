@@ -1,7 +1,7 @@
 use super::*;
 pub(super) const NAV: &str = include_str!("../../tests/fixtures/skills/navigator.md");
 const LITERAL: &str = include_str!("../../tests/fixtures/skills/literal-braces.md");
-fn decl(id: &str, path: &str) -> SkillDeclaration {
+pub(super) fn decl(id: &str, path: &str) -> SkillDeclaration {
     SkillDeclaration {
         id: id.into(),
         path: path.into(),
@@ -9,7 +9,7 @@ fn decl(id: &str, path: &str) -> SkillDeclaration {
         unsupported: Default::default(),
     }
 }
-fn rejects(source: &str, reason: &str) {
+pub(super) fn rejects(source: &str, reason: &str) {
     let err = validate_frontmatter(source).expect_err(source).to_string();
     assert!(err.contains(reason), "{err:?} should name {reason:?}");
     assert!(!err.contains(source), "source leaked");
@@ -107,10 +107,6 @@ fn skills_frontmatter_refusals() {
         ("---\nname: &anchor nav\ndescription: d\n---", "anchor"),
         ("---\nname: *alias\ndescription: d\n---", "alias"),
         ("---\nname: !!str nav\ndescription: d\n---", "tag"),
-        (
-            "---\nname: nav\ndescription: d\nextra:\n  nested: value\n---",
-            "nested",
-        ),
         ("---\nname: nav\ndescription: d\n\textra: v\n---", "tab"),
         ("---\nname: nav\ndescription: |\n\ttext\n---", "tab"),
         ("---\nname: nav\ndescription: \"bad\\q\"\n---", "escape"),
@@ -120,7 +116,6 @@ fn skills_frontmatter_refusals() {
         ("---\nname: nav\ndescription: 'unterminated\n---", "quoted"),
         ("---\nname: nav\ndescription: 'text' junk\n---", "quoted"),
         ("---\nname: nav\ndescription: |2\n  text\n---", "block"),
-        ("---\nname: |\n  nav\ndescription: d\n---", "block"),
         ("---\nname: nav\ndescription: |\n  \n---", "nonempty"),
         (
             "---\nname: nav\ndescription: |\n   first\n  second\n---",
@@ -212,7 +207,7 @@ fn skills_declaration_validation() {
     validate_declarations(&[decl("a", "x"), decl("b", "x")]).unwrap();
 }
 #[cfg(unix)]
-fn temp() -> tempfile::TempDir {
+pub(super) fn temp() -> tempfile::TempDir {
     // Canonicalize temporary roots: some Unix platforms expose temp storage through an alias.
     let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     tempfile::tempdir_in(root).unwrap()
@@ -233,7 +228,7 @@ fn skills_freeze_config_relative_order_origin_and_metadata() {
         decl("first", "skill.md"),
         decl("second", "../checkout/skill.md"),
     ];
-    let before: Vec<_> = std::fs::read_dir(root)
+    let before: Vec<_> = std::fs::read_dir(std::env::current_dir().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
@@ -290,7 +285,7 @@ fn skills_freeze_config_relative_order_origin_and_metadata() {
     assert_ne!(changed.skills()[0].sha256(), frozen.sha256());
     std::fs::remove_file(path).unwrap();
     assert_eq!(frozen.source(), source);
-    let after: Vec<_> = std::fs::read_dir(root)
+    let after: Vec<_> = std::fs::read_dir(std::env::current_dir().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
@@ -387,7 +382,6 @@ fn skills_safe_open_refuses_special_and_bad_sources() {
         "parent-link/valid",
         "parent-link/../valid",
         "valid\0",
-        "fifo",
     ] {
         let start = std::time::Instant::now();
         let err = admit(&[decl("nav", path)], &root.join("config.toml"), root).unwrap_err();
@@ -396,6 +390,19 @@ fn skills_safe_open_refuses_special_and_bad_sources() {
         assert!(!rendered.contains(&root.display().to_string()));
         assert!(!rendered.contains("private body"));
     }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let config = root.join("config.toml");
+    let checkout = root.to_path_buf();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(admit(&[decl("nav", "fifo")], &config, &checkout))
+            .unwrap();
+    });
+    assert!(receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("FIFO admission blocked; nonblocking open is required")
+        .is_err());
+    worker.join().unwrap();
     admit(
         &[decl("nav", root.join("valid").to_str().unwrap())],
         &root.join("config.toml"),

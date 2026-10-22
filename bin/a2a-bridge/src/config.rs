@@ -1212,7 +1212,7 @@ pub struct AgentEntryToml {
     #[serde(default)]
     pub mcp: Vec<McpToml>,
     /// Config-equivalent prompt trust; prefer operator-controlled sources outside untrusted checkouts.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "skills::deserialize_declarations")]
     pub skills: Vec<skills::SkillDeclaration>,
     /// Override the auto-detected MCP delivery channel: `acp` | `codex_native` | `kiro_native`.
     #[serde(default)]
