@@ -33,9 +33,9 @@ fn cost(amount: f64, currency: &str) -> UsageSnapshot {
 }
 struct Mapping(AtomicUsize);
 impl BillingIdentityProviderV1 for Mapping {
-    fn identity(&self, _: &str, _: Option<&str>) -> Option<BillingIdentityV1> {
+    fn identity(&self, _: &str, model: Option<&str>) -> Option<BillingIdentityV1> {
         Some(BillingIdentityV1 {
-            billing_mode: "api".into(),
+            billing_mode: model.unwrap_or("api").into(),
             account_group: self.0.load(SeqCst).to_string(),
         })
     }
@@ -116,7 +116,8 @@ async fn snapshots_reopen_retries_and_frozen_attribution() {
 #[tokio::test]
 async fn cost_quality_and_occupancy_are_not_charges() {
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let service = AccountingV1::new(store.clone());
+    let mut service = AccountingV1::new(store.clone());
+    service.billing = Some(Arc::new(Mapping(AtomicUsize::new(0))));
     let owner = AttemptIdentity::initial().unwrap();
     for (amount, currency, mode) in [
         (Some(0.0), "USD", "api"),
@@ -129,10 +130,7 @@ async fn cost_quality_and_occupancy_are_not_charges() {
         (Some(4.0), "EUR", "api"),
     ] {
         let attr = UsageAttributionV1 {
-            billing: Some(BillingIdentityV1 {
-                billing_mode: mode.into(),
-                account_group: "a".into(),
-            }),
+            effective_model: Some(mode.into()),
             ..Default::default()
         };
         let a = service

@@ -1297,6 +1297,7 @@ mod tests {
 
     fn snapshot(ids: &[&str]) -> RegistrySnapshot {
         RegistrySnapshot {
+            billing_identities: vec![],
             default: AgentId::parse(ids[0]).unwrap(),
             entries: ids.iter().map(|i| entry(i)).collect(),
             allowed_cmds: vec!["fake-cmd".into()],
@@ -1306,6 +1307,7 @@ mod tests {
     /// A single-entry `kind="api"` snapshot (no cmd, has base_url) — Task 15.
     fn api_snap() -> RegistrySnapshot {
         RegistrySnapshot {
+            billing_identities: vec![],
             default: AgentId::parse("ollama").unwrap(),
             entries: vec![AgentEntry {
                 id: AgentId::parse("ollama").unwrap(),
@@ -2170,6 +2172,7 @@ mod tests {
 
     fn single_entry_snapshot(entry: AgentEntry) -> RegistrySnapshot {
         RegistrySnapshot {
+            billing_identities: vec![],
             default: entry.id.clone(),
             entries: vec![entry],
             allowed_cmds: vec!["fake-cmd".into()],

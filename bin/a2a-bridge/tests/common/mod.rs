@@ -51,6 +51,7 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {
+        billing_identities: vec![],
         default: agent_id,
         entries: vec![entry],
         allowed_cmds: vec!["test-cmd".into()],

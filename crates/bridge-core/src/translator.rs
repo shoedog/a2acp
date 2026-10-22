@@ -169,12 +169,10 @@ impl AccountingSelectionV1 {
         hook: impl FnOnce(&Self) -> Result<(), BridgeError>,
     ) -> Result<PreparedAccountingTurnV1, BridgeError> {
         hook(&self)?;
-        let mut attribution = self.attribution;
-        attribution.execution = Some(self.owner.execution_id.as_str().into());
-        attribution.run_attempt = Some(self.owner.attempt_id.as_str().into());
         let attempt = accounting
-            .start(&self.owner, self.concrete, attribution.clone())
+            .start(&self.owner, self.concrete, self.attribution)
             .await?;
+        let attribution = attempt.attribution().clone();
         Ok(PreparedAccountingTurnV1 {
             attempt,
             attribution,

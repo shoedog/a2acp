@@ -131,6 +131,16 @@ inputs = []
 workflow = "implement-review"
 slice_timeout_secs = 1
 [server]
+[[billing_identities]]
+agent = "writer"
+model = "good"
+account_group = "edit"
+billing_mode = "subscription"
+[[billing_identities]]
+agent = "reviewer"
+model = "good"
+account_group = "review"
+billing_mode = "metered"
 "#,
                 root = root,
                 evidence = root.join("evidence")
@@ -200,13 +210,24 @@ slice_timeout_secs = 1
             return vec![];
         }
         let conn = rusqlite::Connection::open(path).unwrap();
-        let rows = conn
+        let rows: Vec<UsageAttemptV1> = conn
             .prepare("SELECT record_json FROM usage_attempts_v1 ORDER BY rowid")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
             .collect();
+        for row in &rows {
+            let expected =
+                (row.attribution.effective_model.as_deref() == Some("good")).then(|| {
+                    let review = row.attribution.agent == "reviewer";
+                    bridge_core::accounting::BillingIdentityV1 {
+                        account_group: if review { "review" } else { "edit" }.into(),
+                        billing_mode: if review { "metered" } else { "subscription" }.into(),
+                    }
+                });
+            assert_eq!(row.attribution.billing, expected);
+        }
         rows
     }
 }

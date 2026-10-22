@@ -140,6 +140,7 @@ fn acp_spawn_fn() -> SpawnFn {
 /// model so `live_edit` can produce a config-only edited snapshot.
 fn two_agent_snapshot(kiro_model: &str) -> RegistrySnapshot {
     RegistrySnapshot {
+        billing_identities: vec![],
         default: AgentId::parse(CODEX_ID).unwrap(),
         entries: vec![
             entry(
@@ -160,6 +161,7 @@ fn two_agent_snapshot(kiro_model: &str) -> RegistrySnapshot {
 /// existing `[codex(0), kiro(1)]` indices the 2-agent tests rely on are untouched.
 fn three_agent_snapshot() -> RegistrySnapshot {
     RegistrySnapshot {
+        billing_identities: vec![],
         default: AgentId::parse(CODEX_ID).unwrap(),
         entries: vec![
             entry(
@@ -188,6 +190,7 @@ fn three_agent_snapshot() -> RegistrySnapshot {
 /// existing indices the 2-/3-agent tests rely on are untouched.
 fn four_agent_snapshot() -> RegistrySnapshot {
     RegistrySnapshot {
+        billing_identities: vec![],
         default: AgentId::parse(CODEX_ID).unwrap(),
         entries: vec![
             entry(
@@ -602,6 +605,7 @@ async fn api_entry_resolves_and_serves_through_registry() {
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {
+        billing_identities: vec![],
         default: AgentId::parse("ollama").unwrap(),
         entries: vec![entry],
         allowed_cmds: vec![],
@@ -668,6 +672,7 @@ async fn registry_rejects_api_entry_with_cmd() {
         extensions: Default::default(),
     };
     let snap = RegistrySnapshot {
+        billing_identities: vec![],
         default: AgentId::parse("x").unwrap(),
         entries: vec![bad],
         allowed_cmds: vec![],

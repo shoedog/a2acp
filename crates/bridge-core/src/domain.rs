@@ -243,6 +243,8 @@ pub fn effective_config(entry: &AgentEntry, ov: Option<&AgentOverride>) -> Effec
 /// Immutable snapshot of the registry state.
 #[derive(Debug, Clone)]
 pub struct RegistrySnapshot {
+    /// Validated exact selector mappings from the same config generation as entries.
+    pub billing_identities: Vec<crate::routing::BillingIdentityV1>,
     pub default: AgentId,
     pub entries: Vec<AgentEntry>,
     pub allowed_cmds: Vec<String>,

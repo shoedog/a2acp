@@ -16821,6 +16821,7 @@ mod tests {
 
     fn idle_retiring_server(backend: Arc<GatedCancelBackend>) -> Arc<InboundServer> {
         let snapshot = RegistrySnapshot {
+            billing_identities: vec![],
             default: AgentId::parse("a").unwrap(),
             entries: vec![bare_entry("a")],
             allowed_cmds: vec!["fake".into()],

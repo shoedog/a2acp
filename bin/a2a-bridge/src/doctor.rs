@@ -1779,6 +1779,7 @@ pub(crate) fn provenance_rows_for_agent(
         return Vec::new();
     };
     let selected = RegistrySnapshot {
+        billing_identities: snapshot.billing_identities.clone(),
         default: agent.clone(),
         entries: vec![entry.clone()],
         allowed_cmds: snapshot.allowed_cmds.clone(),
@@ -2594,6 +2595,7 @@ mod tests {
         allowed_cmds: Vec<&str>,
     ) -> RegistrySnapshot {
         RegistrySnapshot {
+            billing_identities: vec![],
             default: AgentId::parse(default).unwrap(),
             entries,
             allowed_cmds: allowed_cmds.into_iter().map(str::to_string).collect(),

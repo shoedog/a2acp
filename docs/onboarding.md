@@ -27,6 +27,26 @@ to a running multi-agent bridge.
 > `docs/containerized-agents.md` → §9 Podman (separate image store, `podman-egress.sh`, re-up after a
 > `podman machine` restart, kiro re-mint). Docker stays the default.
 
+## Billing identities
+
+`[[billing_identities]]` maps an exact agent ID and dispatched model selector to an
+operator-owned account group and billing mode:
+
+```toml
+[[billing_identities]]
+agent = "claude"
+model = "opus"
+account_group = "engineering"
+billing_mode = "subscription" # or "metered"
+```
+
+The selector is the exact configured model, override, or fallback candidate recorded as
+`attribution.effective_model`. Adapter-internal alias resolution (such as `opus` to `default`)
+does not change the billing key. Operators map the spellings they dispatch; an absent selector
+or missing exact mapping stays unmapped. Billing adds no inference, probing, or relabeling.
+Serve reloads validated mappings with the registry generation. Each attempt freezes its identity
+at start; invalid reloads retain both the previous registry and its mappings.
+
 ## Quick start
 
 ```sh
