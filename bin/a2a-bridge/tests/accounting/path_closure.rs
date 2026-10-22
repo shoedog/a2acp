@@ -51,6 +51,7 @@ async fn exact_rows(f: &Fixture, owners: &[AttemptIdentity]) -> Vec<UsageAttempt
         assert_eq!(row.attribution.turn.as_ref(), Some(&row.id));
         assert_ne!(row.id, owner.attempt_id.as_str());
         assert_eq!(row.attribution.agent, "agent");
+        assert_billing(row);
         assert!(row.dispatched && row.finalized);
         assert_eq!(row.usage, usage());
         assert!(!row.cost_invalid);
@@ -171,7 +172,7 @@ async fn mcp_transport_and_explicit_compaction_leave_no_unowned_or_duplicate_row
     for name in ["run", "continue"] {
         let owner = AttemptIdentity::initial().unwrap();
         let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-            "name":name,"arguments":{"input":"go","context":"mcp-closure",
+            "name":name,"arguments":{"input":"go","context":"mcp-closure", "model":"model",
                 "execution_id":owner.execution_id.as_str(),"attempt_id":owner.attempt_id.as_str()}}});
         write
             .write_all(format!("{req}\n").as_bytes())

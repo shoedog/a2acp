@@ -236,10 +236,10 @@ impl AccountingV1 {
         }
         attribution.execution = Some(owner.execution_id.as_str().to_owned());
         attribution.run_attempt = Some(owner.attempt_id.as_str().to_owned());
-        if let Some(provider) = &self.billing {
-            attribution.billing =
-                provider.identity(&attribution.agent, attribution.effective_model.as_deref());
-        }
+        // Operator configuration is the sole authority, including when no provider exists.
+        attribution.billing = self.billing.as_ref().and_then(|provider| {
+            provider.identity(&attribution.agent, attribution.effective_model.as_deref())
+        });
         let started_ms = (self.clock)();
         let row = UsageAttemptV1 {
             id: concrete_turn.as_str().to_owned(),
@@ -255,6 +255,7 @@ impl AccountingV1 {
         Ok(PreparedUsageAttemptV1 {
             accounting: self.clone(),
             id: row.id,
+            attribution: row.attribution,
         })
     }
 }
@@ -263,8 +264,12 @@ impl AccountingV1 {
 pub struct PreparedUsageAttemptV1 {
     accounting: AccountingV1,
     id: String,
+    attribution: UsageAttributionV1,
 }
 impl PreparedUsageAttemptV1 {
+    pub fn attribution(&self) -> &UsageAttributionV1 {
+        &self.attribution
+    }
     pub fn id(&self) -> &str {
         &self.id
     }

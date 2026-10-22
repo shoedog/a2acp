@@ -150,7 +150,7 @@ impl Fixture {
                 3,
             )
             .with_workflow_history(Ok(store.clone()))
-            .with_accounting(AccountingV1::new(store.clone())),
+            .with_accounting(billing_accounting(store.clone())),
         );
         Self {
             dir,
@@ -213,4 +213,32 @@ pub fn assert_usage(b: &UsageBucketV1, count: u64, pending: u64) {
     if pending == 0 {
         assert_eq!(b.cost_by_currency["USD"], 0.25 * count as f64);
     }
+}
+
+// Synthetic operator mapping: unresolved and unknown models deliberately stay unmapped.
+pub fn billing_accounting(store: Arc<SqliteStore>) -> AccountingV1 {
+    struct Billing;
+    impl BillingIdentityProviderV1 for Billing {
+        fn identity(&self, agent: &str, model: Option<&str>) -> Option<BillingIdentityV1> {
+            (agent == "agent" && matches!(model, Some("model" | "good" | "reject"))).then(|| {
+                BillingIdentityV1 {
+                    account_group: "fixture".into(),
+                    billing_mode: "metered".into(),
+                }
+            })
+        }
+    }
+    AccountingV1 {
+        billing: Some(Arc::new(Billing)),
+        ..AccountingV1::new(store)
+    }
+}
+pub fn assert_billing(row: &UsageAttemptV1) {
+    assert_eq!(
+        row.attribution.billing,
+        Some(BillingIdentityV1 {
+            account_group: "fixture".into(),
+            billing_mode: "metered".into()
+        })
+    );
 }

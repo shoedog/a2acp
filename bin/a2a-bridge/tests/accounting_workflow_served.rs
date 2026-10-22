@@ -4,7 +4,7 @@ pub(crate) mod common;
 #[path = "accounting/support.rs"]
 pub(crate) mod support;
 use bridge_coordinator::{params::OpParams, Coordinator};
-use bridge_core::{accounting::*, ids::*, task_store::TaskStore};
+use bridge_core::{ids::*, task_store::TaskStore};
 use std::{sync::Arc, time::Duration};
 
 struct BoundBackend(Arc<support::Recording>);
@@ -40,8 +40,8 @@ pub fn coordinator(f: &support::Fixture, batch: bool, bound: bool) -> Arc<Coordi
         common::single_agent_registry("agent", Arc::new(BoundBackend(f.backend.clone())));
     let graph = Arc::new(
         serde_json::from_value(serde_json::json!({"id":"flow", "nodes":[
-            {"id":"draft", "agent":"agent", "prompt_template":"{{input}}", "inputs":[]},
-            {"id":"review", "agent":"agent", "prompt_template":"{{draft}}", "inputs":["draft"]}
+            {"id":"draft", "agent":"agent", "model":"good", "prompt_template":"{{input}}", "inputs":[]},
+            {"id":"review", "agent":"agent", "model":"good", "prompt_template":"{{draft}}", "inputs":["draft"]}
         ]}))
         .unwrap(),
     );
@@ -64,7 +64,7 @@ pub fn coordinator(f: &support::Fixture, batch: bool, bound: bool) -> Arc<Coordi
         Arc::new(bridge_observ::NoopObserver),
         3,
     )
-    .with_accounting(AccountingV1::new(f.store.clone()));
+    .with_accounting(support::billing_accounting(f.store.clone()));
     // Deliberately no workflow history, metrics, or trace sink.
     if bound {
         c = c.with_workflow_admission(Arc::new(
@@ -157,6 +157,7 @@ async fn served_rpc_reopens_supplied_identity_without_optional_telemetry() {
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].id, rows[1].id);
         for row in rows {
+            support::assert_billing(&row);
             assert_eq!(row.attribution.turn.as_ref(), Some(&row.id));
             assert_eq!(row.attribution.workflow.as_deref(), Some("flow"));
             assert!(matches!(

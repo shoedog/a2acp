@@ -2050,6 +2050,35 @@ impl RegistryConfig {
         Ok(cfg)
     }
 
+    /// Snapshot validated operator mappings without provider or catalog effects.
+    pub fn billing_provider_v1(
+        &self,
+    ) -> Result<std::sync::Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>, ConfigError>
+    {
+        struct Provider(Vec<bridge_core::routing::BillingIdentityV1>);
+        impl bridge_core::accounting::BillingIdentityProviderV1 for Provider {
+            fn identity(
+                &self,
+                agent: &str,
+                model: Option<&str>,
+            ) -> Option<bridge_core::accounting::BillingIdentityV1> {
+                let identity = self.0.iter().find(|identity| {
+                    identity.agent.as_str() == agent
+                        && Some(identity.effective_model.as_str()) == model
+                })?;
+                Some(bridge_core::accounting::BillingIdentityV1 {
+                    account_group: identity.account_group.clone(),
+                    billing_mode: match identity.billing_mode {
+                        bridge_core::routing::BillingModeV1::Metered => "metered",
+                        bridge_core::routing::BillingModeV1::Subscription => "subscription",
+                    }
+                    .into(),
+                })
+            }
+        }
+        Ok(std::sync::Arc::new(Provider(self.billing_identities_v1()?)))
+    }
+
     #[allow(dead_code)]
     pub fn billing_identities_v1(
         &self,
@@ -3429,6 +3458,34 @@ account_group = "platform"
 billing_mode = "metered"
 [server]
 "#;
+
+    #[test]
+    fn billing_provider_uses_exact_operator_mapping_and_freezes_config() {
+        let mut config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        let provider = config.billing_provider_v1().unwrap();
+        config.billing_identities[0].account_group = "changed".into();
+        config.billing_identities[0].billing_mode =
+            bridge_core::routing::BillingModeV1::Subscription;
+        let original = provider.identity("source", Some("model-a")).unwrap();
+        assert_eq!(original.account_group, "platform");
+        assert_eq!(original.billing_mode, "metered");
+        let next = config
+            .billing_provider_v1()
+            .unwrap()
+            .identity("source", Some("model-a"))
+            .unwrap();
+        assert_eq!(next.account_group, "changed");
+        assert_eq!(next.billing_mode, "subscription");
+        for (agent, model) in [
+            ("target", Some("model-a")),
+            ("source", Some("unknown")),
+            ("source", None),
+        ] {
+            assert!(provider.identity(agent, model).is_none());
+        }
+        config.billing_identities[0].agent = "missing".into();
+        assert!(config.billing_provider_v1().is_err());
+    }
 
     #[test]
     fn provider_governance_requires_explicit_safe_chains_and_billing_identities() {

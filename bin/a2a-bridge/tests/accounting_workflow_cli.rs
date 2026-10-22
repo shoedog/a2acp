@@ -52,12 +52,23 @@ done
         } else {
             ""
         };
+        let billing_config = if configured {
+            r#"[[billing_identities]]
+agent = "agent"
+model = "good"
+account_group = "fixture"
+billing_mode = "metered"
+"#
+        } else {
+            ""
+        };
         fs::write(
             &config,
             format!(
                 r#"
 default = "agent"
 {store_config}
+{billing_config}
 [registry]
 allowed_cmds = [{adapter:?}]
 [metrics]
@@ -156,6 +167,13 @@ addr = "127.0.0.1:0"
         );
         let (execution, attempt) = locator(output);
         let row = &rows[0];
+        assert_eq!(
+            row.attribution.billing.is_some(),
+            self.store.file_name().unwrap() == "tasks.sqlite"
+        );
+        if row.attribution.billing.is_some() {
+            support::assert_billing(row);
+        }
         assert_eq!(
             row.attribution.execution.as_deref(),
             Some(execution.as_str())
@@ -357,7 +375,7 @@ async fn serve_client_leaves_accounting_and_prompt_ownership_to_executing_servic
             Arc::new(bridge_observ::NoopObserver),
             3,
         )
-        .with_accounting(AccountingV1::new(f.store.clone())),
+        .with_accounting(support::billing_accounting(f.store.clone())),
     );
     let router = Arc::new(bridge_a2a_inbound::server::InboundServer::from_coordinator(
         coordinator.clone(),
