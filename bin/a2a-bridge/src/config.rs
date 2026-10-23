@@ -564,8 +564,10 @@ pub struct RegistryConfig {
     /// frozen by policy code; phase one deliberately does not dispatch them.
     #[serde(default)]
     pub routing: RoutingToml,
-    /// Exact operator-owned billing identities. An absent match is deliberately
-    /// observable as unmapped rather than inferred from credentials or provider.
+    /// Exact (agent ID, dispatched model selector) billing identities. The selector
+    /// is attribution.effective_model: configured model, override or fallback candidate.
+    /// Adapter alias resolution never changes this key. Missing selector/match stays
+    /// unmapped; no inference, probing or relabeling is performed.
     #[serde(default)]
     pub billing_identities: Vec<BillingIdentityToml>,
     /// `[[prompts]]` named-prompt registry (E8a). Each entry is `file=` XOR `text=` (+ optional
@@ -2050,6 +2052,16 @@ impl RegistryConfig {
         Ok(cfg)
     }
 
+    /// Snapshot validated operator mappings without provider or catalog effects.
+    pub fn billing_provider_v1(
+        &self,
+    ) -> Result<std::sync::Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>, ConfigError>
+    {
+        Ok(std::sync::Arc::new(BillingProviderV1::new(
+            self.billing_identities_v1()?,
+        )))
+    }
+
     #[allow(dead_code)]
     pub fn billing_identities_v1(
         &self,
@@ -2506,7 +2518,7 @@ impl RegistryConfig {
                     .into(),
             ));
         }
-        self.validate_provider_governance()?;
+        let billing_identities = self.billing_identities_v1()?;
         if let Some(implement) = &self.implement {
             implement.clone_config_policy()?;
         }
@@ -2751,9 +2763,60 @@ impl RegistryConfig {
             AgentId::parse(self.default).map_err(|e| ConfigError::Registry(e.to_string()))?;
 
         Ok(RegistrySnapshot {
+            billing_identities,
             default,
             entries,
             allowed_cmds,
+        })
+    }
+}
+
+/// Shared by one-shot accounting and serve. Each lookup copies an identity; existing
+/// attempts therefore retain their generation even when this provider is reloaded.
+pub struct BillingProviderV1(std::sync::RwLock<Vec<bridge_core::routing::BillingIdentityV1>>);
+impl BillingProviderV1 {
+    pub fn new(identities: Vec<bridge_core::routing::BillingIdentityV1>) -> Self {
+        Self(std::sync::RwLock::new(identities))
+    }
+
+    pub async fn apply(
+        &self,
+        registry: &dyn bridge_core::ports::AgentRegistry,
+        snapshot: RegistrySnapshot,
+    ) -> Result<(), bridge_core::error::BridgeError> {
+        let mut identities = snapshot.billing_identities.clone();
+        let mut apply = registry.apply(snapshot);
+        // Serialize billing lookups with each apply poll. No lock crosses an await:
+        // pending leaves the old generation, success publishes both before unlocking,
+        // and validation failure retains both. Registry apply publishes in one poll.
+        futures::future::poll_fn(|cx| {
+            let mut current = self.0.write().unwrap();
+            let result = std::future::Future::poll(apply.as_mut(), cx);
+            if matches!(result, std::task::Poll::Ready(Ok(()))) {
+                *current = std::mem::take(&mut identities);
+            }
+            result
+        })
+        .await
+    }
+}
+impl bridge_core::accounting::BillingIdentityProviderV1 for BillingProviderV1 {
+    fn identity(
+        &self,
+        agent: &str,
+        model: Option<&str>,
+    ) -> Option<bridge_core::accounting::BillingIdentityV1> {
+        let identities = self.0.read().unwrap();
+        let identity = identities.iter().find(|identity| {
+            identity.agent.as_str() == agent && Some(identity.effective_model.as_str()) == model
+        })?;
+        Some(bridge_core::accounting::BillingIdentityV1 {
+            account_group: identity.account_group.clone(),
+            billing_mode: match identity.billing_mode {
+                bridge_core::routing::BillingModeV1::Metered => "metered",
+                bridge_core::routing::BillingModeV1::Subscription => "subscription",
+            }
+            .into(),
         })
     }
 }
@@ -3429,6 +3492,149 @@ account_group = "platform"
 billing_mode = "metered"
 [server]
 "#;
+
+    #[test]
+    fn billing_provider_uses_exact_operator_mapping_and_freezes_config() {
+        let mut config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        let provider = config.billing_provider_v1().unwrap();
+        config.billing_identities[0].account_group = "changed".into();
+        config.billing_identities[0].billing_mode =
+            bridge_core::routing::BillingModeV1::Subscription;
+        let original = provider.identity("source", Some("model-a")).unwrap();
+        assert_eq!(original.account_group, "platform");
+        assert_eq!(original.billing_mode, "metered");
+        let next = config
+            .billing_provider_v1()
+            .unwrap()
+            .identity("source", Some("model-a"))
+            .unwrap();
+        assert_eq!(next.account_group, "changed");
+        assert_eq!(next.billing_mode, "subscription");
+        for (agent, model) in [
+            ("target", Some("model-a")),
+            ("source", Some("unknown")),
+            ("source", None),
+        ] {
+            assert!(provider.identity(agent, model).is_none());
+        }
+        config.billing_identities[0].agent = "missing".into();
+        assert!(config.billing_provider_v1().is_err());
+    }
+
+    #[tokio::test]
+    async fn serve_billing_reload_freezes_rows_and_rejects_invalid_generations() {
+        use bridge_core::{
+            accounting::*, ids::AttemptIdentity, ports::ConfigSource,
+            translator::AccountingSelectionV1,
+        };
+        use bridge_store::sqlite::SqliteStore;
+        use std::sync::Arc;
+        for invalid in [None, Some("mapping"), Some("registry")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, PROVIDER_CHAINS).unwrap();
+            let source = FileConfigSource::new(&path);
+            let initial = source.load().await.unwrap();
+            let billing = Arc::new(BillingProviderV1::new(initial.billing_identities.clone()));
+            let registry = bridge_registry::registry::Registry::new(
+                initial,
+                Arc::new(|_| panic!("billing must not probe providers")),
+            )
+            .unwrap();
+            let store_path = dir.path().join("tasks.sqlite");
+            let store = Arc::new(SqliteStore::open_shared_history(&store_path).unwrap());
+            let accounting = AccountingV1 {
+                billing: Some(billing.clone()),
+                ..AccountingV1::new(store.clone())
+            };
+            let owner = AttemptIdentity::initial().unwrap();
+            let attribution = UsageAttributionV1 {
+                agent: "source".into(),
+                effective_model: Some("model-a".into()),
+                ..Default::default()
+            };
+            let old = AccountingSelectionV1::new(owner.clone(), attribution.clone())
+                .unwrap()
+                .start(&accounting)
+                .await
+                .unwrap();
+            let old_attribution = old.attribution().clone();
+            assert_eq!(
+                old_attribution.billing.as_ref().unwrap().account_group,
+                "platform"
+            );
+            // Change the spawn-frozen credential policy and billing mapping in one file generation.
+            let mut changed = PROVIDER_CHAINS
+                .replace("account_group = \"platform\"", "account_group = \"B\"")
+                .replacen(
+                    "cmd = \"codex-acp\"",
+                    "cmd = \"codex-acp\"\nauth_method = \"credential-B\"",
+                    1,
+                );
+            match invalid {
+                Some("mapping") => {
+                    changed = changed.replace("agent = \"source\"", "agent = \"missing\"")
+                }
+                Some("registry") => {
+                    changed = changed.replace("default = \"source\"", "default = \"missing\"")
+                }
+                _ => {}
+            }
+            std::fs::write(&path, changed).unwrap();
+            // This is the same loader and apply pair used by serve's watch/reconcile loop.
+            if let Some(snapshot) = FileConfigSource::try_load(&path).await {
+                assert_eq!(
+                    billing.apply(&registry, snapshot).await.is_err(),
+                    invalid.is_some()
+                );
+            } else {
+                assert_eq!(invalid, Some("mapping"));
+            }
+            let next = AccountingSelectionV1::new(owner, attribution)
+                .unwrap()
+                .start(&accounting)
+                .await
+                .unwrap();
+            let next_attribution = next.attribution().clone();
+            let group = &next_attribution.billing.as_ref().unwrap().account_group;
+            assert_eq!(group, if invalid.is_none() { "B" } else { "platform" });
+            assert_eq!(old.attribution(), &old_attribution);
+            old.into_attempt().preparation_failed().await.unwrap();
+            next.into_attempt().preparation_failed().await.unwrap();
+            let entry = bridge_core::ports::AgentRegistry::entry_snapshot(
+                &registry,
+                &AgentId::parse("source").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                entry.auth_method.as_deref(),
+                invalid.is_none().then_some("credential-B")
+            );
+            drop(accounting);
+            drop(store);
+            let conn = rusqlite::Connection::open_with_flags(
+                dir.path().join("tasks.sqlite.usage-v1.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let rows: Vec<UsageAttemptV1> = conn
+                .prepare("SELECT record_json FROM usage_attempts_v1")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            for expected in [old_attribution, next_attribution] {
+                let row = rows
+                    .iter()
+                    .find(|r| r.attribution.turn == expected.turn)
+                    .unwrap();
+                assert_eq!(row.attribution, expected);
+                assert!(row.finalized);
+            }
+        }
+    }
 
     #[test]
     fn provider_governance_requires_explicit_safe_chains_and_billing_identities() {

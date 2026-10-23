@@ -1495,6 +1495,7 @@ fn turn_log_observer_enabled(
 /// policy / batch plus the interactive-permission registry.
 #[allow(clippy::too_many_arguments)]
 fn build_coordinator(
+    billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
     session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
     executor: Arc<bridge_workflow::executor::WorkflowExecutor>,
     wf_map: std::collections::HashMap<
@@ -1519,7 +1520,10 @@ fn build_coordinator(
     workflow_admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
-    let accounting = bridge_core::accounting::AccountingV1::new(task_store.clone());
+    let accounting = bridge_core::accounting::AccountingV1 {
+        billing: Some(billing),
+        ..bridge_core::accounting::AccountingV1::new(task_store.clone())
+    };
     Arc::new(
         bridge_coordinator::Coordinator::new(
             session_manager,
@@ -3091,6 +3095,7 @@ impl ImplementAttemptTelemetry {
     /// checkpoints acquire ownership here without backfilling historical charges.
     fn admit(
         task_id: &str,
+        billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
         store_path: Option<&str>,
         base: &Path,
         clone: &Path,
@@ -3114,7 +3119,10 @@ impl ImplementAttemptTelemetry {
         Arc::get_mut(&mut telemetry)
             .expect("new attempt telemetry")
             .accounting = Some((
-            bridge_core::accounting::AccountingV1::new(Arc::new(store)),
+            bridge_core::accounting::AccountingV1 {
+                billing: Some(billing),
+                ..bridge_core::accounting::AccountingV1::new(Arc::new(store))
+            },
             owner,
         ));
         Ok(telemetry)
@@ -4166,6 +4174,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
             .unwrap_or_else(|| "none".into()),
     );
     refusal_finalizer.ck = no_commit_checkpoint.clone();
+    let billing = cfg.billing_provider_v1()?;
     let accounting_store_path = cfg.store.as_ref().map(|store| store.path.clone());
     let mut snapshot = cfg
         .into_snapshot()
@@ -4225,6 +4234,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
 
     let telemetry = ImplementAttemptTelemetry::admit(
         &task_id,
+        billing,
         accounting_store_path.as_deref(),
         &base,
         &clone,
@@ -4692,6 +4702,7 @@ async fn implement_resume_cmd(
     let custody_cfg = cfg.custody.clone();
     custody_cfg.validate()?;
     let merge_cfg = cfg.merge.as_ref().map(|m| m.to_config()); // ADR-0027: parsed pre-move (--merge sugar)
+    let billing = cfg.billing_provider_v1()?;
     let accounting_store_path = cfg.store.as_ref().map(|store| store.path.clone());
     // Same verify-runtime gate as the implement path (reject a disallowed runtime into ConfigError).
     let verify_cfg = config::gate_verify_runtime(verify_cfg, &snapshot.allowed_cmds);
@@ -4717,6 +4728,7 @@ async fn implement_resume_cmd(
         .unwrap_or_else(|| subject.clone());
     let telemetry = ImplementAttemptTelemetry::admit(
         &ck.task_id,
+        billing,
         accounting_store_path.as_deref(),
         &base,
         &clone,
@@ -5420,7 +5432,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     })?;
     let usage_store = accounting_store.clone();
     let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
-        bridge_core::accounting::AccountingV1::new(accounting_store.clone()),
+        bridge_core::accounting::AccountingV1 {
+            billing: Some(cfg.billing_provider_v1()?),
+            ..bridge_core::accounting::AccountingV1::new(accounting_store.clone())
+        },
         identity.clone(),
         wf_id,
     );
@@ -9574,6 +9589,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     )?;
 
     let coordinator = build_coordinator(
+        cfg.billing_provider_v1()?,
         session_manager,
         executor,
         wf_map,
@@ -11104,7 +11120,7 @@ async fn main() -> Result<(), BoxError> {
     };
 
     // Read the non-registry config sections (server addr, delegation) directly:
-    // the FileConfigSource snapshot only carries the registry. Re-parsing the same
+    // the FileConfigSource snapshot carries registry and billing mappings. Re-parsing the same
     // file is cheap and keeps the [server]/[delegation] parsing (incl. env-expansion)
     // working on the RegistryConfig path.
     let raw = std::fs::read_to_string(&config_path)?;
@@ -11176,6 +11192,9 @@ async fn main() -> Result<(), BoxError> {
         .iter()
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
+    let billing = Arc::new(config::BillingProviderV1::new(
+        snapshot.billing_identities.clone(),
+    ));
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
     // Warm-session expiry only drops a lease; idle retirement frees the shared adapter process
     // (and its agent-side session/MCP children) once no lease has used it for the TTL.
@@ -11189,6 +11208,7 @@ async fn main() -> Result<(), BoxError> {
     //    the bridge's lifetime by the spawned task.
     {
         let reg = Arc::clone(&registry);
+        let billing = Arc::clone(&billing);
         let mut watch = source.watch();
         let recover_config = config_path.clone();
         let recover_host = host.clone();
@@ -11205,7 +11225,7 @@ async fn main() -> Result<(), BoxError> {
                 let config_c = recover_config.clone();
                 let host_c = recover_host.clone();
                 run_blocking(move || recover_orphans(&snap_c, &config_c, &host_c, None)).await;
-                if let Err(e) = reg.apply(snap).await {
+                if let Err(e) = billing.apply(reg.as_ref(), snap).await {
                     tracing::error!(error = ?e, "registry reconcile failed");
                 }
             }
@@ -11405,6 +11425,7 @@ async fn main() -> Result<(), BoxError> {
         &[],
     )?;
     let coordinator = build_coordinator(
+        billing,
         session_manager,
         executor,
         wf_map,
@@ -13539,6 +13560,7 @@ inputs = []
                 .unwrap();
             let telemetry = ImplementAttemptTelemetry::admit(
                 "fixture",
+                cfg.billing_provider_v1().unwrap(),
                 cfg.store.as_ref().map(|store| store.path.as_str()),
                 root.path(),
                 &clone,
@@ -16373,6 +16395,7 @@ esac
     fn snap(entries: Vec<AgentEntry>) -> bridge_core::domain::RegistrySnapshot {
         use bridge_core::ids::AgentId;
         bridge_core::domain::RegistrySnapshot {
+            billing_identities: vec![],
             default: AgentId::parse("d").unwrap(),
             entries,
             allowed_cmds: vec![],

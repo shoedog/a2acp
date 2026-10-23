@@ -131,6 +131,9 @@ async fn child_ownership(bound: bool) {
         0
     );
     let before = f.rows();
+    for row in &before {
+        support::assert_billing(row);
+    }
     crash(&f, &children[0].id, true);
     crash(&f, &children[1].id, false);
     let db = rusqlite::Connection::open(f.dir.path().join("tasks.sqlite")).unwrap();
@@ -163,6 +166,9 @@ async fn child_ownership(bound: bool) {
     support::assert_usage(&f.reopened(Some(&resumed)).await, 1, 0);
     assert_eq!(f.backend.prompts.lock().unwrap().len(), 5);
     let after = f.rows();
+    for row in &after {
+        support::assert_billing(row);
+    }
     for row in before {
         assert_eq!(after.iter().find(|r| r.id == row.id), Some(&row));
     }

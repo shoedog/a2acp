@@ -230,6 +230,12 @@ async fn staged_child_usage_survives_cleanup_and_aggregate_rereads() {
             "Reply exactly PONG. Do not use tools."
         );
         let rows = cli.smoke.rows();
+        for row in &rows {
+            assert_eq!(row.attribution.billing.is_some(), configured);
+            if let Some(billing) = &row.attribution.billing {
+                assert_eq!(billing.account_group, "fixture");
+            }
+        }
         assert_eq!(
             rows.len(),
             1,
