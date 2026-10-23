@@ -79,6 +79,10 @@ pub enum BridgeError {
     AgentOverloaded,
     #[error("upstream a2a error")]
     UpstreamA2aError,
+    #[error("budget refused")]
+    BudgetRefused {
+        refusal: Box<crate::governance::BudgetRefusalV1>,
+    },
     #[error("store failure")]
     StoreFailure,
     #[error("harvest_audit_persist_failed")]
@@ -177,6 +181,7 @@ impl BridgeError {
                 "agent crashed".to_string()
             }
             BridgeError::ConfigInvalid { .. } => "invalid config".to_string(),
+            BridgeError::BudgetRefused { .. } => "budget refused".to_string(),
             other => other.to_string(),
         }
     }

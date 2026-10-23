@@ -557,6 +557,8 @@ fn expand_env(s: &str) -> Result<String, ConfigError> {
 pub struct RegistryConfig {
     pub default: String,
     #[serde(default)]
+    pub governance: Option<crate::governance_config::GovernanceConfigV1>,
+    #[serde(default)]
     pub registry: Option<RegistrySection>,
     #[serde(default)]
     pub agents: Vec<AgentEntryToml>,
@@ -2048,6 +2050,7 @@ impl RegistryConfig {
                 }
             }
         }
+        crate::governance_config::validate(&cfg)?;
         cfg.validate_provider_governance()?;
         Ok(cfg)
     }
@@ -2512,6 +2515,13 @@ impl RegistryConfig {
 
     /// Convert this parsed config into a `RegistrySnapshot` with typed domain values.
     pub fn into_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        crate::governance_config::refuse_staged_execution(&self)?;
+        self.into_validation_snapshot()
+    }
+
+    /// Pure snapshot for validators only; provider-capable entrances use `into_snapshot`.
+    pub(crate) fn into_validation_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
+        crate::governance_config::validate(&self)?;
         if self.agents.iter().any(|agent| !agent.skills.is_empty()) {
             return Err(ConfigError::Registry(
                 "skills are unsupported by this registry entrance until frozen delivery is wired"
@@ -2917,6 +2927,7 @@ impl FileConfigSource {
         let s = tokio::fs::read_to_string(path).await.ok()?;
         RegistryConfig::parse(&s)
             .and_then(|c| c.into_snapshot())
+            .map_err(|error| tracing::error!(%error, "config reload refused; retaining last-good configuration"))
             .ok()
     }
 }
