@@ -57,6 +57,7 @@ mod config;
 mod containers;
 mod doctor;
 mod fallback_plan;
+mod governance_config;
 mod heartbeat;
 mod local_file;
 mod provider_refresh;
