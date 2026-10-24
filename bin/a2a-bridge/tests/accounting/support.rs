@@ -11,7 +11,23 @@ use std::time::Duration;
 #[derive(Default)]
 pub struct Recording {
     pub prompts: Mutex<Vec<SessionId>>,
+    pub effects: Mutex<Vec<&'static str>>,
+    pub configs: Mutex<Vec<SessionSpec>>,
+    pub configured_sessions: Mutex<Vec<(SessionId, SessionSpec)>>,
+    pub prompt_models: Mutex<Vec<Option<String>>>,
+    pub forgets: Mutex<Vec<SessionId>>,
+    pub configure_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pub stream_failure: AtomicBool,
+    pub stream_waiting: Arc<AtomicBool>,
+    pub cleanup_error: AtomicBool,
+    pub prompt_parts: Mutex<Vec<Vec<String>>>,
+    pub on_prompt_poll: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub prompt_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pub reconcile_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pub before_turn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub prompt_error: Mutex<Option<BridgeError>>,
     pub fail_config: AtomicBool,
+    pub fail_prompt: AtomicBool,
     pub config_error: Mutex<Option<BridgeError>>,
     pub releases: Mutex<Vec<SessionId>>,
     pub stall: AtomicBool,
@@ -47,7 +63,44 @@ impl AgentBackend for Recording {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        self.effects.lock().unwrap().push("prompt");
+        self.prompt_models.lock().unwrap().push(
+            self.configured_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(id, _)| id == session)
+                .and_then(|(_, spec)| spec.config.model.clone()),
+        );
+        self.prompt_parts
+            .lock()
+            .unwrap()
+            .push(parts.iter().map(|p| p.text.clone()).collect());
+        if let Some(hook) = self.on_prompt_poll.lock().unwrap().take() {
+            hook();
+        }
         self.prompts.lock().unwrap().push(session.clone());
+        let gate = self.prompt_gate.lock().unwrap().take();
+        let stream_failure = self.stream_failure.load(Ordering::SeqCst);
+        let mut gate = gate;
+        if !stream_failure {
+            if let Some(gate) = gate.take() {
+                let _ = gate.await;
+            }
+        }
+        if let Some(error) = self
+            .prompt_error
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| !stream_failure)
+        {
+            return Err(error);
+        }
+        if self.fail_prompt.load(Ordering::SeqCst) {
+            return Err(BridgeError::AgentTimedOut);
+        }
         let mut reported = usage();
         if parts.iter().any(|p| p.text.contains("double")) {
             reported.terminal.as_mut().unwrap().total_tokens = 30;
@@ -59,7 +112,17 @@ impl AgentBackend for Recording {
         };
         let updates = vec![Ok(Update::Usage(reported)), Ok(Update::Text(text))];
         use futures::StreamExt;
-        let tail: BackendStream = if self.stall.load(Ordering::SeqCst) {
+        let tail: BackendStream = if stream_failure {
+            let waiting = self.stream_waiting.clone();
+            let error = self.prompt_error.lock().unwrap().clone().unwrap();
+            Box::pin(futures::stream::once(async move {
+                waiting.store(true, Ordering::SeqCst);
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                Err(error)
+            }))
+        } else if self.stall.load(Ordering::SeqCst) {
             Box::pin(futures::stream::pending())
         } else {
             Box::pin(futures::stream::iter([Ok(Update::done("end_turn"))]))
@@ -69,7 +132,21 @@ impl AgentBackend for Recording {
             stopped: self.stopped.clone(),
         }))
     }
-    async fn configure_session(&self, _: &SessionId, _: &SessionSpec) -> Result<(), BridgeError> {
+    async fn configure_session(
+        &self,
+        session: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<(), BridgeError> {
+        self.effects.lock().unwrap().push("configure");
+        self.configs.lock().unwrap().push(spec.clone());
+        self.configured_sessions
+            .lock()
+            .unwrap()
+            .push((session.clone(), spec.clone()));
+        let gate = self.configure_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         let hook = self.before_config.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
@@ -83,17 +160,53 @@ impl AgentBackend for Recording {
             Ok(())
         }
     }
+    async fn configure_turn(&self, _: &SessionId, _: bridge_core::permission::TurnMeta) {
+        if let Some(hook) = self.before_turn.lock().unwrap().take() {
+            hook();
+        }
+    }
+    async fn configure_turn_liveness(
+        &self,
+        _: &SessionId,
+        _: bridge_core::turn_liveness::TurnLivenessRequestV1,
+    ) {
+        if let Some(hook) = self.before_turn.lock().unwrap().take() {
+            hook();
+        }
+    }
+    async fn release_session_checked(
+        &self,
+        session: &SessionId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.release_session(session).await;
+        if self.cleanup_error.load(Ordering::SeqCst) {
+            Err(BridgeError::StoreFailure)
+        } else {
+            Ok(BackendCleanupDispositionV1::Complete)
+        }
+    }
     async fn release_session(&self, session: &SessionId) {
+        self.effects.lock().unwrap().push("release");
         self.releases.lock().unwrap().push(session.clone());
     }
     async fn reconcile_config(
         &self,
         _: &SessionId,
-        _: &SessionSpec,
+        spec: &SessionSpec,
     ) -> Result<bridge_core::orch::ReconcileOutcome, BridgeError> {
+        self.effects.lock().unwrap().push("reconcile");
+        self.configs.lock().unwrap().push(spec.clone());
+        let gate = self.reconcile_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         Ok(bridge_core::orch::ReconcileOutcome::Applied)
     }
+    async fn forget_session(&self, session: &SessionId) {
+        self.forgets.lock().unwrap().push(session.clone());
+    }
     async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+        self.effects.lock().unwrap().push("cancel");
         Ok(())
     }
 }
@@ -127,30 +240,67 @@ impl Fixture {
         Self::with_registry(backend, registry)
     }
     pub fn with_registry(backend: Arc<Recording>, registry: Arc<dyn AgentRegistry>) -> Self {
+        Self::with_policy(backend, registry, None)
+    }
+    pub fn with_policy(
+        backend: Arc<Recording>,
+        registry: Arc<dyn AgentRegistry>,
+        policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
+    ) -> Self {
+        Self::with_policy_and_store(backend, registry, policy, None)
+    }
+    pub fn with_policy_and_store(
+        backend: Arc<Recording>,
+        registry: Arc<dyn AgentRegistry>,
+        policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
+        store: Option<Arc<SqliteStore>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(SqliteStore::open_shared_history(&dir.path().join("tasks.sqlite")).unwrap());
+        let store = store.unwrap_or_else(|| {
+            Arc::new(SqliteStore::open_shared_history(&dir.path().join("tasks.sqlite")).unwrap())
+        });
         let manager = Arc::new(bridge_coordinator::session_manager::SessionManager::new(
             registry.clone(),
             Duration::from_secs(3600),
         ));
+        let graph = Arc::new(bridge_core::graph::WorkflowGraph {
+            id: WorkflowId::parse("fixture-workflow").unwrap(),
+            nodes: vec![bridge_core::graph::WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("agent").unwrap(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        });
         let coordinator = Arc::new(
             bridge_coordinator::Coordinator::new(
                 manager,
-                None,
-                Arc::new(Default::default()),
+                Some(Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+                    registry.clone(),
+                ))),
+                Arc::new([(graph.id.clone(), graph)].into_iter().collect()),
                 store.clone(),
                 store.clone(),
                 Arc::new(bridge_policy::permission::AutoPolicy),
                 registry,
                 Arc::new(bridge_coordinator::clock::SystemClock),
                 None,
-                None,
+                Some(bridge_coordinator::batch::BatchRuntime::new_noop(1, 1)),
                 Arc::new(bridge_observ::NoopObserver),
                 3,
             )
             .with_workflow_history(Ok(store.clone()))
-            .with_accounting(billing_accounting(store.clone())),
+            .with_accounting(AccountingV1 {
+                budget_policy: policy,
+                ..billing_accounting(store.clone())
+            }),
         );
         Self {
             dir,

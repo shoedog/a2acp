@@ -14,6 +14,35 @@ impl AccountingBackendV1 {
         Self { inner }
     }
 }
+impl AccountingBackendV1 {
+    pub async fn prompt_prepared_v1(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        mut attempt: PreparedUsageAttemptV1,
+        observers: Option<BackendObservers>,
+    ) -> Result<BackendStream, crate::translator::AccountingFailureV1> {
+        let gate = attempt.take_prompt_gate();
+        let settlement = attempt.preparation_settlement();
+        let mut prompt = Box::pin(self.prompt_accounted_v1(session, parts, attempt, observers));
+        let result = match gate {
+            Some(gate) => match gate.first_poll(session, &self.inner, &mut prompt).await {
+                Ok(std::task::Poll::Ready(result)) => result,
+                Ok(std::task::Poll::Pending) => prompt.await,
+                Err(mut failure) => {
+                    drop(prompt); // the provider has never been polled
+                    failure.replay.prompt_acceptance =
+                        crate::routing::ExclusionEvidenceV1::Excluded;
+                    failure.replay.effects = crate::routing::ExclusionEvidenceV1::Excluded;
+                    failure.persistence = settlement.await.err();
+                    return Err(failure);
+                }
+            },
+            None => prompt.await,
+        };
+        result.map_err(crate::translator::AccountingFailureV1::prompt_open_failure)
+    }
+}
 #[async_trait::async_trait]
 impl AgentBackend for AccountingBackendV1 {
     async fn prompt(&self, _: &SessionId, _: Vec<Part>) -> Result<BackendStream, BridgeError> {
@@ -23,10 +52,19 @@ impl AgentBackend for AccountingBackendV1 {
         &self,
         session: &SessionId,
         parts: Vec<Part>,
-        attempt: PreparedUsageAttemptV1,
+        mut attempt: PreparedUsageAttemptV1,
         observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
-        match attempt.admit().await? {
+        // Governed prompt gates must travel through the composite-error seam.
+        // The legacy backend trait cannot represent a primary plus persistence error.
+        if attempt.has_prompt_gate() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        let admission = match attempt.take_permit() {
+            Some(permit) => BudgetAdmissionOutcomeV1::Admitted(permit),
+            None => attempt.admit().await?,
+        };
+        match admission {
             BudgetAdmissionOutcomeV1::Ungoverned => attempt.update(true, None, false).await?,
             BudgetAdmissionOutcomeV1::Admitted(permit) => {
                 // Consuming the single-use permit authorizes exactly this inner prompt.
