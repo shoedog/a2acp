@@ -534,3 +534,411 @@ async fn capture_persistence_failures_and_context_free_refusals() {
         assert_eq!(s.buckets[0].pending, u64::from(phase != "preparation"));
     }
 }
+
+use bridge_core::governance::*;
+fn policy(
+    selectors: Vec<BudgetSelectorV1>,
+    turns: Option<u64>,
+    cap: Option<u64>,
+) -> BudgetPolicyV1 {
+    BudgetPolicyV1::new(
+        selectors
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| BudgetRuleV1 {
+                id: format!("rule-{i}"),
+                selector,
+                limits: BudgetLimitsV1 {
+                    turns,
+                    terminal_tokens: cap,
+                },
+            })
+            .collect(),
+        vec![TurnAllowanceV1 {
+            target: candidate(),
+            terminal_tokens: 10.try_into().unwrap(),
+        }],
+    )
+    .unwrap()
+}
+fn candidate() -> BudgetCandidateV1 {
+    BudgetCandidateV1 {
+        agent: AgentId::parse("a").unwrap(),
+        model: None,
+    }
+}
+async fn prepared(
+    store: &SqliteStore,
+    owner: &AttemptIdentity,
+    started: i64,
+) -> (AttemptId, BudgetContextV1) {
+    let id = AttemptId::mint().unwrap();
+    store
+        .start_usage_attempt_v1(&UsageAttemptV1 {
+            id: id.as_str().into(),
+            attribution: UsageAttributionV1 {
+                execution: Some(owner.execution_id.as_str().into()),
+                run_attempt: Some(owner.attempt_id.as_str().into()),
+                agent: "a".into(),
+                ..Default::default()
+            },
+            started_ms: started,
+            utc_day: started.div_euclid(86_400_000),
+            dispatched: false,
+            finalized: false,
+            usage: Default::default(),
+            cost_invalid: false,
+        })
+        .await
+        .unwrap();
+    (
+        id,
+        BudgetContextV1 {
+            request: BudgetRequestIdV1::Execution(owner.execution_id.clone()),
+            workflow_run: Some(owner.execution_id.clone()),
+        },
+    )
+}
+async fn admission(
+    store: &SqliteStore,
+    p: Option<&BudgetPolicyV1>,
+    a: &(AttemptId, BudgetContextV1),
+) -> BudgetAdmissionOutcomeV1 {
+    store
+        .admit_usage_attempt_v1(p, &a.0, &a.1, &candidate())
+        .await
+}
+fn refused(outcome: BudgetAdmissionOutcomeV1, reason: BudgetRefusalReasonV1) {
+    assert!(
+        matches!(outcome, BudgetAdmissionOutcomeV1::Refused(r) if r.reason == reason),
+        "expected {reason:?}"
+    );
+}
+fn admitted(outcome: BudgetAdmissionOutcomeV1) -> BudgetReservationV1 {
+    match outcome {
+        BudgetAdmissionOutcomeV1::Admitted(p) => p.into_reservation(),
+        other => panic!("{other:?}"),
+    }
+}
+fn saved(db: &rusqlite::Connection, id: &AttemptId) -> serde_json::Value {
+    let s: String = db
+        .query_row(
+            "SELECT record_json FROM governance_reservations_v1 WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&s).unwrap()
+}
+#[tokio::test]
+async fn governance_atomic_scopes_identity_and_policy() {
+    use BudgetRefusalReasonV1 as R;
+    for selector in [
+        BudgetSelectorV1::EachWorkflowRun,
+        BudgetSelectorV1::UtcDayAgent(candidate().agent),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path(&dir);
+        let store = SqliteStore::open(&path).unwrap();
+        let owner = AttemptIdentity::initial().unwrap();
+        let a = prepared(&store, &owner, i64::MAX / 2).await;
+        let db = rusqlite::Connection::open(usage_path(&path)).unwrap();
+        db.execute("UPDATE usage_coverage_v1 SET started_ms=0", [])
+            .unwrap();
+        let p = BudgetPolicyV1::new(
+            vec![
+                BudgetRuleV1 {
+                    id: "request".into(),
+                    selector: BudgetSelectorV1::EachRequest,
+                    limits: BudgetLimitsV1 {
+                        turns: Some(5),
+                        terminal_tokens: None,
+                    },
+                },
+                BudgetRuleV1 {
+                    id: "blocking".into(),
+                    selector,
+                    limits: BudgetLimitsV1 {
+                        turns: Some(0),
+                        terminal_tokens: None,
+                    },
+                },
+            ],
+            vec![],
+        )
+        .unwrap();
+        refused(admission(&store, Some(&p), &a).await, R::LimitExceeded);
+        let count: u64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let row: String = db
+            .query_row("SELECT record_json FROM usage_attempts_v1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            !serde_json::from_str::<UsageAttemptV1>(&row)
+                .unwrap()
+                .dispatched
+        );
+    }
+    let store = SqliteStore::open_in_memory().unwrap();
+    let owner = AttemptIdentity::initial().unwrap();
+    let a = prepared(&store, &owner, i64::MAX / 2).await;
+    let p = policy(
+        vec![
+            BudgetSelectorV1::EachRequest,
+            BudgetSelectorV1::EachWorkflowRun,
+        ],
+        Some(4),
+        None,
+    );
+    let mut wrong = candidate();
+    wrong.model = Some("other".into());
+    refused(
+        store
+            .admit_usage_attempt_v1(Some(&p), &a.0, &a.1, &wrong)
+            .await,
+        R::IdentityMismatch,
+    );
+    let mut other = a.1.clone();
+    other.request = BudgetRequestIdV1::Execution(ExecutionId::mint().unwrap());
+    refused(
+        store
+            .admit_usage_attempt_v1(Some(&p), &a.0, &other, &candidate())
+            .await,
+        R::UnsupportedRoute,
+    );
+    admitted(admission(&store, Some(&p), &a).await);
+    refused(admission(&store, Some(&p), &a).await, R::DuplicateAttempt);
+    let b = prepared(&store, &owner, i64::MAX / 2).await;
+    refused(admission(&store, None, &b).await, R::PolicyMismatch);
+    let changed = policy(vec![BudgetSelectorV1::EachRequest], Some(5), None);
+    refused(
+        admission(&store, Some(&changed), &b).await,
+        R::PolicyMismatch,
+    );
+    let renamed = BudgetPolicyV1::new(
+        p.rules()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.id.push('x');
+                r
+            })
+            .collect(),
+        vec![],
+    )
+    .unwrap();
+    refused(
+        admission(&store, Some(&renamed), &b).await,
+        R::PolicyMismatch,
+    );
+    let mut no_parent = b.1.clone();
+    no_parent.workflow_run = None;
+    refused(
+        store
+            .admit_usage_attempt_v1(Some(&p), &b.0, &no_parent, &candidate())
+            .await,
+        R::IdentityMismatch,
+    );
+}
+#[tokio::test]
+async fn governance_reopen_high_water_finalization_and_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = path(&dir);
+    let owner = AttemptIdentity::initial().unwrap();
+    let p = policy(vec![BudgetSelectorV1::EachRequest], None, Some(u64::MAX));
+    let store = SqliteStore::open(&path).unwrap();
+    let a = prepared(&store, &owner, i64::MAX / 2).await;
+    admitted(admission(&store, Some(&p), &a).await);
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let db = rusqlite::Connection::open(usage_path(&path)).unwrap();
+    assert_eq!(saved(&db, &a.0)["liability"]["Pending"], 10);
+    for n in [20, 5] {
+        let mut u = tokens();
+        u.terminal.as_mut().unwrap().total_tokens = n;
+        store
+            .update_usage_attempt_v1(a.0.as_str(), true, Some(u), false)
+            .await
+            .unwrap();
+    }
+    assert_eq!(saved(&db, &a.0)["liability"]["Pending"], 20);
+    db.execute_batch("CREATE TRIGGER fail BEFORE UPDATE ON usage_attempts_v1 BEGIN SELECT RAISE(ABORT, 'failure'); END;").unwrap();
+    assert!(store
+        .update_usage_attempt_v1(a.0.as_str(), false, Some(tokens()), true)
+        .await
+        .is_err());
+    assert_eq!(saved(&db, &a.0)["liability"]["Pending"], 20);
+    db.execute_batch("DROP TRIGGER fail").unwrap();
+    for _ in 0..2 {
+        store
+            .update_usage_attempt_v1(a.0.as_str(), false, Some(tokens()), true)
+            .await
+            .unwrap();
+    }
+    assert_eq!(saved(&db, &a.0)["liability"]["Known"], 15); // successful overrun, charged once
+    let b = prepared(&store, &owner, i64::MAX / 2).await;
+    admitted(admission(&store, Some(&p), &b).await);
+    store
+        .update_usage_attempt_v1(b.0.as_str(), false, None, true)
+        .await
+        .unwrap();
+    let c = prepared(&store, &owner, i64::MAX / 2).await;
+    refused(
+        admission(&store, Some(&p), &c).await,
+        BudgetRefusalReasonV1::UnknownMeasurement,
+    );
+    assert_eq!(saved(&db, &b.0)["liability"]["Unknown"]["retained"], 10);
+    // Final actuals below allowance are the only allowed reduction; full u64 never narrows.
+    let fresh = AttemptIdentity::initial().unwrap();
+    let d = prepared(&store, &fresh, i64::MAX / 2).await;
+    admitted(admission(&store, Some(&p), &d).await);
+    let mut u = tokens();
+    u.terminal.as_mut().unwrap().total_tokens = u64::MAX;
+    store
+        .update_usage_attempt_v1(d.0.as_str(), false, Some(u), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        saved(&db, &d.0)["liability"]["Known"].as_u64(),
+        Some(u64::MAX)
+    );
+    let e = prepared(&store, &fresh, i64::MAX / 2).await;
+    refused(
+        admission(&store, Some(&p), &e).await,
+        BudgetRefusalReasonV1::Overflow,
+    );
+}
+#[tokio::test]
+async fn governance_coverage_history_day_and_disabled() {
+    use BudgetRefusalReasonV1 as R;
+    let store = SqliteStore::open_in_memory().unwrap();
+    let a = prepared(&store, &AttemptIdentity::initial().unwrap(), 86_399_999).await;
+    let p = policy(
+        vec![BudgetSelectorV1::UtcDayAgent(candidate().agent)],
+        Some(5),
+        None,
+    );
+    refused(admission(&store, Some(&p), &a).await, R::IncompleteCoverage);
+    let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 0)).unwrap();
+    let a = prepared(&store, &AttemptIdentity::initial().unwrap(), 86_399_999).await;
+    let r = admitted(admission(&store, Some(&p), &a).await);
+    assert_eq!(r.admission_day, 0); // store clock, not preparation day
+    let dir = tempfile::tempdir().unwrap();
+    let path = path(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    let owner = AttemptIdentity::initial().unwrap();
+    let a = prepared(&store, &owner, i64::MAX / 2).await;
+    assert!(matches!(
+        admission(&store, None, &a).await,
+        BudgetAdmissionOutcomeV1::Ungoverned
+    ));
+    let db = rusqlite::Connection::open(usage_path(&path)).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let p = policy(vec![BudgetSelectorV1::EachRequest], Some(1), None);
+    store
+        .update_usage_attempt_v1(a.0.as_str(), true, Some(tokens()), true)
+        .await
+        .unwrap();
+    let b = prepared(&store, &owner, i64::MAX / 2).await;
+    refused(admission(&store, Some(&p), &b).await, R::LimitExceeded);
+    let p = policy(vec![BudgetSelectorV1::EachRequest], Some(3), None);
+    admitted(admission(&store, Some(&p), &b).await);
+    let c = prepared(&store, &owner, i64::MAX / 2).await;
+    let d = prepared(&store, &owner, i64::MAX / 2).await;
+    store
+        .update_usage_attempt_v1(c.0.as_str(), true, None, false)
+        .await
+        .unwrap();
+    refused(admission(&store, Some(&p), &d).await, R::IncompleteCoverage);
+    store
+        .update_usage_attempt_v1(c.0.as_str(), false, None, true)
+        .await
+        .unwrap();
+    admitted(admission(&store, Some(&p), &d).await); // unknown tokens do not block turns
+    db.execute("UPDATE governance_reservations_v1 SET record_json='{}'", [])
+        .unwrap();
+    refused(
+        admission(&store, Some(&p), &d).await,
+        R::AccountingUnavailable,
+    );
+}
+
+#[test]
+fn governance_process_child() {
+    let Some(path) = std::env::var_os("A2A_GOVERNANCE_TEST_DB") else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let store = SqliteStore::open(path).unwrap();
+        let owner = AttemptIdentity::initial().unwrap();
+        let id = AttemptId::parse(std::env::var("A2A_GOVERNANCE_TEST_ATTEMPT").unwrap()).unwrap();
+        let context: BudgetContextV1 =
+            serde_json::from_str(&std::env::var("A2A_GOVERNANCE_TEST_CONTEXT").unwrap()).unwrap();
+        let p = policy(vec![BudgetSelectorV1::EachRequest], Some(1), None);
+        match admission(&store, Some(&p), &(id, context)).await {
+            BudgetAdmissionOutcomeV1::Admitted(_) => (),
+            BudgetAdmissionOutcomeV1::Refused(r)
+                if r.reason == BudgetRefusalReasonV1::LimitExceeded =>
+            {
+                std::process::exit(23)
+            }
+            other => panic!("{owner:?}: {other:?}"),
+        }
+    });
+}
+#[tokio::test]
+async fn governance_independent_processes_compete_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = path(&dir);
+    let store = SqliteStore::open(&path).unwrap();
+    let owner = AttemptIdentity::initial().unwrap();
+    let a = prepared(&store, &owner, i64::MAX / 2).await;
+    let b = prepared(&store, &owner, i64::MAX / 2).await;
+    let mut children: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|a| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "governance_process_child"])
+                .env("A2A_GOVERNANCE_TEST_DB", &path)
+                .env("A2A_GOVERNANCE_TEST_ATTEMPT", a.0.as_str())
+                .env(
+                    "A2A_GOVERNANCE_TEST_CONTEXT",
+                    serde_json::to_string(&a.1).unwrap(),
+                )
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut codes: Vec<_> = children
+        .iter_mut()
+        .map(|c| c.wait().unwrap().code().unwrap())
+        .collect();
+    codes.sort();
+    assert_eq!(codes, [0, 23]);
+    drop(store);
+    let db = rusqlite::Connection::open(usage_path(&path)).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM governance_reservations_v1", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(db.query_row("SELECT count(*) FROM usage_attempts_v1 WHERE json_extract(record_json, '$.dispatched')=1", [], |r| r.get::<_, u64>(0)).unwrap(), 1);
+}

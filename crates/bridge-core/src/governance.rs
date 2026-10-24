@@ -252,6 +252,10 @@ pub struct BudgetPermitV1 {
     reservation: BudgetReservationV1,
 }
 impl BudgetPermitV1 {
+    /// Only TaskStore admission implementations may call this after committing admission.
+    pub fn from_committed_admission(reservation: BudgetReservationV1) -> Self {
+        Self { reservation }
+    }
     pub fn into_reservation(self) -> BudgetReservationV1 {
         self.reservation
     }
