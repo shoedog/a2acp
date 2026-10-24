@@ -2894,6 +2894,9 @@ impl WorkflowExecutor {
                         duration: started.elapsed(),
                         usage: None,
                         reason: match cleanup_result.as_ref() {
+                            _ if matches!(error, BridgeError::BudgetRefused { .. }) => {
+                                format!("prompt error: {}", error.client_message())
+                            }
                             Some(Ok(BackendCleanupDispositionV1::Complete)) | None => {
                                 format!("prompt error: {error:?}")
                             }
@@ -4513,7 +4516,10 @@ impl WorkflowExecutor {
                                 )
                                 .await;
                                 break 'attempt Attempt::Fatal {
-                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                    text: match &e {
+                                        BridgeError::BudgetRefused { .. } => format!("[node {} failed: {}]", node.id.as_str(), e.client_message()),
+                                        _ => format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                    },
                                     usage: None,
                                     failure_class: classify_failure(&e),
                                     error: Some(e),

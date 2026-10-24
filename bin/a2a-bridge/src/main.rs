@@ -60,6 +60,7 @@ mod fallback_plan;
 mod governance_config;
 mod heartbeat;
 mod local_file;
+mod local_workflow_accounting;
 mod provider_refresh;
 mod route;
 mod slice;
@@ -5435,6 +5436,17 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
         bridge_core::accounting::AccountingV1 {
             billing: Some(cfg.billing_provider_v1()?),
+            budget_policy: cfg
+                .governance
+                .as_ref()
+                .map(|caps| {
+                    bridge_core::governance::BudgetPolicyV1::new(
+                        caps.rules.clone(),
+                        caps.allowances.clone(),
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?,
             ..bridge_core::accounting::AccountingV1::new(accounting_store.clone())
         },
         identity.clone(),
@@ -5686,6 +5698,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // unsupported physical-accounting configuration. Both fail closed before
     // any session/provider effect.
     let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
+    if admission_cfg.governance.is_some() {
+        local_workflow_accounting::establish_coverage(accounting_store.as_ref()).await?;
+    }
     let history_store = match selected_history {
         Ok(store) => {
             let reservation = bridge_core::workflow_history::AttemptReservation {
@@ -5824,27 +5839,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let diagnostic_ctx = bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(ctx);
     let diagnostic_ctx = match history_store.as_ref() {
         Some(store) => {
-            let prompt_store = store.clone();
-            let attempt_id = identity.attempt_id.clone();
-            let prompt_telemetry = offline_telemetry.clone();
-            let barrier: bridge_workflow::executor::PromptDispatchBarrier = Arc::new(move || {
-                let prompt_store = prompt_store.clone();
-                let attempt_id = attempt_id.clone();
-                let prompt_telemetry = prompt_telemetry.clone();
-                Box::pin(async move {
-                    if let Err(error) =
-                        bridge_core::workflow_history::WorkflowHistoryStore::mark_prompt_acceptance(
-                            prompt_store.as_ref(),
-                            &attempt_id,
-                            "dispatch_uncertain",
-                        )
-                        .await
-                    {
-                        prompt_telemetry.record(error.reason);
-                        eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
-                    }
-                })
-            });
+            let barrier = local_workflow_accounting::dispatch_barrier(
+                store.clone(),
+                identity.attempt_id.clone(),
+                offline_telemetry.clone(),
+            );
             diagnostic_ctx.with_prompt_dispatch_barrier(barrier)
         }
         None => diagnostic_ctx,
