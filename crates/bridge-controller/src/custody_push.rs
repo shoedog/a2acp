@@ -1852,6 +1852,26 @@ mod tests {
         };
         assert!(cfg.validate().is_err());
     }
+
+    fn retry_would_block<T>(
+        attempts: u32,
+        pause: Duration,
+        mut operation: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut attempt = 1;
+        loop {
+            match operation() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock && attempt < attempts =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(pause);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
     // Run environment-sensitive controls in a child test process, never mutating
     // process-wide environment while other Rust tests are executing.
     #[test]
@@ -1896,7 +1916,8 @@ mod tests {
                 },
             )
             .unwrap();
-            let out = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "custody_push::tests::transport_scenario_child",
@@ -1921,8 +1942,12 @@ mod tests {
                 .env("HTTPS_PROXY", "")
                 .env("ALL_PROXY", "")
                 .env("NO_PROXY", "*")
-                .output()
-                .unwrap();
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // A saturated CI worker can reject fork with EAGAIN before the isolated child starts.
+            let child = retry_would_block(50, Duration::from_millis(10), || command.spawn())
+                .expect("spawn isolated transport control");
+            let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
                 "{scenario}: {} {}",
