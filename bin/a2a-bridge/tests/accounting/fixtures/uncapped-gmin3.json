@@ -1,0 +1,137 @@
+{
+  "source_commit": "a75cd3f25c872c372eaff28d44afa015a0aa49c5",
+  "source_binary_sha256": "b0462fe9c2b125c9ffde7ae1d53001952caef5d34506274a736b9333f01e7465",
+  "canonicalization": "Only fixture roots, explicit execution/attempt IDs, usage timestamps, UTC day, coverage start and cleanup durations are replaced with fixed fixture values. All output data and messages remain exact.",
+  "projections": {
+    "success": {
+      "status": 0,
+      "stdout": "execution_id=exec-11111111111111111111111111111111\nattempt_id=attempt-22222222222222222222222222222222\n",
+      "stderr": "[brief-lint] artifact write skipped: no git artifact surface under $FIXTURE\n[workflow] node review started; configured selection: Some(EffectiveConfig { model: Some(\"good\"), effort: None, mode: None })\n[workflow] node review ok\nusage node=\"review\" attempts=1 coverage_start_ms=0 historical_incomplete=true groups=[agent=\"agent\" model=\"good\" workflow=null utc_day=null billing={\"billing_mode\":\"metered\",\"account_group\":\"fixture\"} attempts=1 dispatched=1 pending=0 unmapped=0 total_tokens={reported_sum:15,missing_count:0,partial:false} input_tokens={reported_sum:10,missing_count:0,partial:false} output_tokens={reported_sum:5,missing_count:0,partial:false} thought_tokens={reported_sum:0,missing_count:1,partial:true} cached_read_tokens={reported_sum:0,missing_count:1,partial:true} cached_write_tokens={reported_sum:0,missing_count:1,partial:true} costs={\"USD\":0.25} cost_known=1 cost_missing=0 cost_invalid=0 cost_partial=false]\nnode_terminal{node=\"review\",terminal_json={\"schema_version\":1,\"primary\":\"completed\",\"cleanup\":{\"disposition\":\"complete\",\"duration_ms\":0},\"cause\":null,\"prompt_may_have_been_accepted\":false,\"degraded_ancestry\":false,\"policy_trigger_id\":null}}\n[brief-lint] wrote artifact result.brief-lint.json\n",
+      "artifacts": {
+        "result.brief-lint.json": "{\n  \"schema_version\": 1,\n  \"strict\": false,\n  \"report\": {\n    \"kind\": \"run-workflow\",\n    \"findings\": []\n  }\n}",
+        "result.md": "answer"
+      },
+      "accounting": [
+        {
+          "id": "attempt-33333333333333333333333333333333",
+          "attribution": {
+            "execution": "exec-11111111111111111111111111111111",
+            "run_attempt": "attempt-22222222222222222222222222222222",
+            "node": "review",
+            "agent": "agent",
+            "effective_model": "good",
+            "effective_effort": null,
+            "effective_mode": null,
+            "turn": "attempt-33333333333333333333333333333333",
+            "workflow": "flow",
+            "attempt_kind": "node",
+            "billing": {
+              "billing_mode": "metered",
+              "account_group": "fixture"
+            }
+          },
+          "started_ms": 0,
+          "utc_day": 0,
+          "dispatched": true,
+          "finalized": true,
+          "usage": {
+            "used": 99,
+            "size": 1000,
+            "cost": {
+              "amount": 0.25,
+              "currency": "USD"
+            },
+            "terminal": {
+              "totalTokens": 15,
+              "inputTokens": 10,
+              "outputTokens": 5
+            },
+            "at_ms": 0
+          },
+          "cost_invalid": false
+        }
+      ],
+      "accounting_records": [
+        "{\"id\":\"attempt-33333333333333333333333333333333\",\"attribution\":{\"execution\":\"exec-11111111111111111111111111111111\",\"run_attempt\":\"attempt-22222222222222222222222222222222\",\"node\":\"review\",\"agent\":\"agent\",\"effective_model\":\"good\",\"effective_effort\":null,\"effective_mode\":null,\"turn\":\"attempt-33333333333333333333333333333333\",\"workflow\":\"flow\",\"attempt_kind\":\"node\",\"billing\":{\"billing_mode\":\"metered\",\"account_group\":\"fixture\"}},\"started_ms\":0,\"utc_day\":0,\"dispatched\":true,\"finalized\":true,\"usage\":{\"used\":99,\"size\":1000,\"cost\":{\"amount\":0.25,\"currency\":\"USD\"},\"terminal\":{\"totalTokens\":15,\"inputTokens\":10,\"outputTokens\":5},\"at_ms\":0},\"cost_invalid\":false}"
+      ],
+      "public_failure_projection": [
+        {
+          "schema_version": 1,
+          "primary": "completed",
+          "cleanup": {
+            "disposition": "complete",
+            "duration_ms": 0
+          },
+          "cause": null,
+          "prompt_may_have_been_accepted": false,
+          "degraded_ancestry": false,
+          "policy_trigger_id": null
+        }
+      ],
+      "governance_tables": 0
+    },
+    "failure": {
+      "status": 1,
+      "stdout": "execution_id=exec-11111111111111111111111111111111\nattempt_id=attempt-22222222222222222222222222222222\n",
+      "stderr": "[brief-lint] artifact write skipped: no git artifact surface under $FIXTURE\n[workflow] node review started; configured selection: Some(EffectiveConfig { model: Some(\"missing\"), effort: None, mode: None })\n[workflow] node review failed\nusage node=\"review\" attempts=1 coverage_start_ms=0 historical_incomplete=true groups=[agent=\"agent\" model=\"missing\" workflow=null utc_day=null billing=unmapped attempts=1 dispatched=1 pending=1 unmapped=1 total_tokens={reported_sum:0,missing_count:0,partial:true} input_tokens={reported_sum:0,missing_count:0,partial:true} output_tokens={reported_sum:0,missing_count:0,partial:true} thought_tokens={reported_sum:0,missing_count:0,partial:true} cached_read_tokens={reported_sum:0,missing_count:0,partial:true} cached_write_tokens={reported_sum:0,missing_count:0,partial:true} costs={} cost_known=0 cost_missing=0 cost_invalid=0 cost_partial=true]\nnode_terminal{node=\"review\",terminal_json={\"schema_version\":1,\"primary\":\"failed\",\"cleanup\":{\"disposition\":\"complete\",\"duration_ms\":0},\"cause\":{\"failure_class\":\"model\",\"code\":\"acp.config.model_rejected\",\"deepest_cause\":\"invalid config: agent agent model=missing is not advertised; valid models: good\",\"cause_truncated\":false,\"evidence_overflow\":false,\"dependency_set\":null},\"prompt_may_have_been_accepted\":false,\"degraded_ancestry\":false,\"policy_trigger_id\":null}}\n[brief-lint] wrote artifact result.brief-lint.json\nError: \"run-workflow: workflow did not complete successfully\"\n",
+      "artifacts": {
+        "result.brief-lint.json": "{\n  \"schema_version\": 1,\n  \"strict\": false,\n  \"report\": {\n    \"kind\": \"run-workflow\",\n    \"findings\": []\n  }\n}",
+        "result.md": "[node review failed: AgentFailure { diagnostic: FailureDiagnostic { schema_version: 1, failed_phase: ConfigApply, last_completed_phase: Some(SessionCreate), class: Model, disposition: Fatal, code: DiagnosticCode(\"acp.config.model_rejected\"), cause_count: 1, stderr_observed: false, stderr_line_count: 0, stderr_scope: None, stderr_redaction: None, retry_after_ms: None, reset_at_ms: None, prompt_may_have_been_accepted: false } }]"
+      },
+      "accounting": [
+        {
+          "id": "attempt-33333333333333333333333333333333",
+          "attribution": {
+            "execution": "exec-11111111111111111111111111111111",
+            "run_attempt": "attempt-22222222222222222222222222222222",
+            "node": "review",
+            "agent": "agent",
+            "effective_model": "missing",
+            "effective_effort": null,
+            "effective_mode": null,
+            "turn": "attempt-33333333333333333333333333333333",
+            "workflow": "flow",
+            "attempt_kind": "node",
+            "billing": null
+          },
+          "started_ms": 0,
+          "utc_day": 0,
+          "dispatched": true,
+          "finalized": false,
+          "usage": {
+            "used": null,
+            "size": null,
+            "cost": null,
+            "at_ms": 0
+          },
+          "cost_invalid": false
+        }
+      ],
+      "accounting_records": [
+        "{\"id\":\"attempt-33333333333333333333333333333333\",\"attribution\":{\"execution\":\"exec-11111111111111111111111111111111\",\"run_attempt\":\"attempt-22222222222222222222222222222222\",\"node\":\"review\",\"agent\":\"agent\",\"effective_model\":\"missing\",\"effective_effort\":null,\"effective_mode\":null,\"turn\":\"attempt-33333333333333333333333333333333\",\"workflow\":\"flow\",\"attempt_kind\":\"node\",\"billing\":null},\"started_ms\":0,\"utc_day\":0,\"dispatched\":true,\"finalized\":false,\"usage\":{\"used\":null,\"size\":null,\"cost\":null,\"at_ms\":0},\"cost_invalid\":false}"
+      ],
+      "public_failure_projection": [
+        {
+          "schema_version": 1,
+          "primary": "failed",
+          "cleanup": {
+            "disposition": "complete",
+            "duration_ms": 0
+          },
+          "cause": {
+            "failure_class": "model",
+            "code": "acp.config.model_rejected",
+            "deepest_cause": "invalid config: agent agent model=missing is not advertised; valid models: good",
+            "cause_truncated": false,
+            "evidence_overflow": false,
+            "dependency_set": null
+          },
+          "prompt_may_have_been_accepted": false,
+          "degraded_ancestry": false,
+          "policy_trigger_id": null
+        }
+      ],
+      "governance_tables": 0
+    }
+  }
+}

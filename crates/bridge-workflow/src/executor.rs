@@ -2051,7 +2051,9 @@ async fn settle_accounting_preparation(
     let failure = AccountingFailureV1::from(original)
         .settle(prepared.take())
         .await;
-    if failure.persistence.is_some() {
+    if failure.persistence.is_some()
+        || matches!(failure.original, BridgeError::BudgetRefused { .. })
+    {
         Err(failure)
     } else {
         Ok(())
@@ -5638,6 +5640,7 @@ impl WorkflowExecutor {
                     Arc::new(bridge_core::attempt_activity::SystemMonotonicClock::start())
                 });
             let cleanup_tracker = Arc::new(WorkflowCleanupTracker::new(cleanup_clock.clone()));
+            let mut budget_failure: Option<AccountingFailureV1> = None;
             // This macro is deliberately inside the stream, at every post-recording return site.
             // `async_stream` resumes only when the consumer polls; yielding the terminal error
             // before this await would allow a consumer drop to strand a materialized checkout.
@@ -5650,6 +5653,10 @@ impl WorkflowExecutor {
                         terminal_error_checkout_outcome(cancel.is_cancelled()),
                     )
                     .await;
+                    // Keep the refusal observable even when a later error aborts the drain.
+                    if let Some(failure) = budget_failure.take() {
+                        yield Err(failure);
+                    }
                     yield Err(primary_error);
                     return;
                 }};
@@ -5760,7 +5767,7 @@ impl WorkflowExecutor {
             let mut inflight: FuturesUnordered<NodeFut> = FuturesUnordered::new();
             let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let mut scheduled: HashSet<String> = HashSet::new();
-            let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
+            let mut stop_scheduling = false; // drain in-flight, schedule nothing new
             let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
             let mut post_transfer_terminalizers = BTreeMap::<NodeId, CancellationToken>::new();
             use NodePrimaryDispositionV1::{CanceledPolicy, CanceledWorkflow};
@@ -5852,6 +5859,7 @@ impl WorkflowExecutor {
                         });
                         if has_trigger_reference
                             || (qualifying_failure
+                                && !node_terminals.values().any(bridge_core::governance::is_budget_stop_terminal_v1)
                                 && !matches!(
                                     authority.run_spec.controls.fan_out,
                                     bridge_core::execution_policy::FanOutPolicyV1::BoundedIndependent
@@ -6124,7 +6132,9 @@ impl WorkflowExecutor {
                     break;
                 }
                 let workflow_cancel_observable_before_wait = cancel.is_cancelled();
-                let mut impossibility_proof = scheduler_active
+                // Budget refusal explains the absent terminal; it must not mint an
+                // impossibility cancellation. Deadlines and cleanup polling stay live.
+                let mut impossibility_proof = (scheduler_active && budget_failure.is_none())
                     .then(|| scheduler_impossibility_proof_v1(
                         graph.as_ref(), &done, &node_cancels, stop_scheduling,
                     ))
@@ -6458,10 +6468,30 @@ impl WorkflowExecutor {
                     post_transfer_terminalizers.remove(&node_id);
                     let raw_output = match raw_output {
                         Ok(output) => output,
+                        Err(error) if matches!(error.original, BridgeError::BudgetRefused { .. }) => {
+                            let node = graph.nodes.iter().find(|node| node.id == node_id)
+                                .expect("a completion belongs to the workflow");
+                            let mut output = match node_run_output(
+                                graph.id.as_str(), node, &run_id, &ctx,
+                                format!("[node {} failed: {}]", node_id.as_str(), error.original.client_message()),
+                                false, None, NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
+                            ) {
+                                Ok(output) => output,
+                                Err(error) => { settle_error_before_yield!(error); }
+                            };
+                            output.primary_error = Some(error.original.clone());
+                            budget_failure.get_or_insert(error);
+                            output
+                        }
                         Err(error) => {
                             settle_error_before_yield!(error);
                         }
                     };
+                    if let Some(error @ BridgeError::BudgetRefused { .. }) = &raw_output.primary_error {
+                        budget_failure.get_or_insert_with(|| error.clone().into());
+                    }
+                    stop_scheduling |= budget_failure.is_some();
                     let NodeRunOutput {
                         text: raw_text,
                         ok,
@@ -6589,7 +6619,7 @@ impl WorkflowExecutor {
                 let mut action = PolicyActionV1::None;
                 if ready_terminals.is_empty() {
                 } else if let (Some(controller), Some(authority)) =
-                    (fanout_controller.as_mut(), frozen_authority.as_ref())
+                    (fanout_controller.as_mut().filter(|_| budget_failure.is_none()), frozen_authority.as_ref())
                 {
                     #[cfg(test)]
                     if ctx.post_recording_exit_fault
@@ -6712,6 +6742,13 @@ impl WorkflowExecutor {
                     stop_scheduling |= controller.admission_stopped();
                 } else {
                     for ready in ready_terminals {
+                        if frozen_authority.is_some() {
+                            let encoded = match canonical_terminal_json_v1(&ready.terminal) {
+                                Ok(encoded) => encoded,
+                                Err(error) => { settle_error_before_yield!(error); }
+                            };
+                            ready_event_evidence.insert(ready.node.clone(), (encoded, None, None));
+                        }
                         node_terminals.insert(ready.node, ready.terminal);
                     }
                 }
@@ -6790,7 +6827,7 @@ impl WorkflowExecutor {
                 }
             }
             observe_external_root_cancellation!();
-            if frozen_authority.is_some() {
+            if frozen_authority.is_some() || budget_failure.is_some() {
                 let mut missing = graph
                     .nodes
                     .iter()
@@ -6805,7 +6842,8 @@ impl WorkflowExecutor {
                             NodeDisposition::Canceled,
                             format!("[node {} canceled: workflow]", node.as_str()),
                         )
-                    } else if observed_arms.contains(&Arm::AbsoluteCutoff)
+                    } else if budget_failure.is_some()
+                        || observed_arms.contains(&Arm::AbsoluteCutoff)
                         || observed_arms.contains(&Arm::MechanicallyProvedImpossibility)
                         || fanout_controller.as_ref().is_some_and(|controller| {
                             controller.admission_stopped() && controller.trigger().is_some()
@@ -6861,7 +6899,9 @@ impl WorkflowExecutor {
                 }
             }
             let (term_text, _, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
-            let outcome = dispositions
+            let outcome = if budget_failure.is_some() {
+                WorkflowOutcome::Failed
+            } else { dispositions
                 .get(&terminal_id)
                 .copied()
                 .map(NodeDisposition::workflow_outcome)
@@ -6884,7 +6924,7 @@ impl WorkflowExecutor {
                     } else {
                         WorkflowOutcome::Failed
                     }
-                });
+                }) };
             let (cleanup_disposition, cleanup_ms) = cleanup_tracker.observation();
             // ---- R2f1b §5.1 WORKFLOW-LEVEL CHECKOUT DISPOSITION (slice 2c2) ------------------
             // "After every node is terminal, an all-healthy global workflow outcome may mint
@@ -6923,6 +6963,9 @@ impl WorkflowExecutor {
                 duration_ms: cleanup_ms,
             });
             yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
+            if let Some(failure) = budget_failure {
+                yield Err(failure);
+            }
         })
     }
 }
@@ -15245,6 +15288,8 @@ mod tests {
     struct SettlementBackend {
         settlements: Mutex<Vec<(String, WorkflowCheckoutOutcomeV1)>>,
         fail_prompt_for: Option<&'static str>,
+        budget_refusal: bool,
+        fail_transfer: bool,
         cleanups: AtomicUsize,
         root_cleanup_advance_ms: u64,
         scheduler: Option<Arc<SchedulerSignals>>,
@@ -15269,7 +15314,15 @@ mod tests {
                 {
                     signals.fail_gate.notified().await;
                 }
-                return Err(BridgeError::StoreFailure);
+                return Err(if self.budget_refusal {
+                    BridgeError::BudgetRefused {
+                        refusal: Box::new(bridge_core::governance::BudgetRefusalV1::new(
+                            bridge_core::governance::BudgetRefusalReasonV1::LimitExceeded,
+                        )),
+                    }
+                } else {
+                    BridgeError::StoreFailure
+                });
             }
             if let Some(signals) = self
                 .scheduler
@@ -15344,6 +15397,9 @@ mod tests {
             _session: &SessionId,
             reason: BoundedRecoveryReasonV1,
         ) -> Result<CleanupDeadlineTransferV1, BridgeError> {
+            if self.fail_transfer {
+                return Err(BridgeError::StoreFailure);
+            }
             self.terminalization
                 .as_ref()
                 .map(|harness| harness.transfer(reason))
@@ -16009,6 +16065,7 @@ mod tests {
         ) -> Vec<Result<WorkflowEvent, BridgeError>> {
             let harness = backend.terminalization.as_ref().unwrap();
             let signals = backend.scheduler.as_ref().unwrap().clone();
+            let finished = signals.clone();
             let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
                 session_cwd: spec.requested_session_cwd.clone(),
                 make_rich_sink: Some(harness.clone()),
@@ -16035,6 +16092,11 @@ mod tests {
                     cancel,
                     context,
                 )
+                .inspect(move |event| {
+                    if matches!(event, Ok(WorkflowEvent::NodeFinished { node, .. }) if node.as_str() == "codex") {
+                        finished.fail_gate.notify_one();
+                    }
+                })
                 .collect()
                 .await
         }
@@ -16379,6 +16441,110 @@ mod tests {
                 let task = tokio::spawn(collect_terminalization($spec, backend.clone(), $cancel));
                 (backend, harness, task)
             }};
+        }
+
+        async fn assert_budget_drain_bound(external: bool) {
+            let spec = review_fail_fast_spec(Readiness::Armed);
+            let cutoff = spec.controls.effective_work_cutoff_ms();
+            let clock = Arc::new(PausedSchedulerClock(tokio::time::Instant::now()));
+            let (mut backend, harness) = terminalization_backend(clock, 0);
+            Arc::get_mut(&mut backend).unwrap().budget_refusal = true;
+            let signals = backend.scheduler.as_ref().unwrap().clone();
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(collect_terminalization(spec, backend, cancel.clone()));
+            soon(signals.other_entered.notified()).await;
+            soon(signals.fail_gate.notified()).await; // refusal has reached the scheduler
+            assert_eq!(harness.cancel_calls.load(Ordering::SeqCst), 0);
+            assert!(!task.is_finished()); // budget alone neither cancels nor drops its sibling
+            if external {
+                cancel.cancel();
+            } else {
+                tokio::time::advance(std::time::Duration::from_millis(cutoff - 1)).await;
+                tokio::task::yield_now().await;
+                assert_eq!(harness.cancel_calls.load(Ordering::SeqCst), 0);
+                tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            }
+            soon(harness.cancel_started.notified()).await;
+            assert_eq!(harness.cancel_calls.load(Ordering::SeqCst), 1);
+            tokio::time::advance(std::time::Duration::from_millis(59_999)).await;
+            tokio::task::yield_now().await;
+            assert!(!harness.flight.lock().unwrap().as_ref().unwrap().1);
+            assert!(!task.is_finished()); // cleanup is still blocked inside cancel()
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            let events = tokio::time::timeout(std::time::Duration::from_millis(1), task)
+                .await
+                .expect("budget drain lost its bounded cleanup transfer")
+                .unwrap();
+            assert!(harness.flight.lock().unwrap().as_ref().unwrap().1);
+            assert_eq!(harness.cancel_completed.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                events.last(),
+                Some(Err(BridgeError::BudgetRefused { .. }))
+            ));
+            assert_eq!(workflow_terminal(&events), WfFailed);
+            assert_eq!(
+                primary(&events, "claude"),
+                if external {
+                    CanceledWorkflow
+                } else {
+                    CanceledPolicy
+                }
+            );
+            assert_eq!(
+                primary(&events, "synth"),
+                if external {
+                    CanceledWorkflow
+                } else {
+                    NotStartedPolicy
+                }
+            );
+            assert_eq!(terminal(&events, "claude").cleanup.disposition, Xfer);
+            assert!(bridge_core::governance::is_budget_stop_terminal_v1(
+                &terminal(&events, "codex")
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn budget_drain_retains_absolute_cutoff() {
+            assert_budget_drain_bound(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn budget_drain_retains_external_cleanup_deadline() {
+            assert_budget_drain_bound(true).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn retained_budget_precedes_secondary_store_failure() {
+            for governed in [true, false] {
+                let spec = review_fail_fast_spec(Readiness::Armed);
+                let clock = Arc::new(PausedSchedulerClock(tokio::time::Instant::now()));
+                let (mut backend, harness) = terminalization_backend(clock, 0);
+                let fixture = Arc::get_mut(&mut backend).unwrap();
+                fixture.budget_refusal = governed;
+                fixture.fail_transfer = true;
+                let signals = backend.scheduler.as_ref().unwrap().clone();
+                signals.barrier_gate.notify_one();
+                let cancel = CancellationToken::new();
+                let task = tokio::spawn(collect_terminalization(spec, backend, cancel.clone()));
+                soon(signals.other_entered.notified()).await;
+                soon(signals.fail_gate.notified()).await;
+                cancel.cancel();
+                soon(harness.cancel_started.notified()).await;
+                tokio::time::advance(std::time::Duration::from_secs(60)).await;
+                let events = soon(task).await.unwrap();
+                let errors: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| event.as_ref().err())
+                    .collect();
+                assert_eq!(errors.len(), if governed { 2 } else { 1 }, "{events:?}");
+                if governed {
+                    assert!(matches!(errors[0], BridgeError::BudgetRefused { .. }));
+                }
+                assert_eq!(errors.last(), Some(&&BridgeError::StoreFailure));
+                assert!(!events.iter().any(|event| matches!(event,
+                    Ok(WorkflowEvent::NodeStarted { node, .. }) if node.as_str() == "synth")));
+            }
         }
 
         #[tokio::test(start_paused = true)]

@@ -269,3 +269,18 @@ pub enum BudgetAdmissionOutcomeV1 {
     Admitted(BudgetPermitV1),
     Refused(BudgetRefusalV1),
 }
+
+/// A budget stop deliberately drains siblings instead of selecting a fan-out trigger.
+/// Only a failed, undispatched terminal with the typed static budget cause proves it.
+pub fn is_budget_stop_terminal_v1(terminal: &crate::execution_policy::NodeTerminalV1) -> bool {
+    use crate::{diagnostics::DiagnosticFailureClass, execution_policy::NodePrimaryDispositionV1};
+    terminal.primary == NodePrimaryDispositionV1::Failed
+        && !terminal.prompt_may_have_been_accepted
+        && terminal.cause.as_ref().is_some_and(|cause| {
+            cause.failure_class == DiagnosticFailureClass::Config
+                && cause.code.as_str() == "bridge.budget_refused"
+                && !cause.cause_truncated
+                && !cause.evidence_overflow
+                && cause.dependency_set.is_none()
+        })
+}
