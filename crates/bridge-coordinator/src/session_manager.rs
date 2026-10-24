@@ -172,6 +172,11 @@ impl From<&WarmHandle> for CompactionSnapshot {
     }
 }
 
+struct GovernedOperation {
+    abort: CancellationToken,
+    ready: bool,
+}
+
 struct WarmHandle {
     #[allow(dead_code)] // surfaced by handle ops in later slices
     id: SessionHandleId,
@@ -196,6 +201,7 @@ struct WarmHandle {
     /// appends rather than overwrites; `finish_turn` removes only its exact operation token, closing the
     /// cancel-A -> checkout-B -> release/reset orphan window.
     turn_aborts: Vec<TurnAbort>,
+    governed: Option<GovernedOperation>,
     pending_seed: Option<String>,
     pending_injects: Vec<QueuedInject>,
     last_used: Instant,
@@ -455,6 +461,384 @@ impl Drop for ExpiryClaim {
 }
 
 /// What a checked-out warm turn needs to dispatch.
+/// Reversible ownership of one exact governed operation. No backend effect occurs
+/// until admission. Drop restores the retained handle, or expires an uncertain apply.
+pub struct GovernedTurnClaim {
+    sm: Arc<SessionManager>,
+    ctx: ContextId,
+    handle: SessionHandleId,
+    generation: SessionGeneration,
+    op: OperationId,
+    backend: Arc<dyn AgentBackend>,
+    before: SessionSpecFingerprint,
+    intended: SessionSpecFingerprint,
+    fresh: bool,
+    applying: bool,
+    attempt: Option<String>,
+    entry: Option<Arc<bridge_core::domain::AgentEntry>>,
+    armed: bool,
+    abort: CancellationToken,
+    observer: Arc<dyn DiagnosticObserver>,
+}
+
+impl GovernedTurnClaim {
+    pub async fn rollback(mut self) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        self.settle().await
+    }
+
+    pub fn selection(&self) -> (&AgentId, &bridge_core::domain::EffectiveConfig) {
+        (&self.intended.agent, &self.intended.config)
+    }
+
+    fn matches(&self, usage: &bridge_core::translator::PreparedAccountingTurnV1) -> bool {
+        let config = &self.intended.config;
+        usage.attribution().agent == self.intended.agent.as_str()
+            && usage.matches_config(
+                &config.model,
+                &config.effort.map(|e| format!("{e:?}").to_ascii_lowercase()),
+                &config.mode,
+            )
+    }
+
+    /// The owned flight outlives a disconnected caller. In particular, cancellation
+    /// cannot roll back the session while store admission is still outstanding.
+    pub async fn admit(
+        self,
+        usage: bridge_core::translator::PreparedAccountingTurnV1,
+    ) -> Result<
+        (Self, bridge_core::translator::PreparedAccountingTurnV1),
+        bridge_core::translator::AccountingFailureV1,
+    > {
+        let interrupted = CancellationToken::new();
+        let interrupt_on_drop = interrupted.clone().drop_guard();
+        let cancel_on_drop = self.abort.clone().drop_guard();
+        let result = tokio::spawn(async move {
+            let mut claim = self;
+            if !claim.matches(&usage) || claim.abort.is_cancelled() {
+                let error = if claim.abort.is_cancelled() {
+                    bridge_core::translator::AccountingFailureV1::canceled_before_prompt()
+                } else { BridgeError::ConfigMismatch { field: "claim selection" }.into() };
+                return Err(claim.reject(usage, error, interrupted.is_cancelled()).await);
+            }
+            match usage.admit_direct().await {
+                Ok(usage) => {
+                    if claim.abort.is_cancelled() {
+                        return Err(claim.reject(usage, bridge_core::translator::AccountingFailureV1::canceled_before_prompt(), interrupted.is_cancelled()).await);
+                    }
+                    claim.attempt = usage.attribution().turn.clone();
+                    Ok((claim, usage))
+                }
+                Err(failure) => {
+                    let cleanup = claim.settle().await;
+                    Err(failure.with_checked_cleanup(cleanup))
+                }
+            }
+        })
+        .await
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        cancel_on_drop.disarm();
+        interrupt_on_drop.disarm();
+        result
+    }
+
+    pub async fn apply(
+        self,
+        usage: bridge_core::translator::PreparedAccountingTurnV1,
+    ) -> Result<crate::dispatch::GovernedDispatch, bridge_core::translator::AccountingFailureV1>
+    {
+        let interrupted = CancellationToken::new();
+        let interrupt_on_drop = interrupted.clone().drop_guard();
+        let cancel_on_drop = self.abort.clone().drop_guard();
+        let result = tokio::spawn(async move {
+            let mut claim = self;
+            match claim.apply_session(&usage).await {
+                Ok(turn) => {
+                    let completion = crate::dispatch::WarmCompletionGuard::finish_owner(
+                        claim.sm.clone(),
+                        claim.ctx.clone(),
+                        turn.generation,
+                        turn.op.clone(),
+                        turn.expiry_intent.clone(),
+                        claim.observer.clone(),
+                    );
+                    claim.armed = false;
+                    Ok(crate::dispatch::GovernedDispatch {
+                        turn,
+                        usage: usage.with_prompt_gate(Arc::new(claim)),
+                        completion,
+                    })
+                }
+                Err(error) => Err(claim.reject(usage, error, interrupted.is_cancelled()).await),
+            }
+        })
+        .await
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        cancel_on_drop.disarm();
+        interrupt_on_drop.disarm();
+        result
+    }
+
+    async fn reject(
+        &mut self,
+        usage: bridge_core::translator::PreparedAccountingTurnV1,
+        mut failure: bridge_core::translator::AccountingFailureV1,
+        interrupted: bool,
+    ) -> bridge_core::translator::AccountingFailureV1 {
+        let cleanup = self.settle().await;
+        failure.replay.prompt_acceptance = bridge_core::routing::ExclusionEvidenceV1::Excluded;
+        failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Excluded;
+        if !interrupted {
+            failure = failure.settle(Some(usage)).await;
+        }
+        // Abrupt disconnection drops usage pending, retaining admitted liability.
+        failure.with_checked_cleanup(cleanup)
+    }
+
+    fn owns(&self, h: &WarmHandle) -> bool {
+        h.id == self.handle
+            && h.generation == self.generation
+            && h.op.as_ref() == Some(&self.op)
+            && h.governed.is_some()
+    }
+
+    fn registry_is_current(&self, h: &WarmHandle) -> bool {
+        !h.lease.is_retired()
+            && Arc::ptr_eq(&h.backend, &self.backend)
+            && self.entry.as_ref().is_none_or(|entry| {
+                self.sm
+                    .registry
+                    .entry_snapshot(&self.intended.agent)
+                    .is_some_and(|current| Arc::ptr_eq(entry, &current))
+            })
+    }
+
+    async fn apply_session(
+        &mut self,
+        usage: &bridge_core::translator::PreparedAccountingTurnV1,
+    ) -> Result<WarmTurn, bridge_core::translator::AccountingFailureV1> {
+        if !usage.is_admitted()
+            || !self.matches(usage)
+            || self.attempt.is_none()
+            || self.attempt != usage.attribution().turn
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "admitted selection",
+            }
+            .into());
+        }
+        let resolved = self
+            .sm
+            .registry
+            .resolve_observed(&self.intended.agent, self.observer.clone())
+            .await?;
+        let sm = self.sm.clone();
+        let mut tab = sm.by_context.lock().await;
+        let h = tab
+            .get_mut(&self.ctx)
+            .filter(|h| self.owns(h))
+            .ok_or(BridgeError::SessionExpired)?;
+        if self.abort.is_cancelled() {
+            return Err(bridge_core::translator::AccountingFailureV1::canceled_before_prompt());
+        }
+        if h.expire_after_reconcile {
+            return Err(BridgeError::SessionExpired.into());
+        }
+        if !self.registry_is_current(h)
+            || resolved.lease.is_retired()
+            || !Arc::ptr_eq(&resolved.backend, &self.backend)
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|entry| !Arc::ptr_eq(entry, &resolved.entry))
+            || h.fingerprint != self.before
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "claim identity",
+            }
+            .into());
+        }
+        let session = h.backend_session.clone();
+        let spec = SessionSpec {
+            config: self.intended.config.clone(),
+            cwd: self
+                .intended
+                .cwd
+                .as_deref()
+                .map(SessionCwd::parse)
+                .transpose()?,
+        };
+        if h.turn_aborts
+            .iter()
+            .any(|turn| turn.expiry_intent.is_armed())
+        {
+            return Err(BridgeError::SessionExpired.into());
+        }
+        self.applying = true;
+        if h.turn_aborts
+            .iter()
+            .any(|turn| !turn.expiry_intent.reserve_successor())
+        {
+            return Err(BridgeError::SessionExpired.into());
+        }
+        drop(tab);
+        if self.fresh {
+            self.backend.configure_session(&session, &spec).await?;
+        } else if self.before != self.intended {
+            match self.backend.reconcile_config(&session, &spec).await? {
+                ReconcileOutcome::Applied => {}
+                _ => {
+                    return Err(BridgeError::ConfigReseedRequired {
+                        field: "model/effort",
+                    }
+                    .into())
+                }
+            }
+        }
+        let mut tab = sm.by_context.lock().await;
+        let h = tab
+            .get_mut(&self.ctx)
+            .filter(|h| self.owns(h))
+            .ok_or(BridgeError::SessionExpired)?;
+        if self.abort.is_cancelled() {
+            return Err(bridge_core::translator::AccountingFailureV1::canceled_before_prompt());
+        }
+        if h.expire_after_reconcile {
+            return Err(BridgeError::SessionExpired.into());
+        }
+        if !self.registry_is_current(h)
+            || resolved.lease.is_retired()
+            || h.fingerprint != self.before
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "claim identity",
+            }
+            .into());
+        }
+        h.fingerprint = self.intended.clone();
+        h.governed.as_mut().expect("owned claim").ready = true;
+        let expiry_intent = WarmExpiryIntent::new();
+        h.turn_aborts.push(TurnAbort {
+            op: self.op.clone(),
+            token: self.abort.clone(),
+            expiry_intent: expiry_intent.clone(),
+        });
+        h.last_used = sm.clock.now_instant();
+        Ok(SessionManager::warm_turn_from_handle(
+            h,
+            sm.eval_warn(&h.usage),
+            self.op.clone(),
+            expiry_intent,
+            self.abort.clone(),
+        ))
+    }
+
+    async fn settle(&mut self) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        let mut tab = self.sm.by_context.lock().await;
+        let Some(h) = tab.get_mut(&self.ctx).filter(|h| self.owns(h)) else {
+            self.armed = false;
+            return Ok(BackendCleanupDispositionV1::Unknown);
+        };
+        let expire = self.applying
+            || h.expire_after_reconcile
+            || h.turn_aborts
+                .iter()
+                .any(|turn| turn.expiry_intent.is_armed());
+        h.governed = None;
+        if self.fresh && !self.applying {
+            tab.remove(&self.ctx); // never configured: no provider cancel/release
+        } else if expire {
+            let cleanup = self.sm.take_expiry_claim_locked(
+                &mut tab,
+                &self.ctx,
+                self.generation,
+                self.op.clone(),
+            );
+            self.armed = false;
+            drop(tab);
+            return cleanup.cleanup().await.result;
+        } else {
+            h.state = SessionState::Idle;
+            h.op = None; // deliberately preserve last_used, queues, usage and expiry intents
+        }
+        self.armed = false;
+        Ok(BackendCleanupDispositionV1::Complete)
+    }
+}
+
+#[async_trait::async_trait]
+impl bridge_core::accounting::DirectPromptGateV1 for GovernedTurnClaim {
+    async fn first_poll(
+        &self,
+        session: &SessionId,
+        backend: &Arc<dyn AgentBackend>,
+        prompt: &mut bridge_core::accounting::DirectPromptFutureV1<'_>,
+    ) -> Result<
+        Poll<Result<bridge_core::ports::BackendStream, BridgeError>>,
+        bridge_core::translator::AccountingFailureV1,
+    > {
+        let mut tab = self.sm.by_context.lock().await;
+        let h = tab
+            .get_mut(&self.ctx)
+            .filter(|h| {
+                self.owns(h)
+                    && h.governed.as_ref().is_some_and(|operation| operation.ready)
+                    && h.backend_session == *session
+            })
+            .ok_or(BridgeError::SessionExpired)?;
+        if self.abort.is_cancelled() {
+            return Err(bridge_core::translator::AccountingFailureV1::canceled_before_prompt());
+        }
+        if h.expire_after_reconcile
+            || !Arc::ptr_eq(backend, &self.backend)
+            || !self.registry_is_current(h)
+            || h.fingerprint != self.intended
+        {
+            h.expire_after_reconcile = true;
+            return Err(BridgeError::ConfigMismatch {
+                field: "prompt identity",
+            }
+            .into());
+        }
+        // Keep the session lock through exactly the first provider poll. Once it
+        // is polled, ordinary backend cancellation owns the running operation.
+        h.governed = None;
+        let first =
+            futures::future::poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut *prompt).poll(cx)))
+                .await;
+        drop(tab);
+        Ok(first)
+    }
+}
+
+impl Drop for GovernedTurnClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            // Move exact ownership into an async settlement without cloning the capability.
+            let mut owner = Self {
+                sm: self.sm.clone(),
+                ctx: self.ctx.clone(),
+                handle: self.handle.clone(),
+                generation: self.generation,
+                op: self.op.clone(),
+                backend: self.backend.clone(),
+                before: self.before.clone(),
+                intended: self.intended.clone(),
+                fresh: self.fresh,
+                applying: self.applying,
+                attempt: self.attempt.take(),
+                entry: self.entry.take(),
+                armed: true,
+                abort: self.abort.clone(),
+                observer: self.observer.clone(),
+            };
+            self.armed = false;
+            tokio::spawn(async move {
+                let _ = owner.settle().await;
+            });
+        }
+    }
+}
+
 pub struct WarmTurn {
     pub backend: Arc<dyn AgentBackend>,
     pub session: SessionId,
@@ -846,6 +1230,177 @@ impl SessionManager {
     /// Start a warm turn: mint (fresh ctx) or resume (known ctx). Resume requires a matching
     /// fingerprint (else ConfigMismatch), a non-retired lease (else SessionExpired), and an Idle
     /// handle (else HandleBusy). Transitions to Running. Resolves the agent exactly once.
+    pub async fn has_live_contexts(&self) -> bool {
+        let tab = self.by_context.lock().await;
+        !tab.live.is_empty() || !tab.tombstones.is_empty()
+    }
+
+    pub async fn claim_existing_turn(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+    ) -> Result<GovernedTurnClaim, BridgeError> {
+        let mut tab = self.by_context.lock().await;
+        self.claim_governed_locked(
+            &mut tab,
+            ctx,
+            None,
+            None,
+            None,
+            false,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+    }
+
+    /// Installed-policy counterpart of checkout_turn_observed. Warm omissions
+    /// inherit the retained selection; registry defaults only select fresh turns.
+    pub async fn claim_turn_observed(
+        self: &Arc<Self>,
+        ctx: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<GovernedTurnClaim, BridgeError> {
+        {
+            let mut tab = self.by_context.lock().await;
+            if tab.contains_key(ctx) {
+                return self.claim_governed_locked(
+                    &mut tab,
+                    ctx,
+                    Some(agent),
+                    overrides,
+                    cwd,
+                    false,
+                    observer,
+                );
+            }
+        }
+        let resolved = self
+            .registry
+            .resolve_observed(&agent, observer.clone())
+            .await?;
+        let mut tab = self.by_context.lock().await;
+        if tab.contains_key(ctx) {
+            return Err(BridgeError::HandleBusy);
+        }
+        let fingerprint = SessionSpecFingerprint {
+            agent: agent.clone(),
+            config: effective_config(&resolved.entry, overrides.as_ref()),
+            cwd: cwd.as_ref().map(|c| c.as_str().to_owned()),
+        };
+        let session = SessionId::parse(format!("ctx-{}-g0", ctx.as_str()))?;
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tab.insert(
+            ctx.clone(),
+            WarmHandle {
+                id: SessionHandleId::parse(format!("h-{n}"))?,
+                agent,
+                caps: resolved.backend.capabilities(),
+                backend: resolved.backend,
+                backend_session: session,
+                generation: SessionGeneration::new(0),
+                fingerprint,
+                lease: resolved.lease,
+                state: SessionState::Idle,
+                usage: UsageSnapshot::default(),
+                expire_after_reconcile: false,
+                op: None,
+                turn_aborts: Vec::new(),
+                governed: None,
+                pending_seed: None,
+                pending_injects: Vec::new(),
+                last_used: self.clock.now_instant(),
+            },
+        );
+        let result = self.claim_governed_locked(&mut tab, ctx, None, None, None, true, observer);
+        if result.is_err() {
+            tab.remove(ctx);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_governed_locked(
+        self: &Arc<Self>,
+        tab: &mut SessionTable,
+        ctx: &ContextId,
+        agent: Option<AgentId>,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        fresh: bool,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<GovernedTurnClaim, BridgeError> {
+        if tab.tombstone(ctx).is_some() {
+            return Err(BridgeError::SessionExpired);
+        }
+        let h = tab.get_mut(ctx).ok_or(BridgeError::SessionNotFound)?;
+        if h.lease.is_retired() {
+            return Err(BridgeError::SessionExpired);
+        }
+        if h.state != SessionState::Idle {
+            return Err(BridgeError::HandleBusy);
+        }
+        if let Some(op) = h
+            .turn_aborts
+            .iter()
+            .find(|t| t.expiry_intent.is_armed())
+            .map(|t| t.op.clone())
+        {
+            let generation = h.generation;
+            let _ = self
+                .take_expiry_claim_locked(tab, ctx, generation, op)
+                .into_flight();
+            return Err(BridgeError::SessionExpired);
+        }
+        if agent.as_ref().is_some_and(|agent| *agent != h.agent) {
+            return Err(BridgeError::ConfigMismatch { field: "agent" });
+        }
+        if cwd
+            .as_ref()
+            .is_some_and(|c| Some(c.as_str()) != h.fingerprint.cwd.as_deref())
+        {
+            return Err(BridgeError::ConfigMismatch { field: "cwd" });
+        }
+        let mut intended = h.fingerprint.clone();
+        if let Some(ov) = overrides {
+            if let Some(model) = ov.model {
+                intended.config.model = Some(model);
+            }
+            if let Some(effort) = ov.effort {
+                intended.config.effort = Some(effort);
+            }
+            if let Some(mode) = ov.mode {
+                if Some(&mode) != intended.config.mode.as_ref() {
+                    return Err(BridgeError::ConfigReseedRequired { field: "mode" });
+                }
+            }
+        }
+        let claim = GovernedTurnClaim {
+            sm: self.clone(),
+            ctx: ctx.clone(),
+            handle: h.id.clone(),
+            generation: h.generation,
+            op: self.mint_turn_op(),
+            backend: h.backend.clone(),
+            before: h.fingerprint.clone(),
+            intended,
+            fresh,
+            applying: false,
+            attempt: None,
+            entry: self.registry.entry_snapshot(&h.agent),
+            armed: true,
+            abort: CancellationToken::new(),
+            observer,
+        };
+        h.state = SessionState::Running;
+        h.op = Some(claim.op.clone());
+        h.governed = Some(GovernedOperation {
+            abort: claim.abort.clone(),
+            ready: false,
+        });
+        Ok(claim)
+    }
+
     pub async fn checkout_turn(
         &self,
         ctx: &ContextId,
@@ -1223,6 +1778,7 @@ impl SessionManager {
                 expire_after_reconcile: false,
                 op: Some(claim.clone()),
                 turn_aborts: Vec::new(),
+                governed: None,
                 pending_seed: None,
                 pending_injects: Vec::new(),
                 last_used: self.clock.now_instant(),
@@ -1429,6 +1985,13 @@ impl SessionManager {
         }
         let matches_current = match tab.get_mut(ctx) {
             Some(handle) if handle.generation == generation => {
+                if handle.op.as_ref() != Some(op) && has_armed_expiry_intent(handle, op) {
+                    if let Some(operation) = &handle.governed {
+                        operation.abort.cancel();
+                        handle.expire_after_reconcile = true;
+                        return None;
+                    }
+                }
                 if handle.op.as_ref() == Some(op) && handle.state == SessionState::Cancelling {
                     // The cancel flight owns the handle. Make the exact
                     // structured-failure expiry sticky and let that owner
@@ -1466,17 +2029,42 @@ impl SessionManager {
     /// and operation AND the handle is Running (a turn only legitimately idles a Running handle); a stale
     /// (reset-away, cancelled, or claim-state) completion touches NOTHING.
     pub async fn finish_turn(&self, ctx: &ContextId, gen: SessionGeneration, op: &OperationId) {
-        if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
+        let _ = self.finish_owned_turn(ctx, gen, op).await;
+    }
+
+    pub(crate) async fn finish_owned_turn(
+        &self,
+        ctx: &ContextId,
+        gen: SessionGeneration,
+        op: &OperationId,
+    ) -> Result<BackendCleanupDispositionV1, BridgeError> {
+        let mut tab = self.by_context.lock().await;
+        if let Some(h) = tab.get_mut(ctx) {
+            if h.generation == gen
+                && h.op.as_ref() == Some(op)
+                && h.governed.as_ref().is_some_and(|operation| operation.ready)
+            {
+                if h.expire_after_reconcile {
+                    let cleanup = self.take_expiry_claim_locked(&mut tab, ctx, gen, op.clone());
+                    drop(tab);
+                    return cleanup.cleanup().await.result;
+                }
+                h.governed = None;
+            }
             if h.generation == gen {
                 h.turn_aborts.retain(|abort| abort.op != *op);
             }
-            if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
+            if h.governed.is_none()
+                && h.generation == gen
+                && h.op.as_ref() == Some(op)
+                && h.state == SessionState::Running
             {
                 h.state = SessionState::Idle;
                 h.op = None;
                 h.last_used = self.clock.now_instant();
             }
         }
+        Ok(BackendCleanupDispositionV1::Complete)
     }
 
     pub async fn status(&self, ctx: &ContextId) -> Option<SessionStatusInfo> {
@@ -1584,6 +2172,11 @@ impl SessionManager {
         if let Some(handle) = tab.get_mut(ctx) {
             // A reconcile owns the handle: defer teardown to its resolve (don't remove it out from
             // under the in-flight release / let the backend_session id be reused mid-release).
+            if let Some(abort) = &handle.governed {
+                abort.abort.cancel();
+                handle.expire_after_reconcile = true;
+                return None;
+            }
             if is_claimed(handle.state) {
                 handle.expire_after_reconcile = true;
                 return None;
@@ -1717,6 +2310,10 @@ impl SessionManager {
                     || h.op.as_ref() != Some(op)
                     || h.state != SessionState::Running
             }) {
+                return (Ok(()), false);
+            }
+            if let Some(abort) = &h.governed {
+                abort.abort.cancel();
                 return (Ok(()), false);
             }
             // A reconcile owns the handle: flag it to expire on resolve rather than resetting to Idle
@@ -2001,6 +2598,19 @@ impl SessionManager {
             let Some(h) = tab.get_mut(ctx) else {
                 return (Ok(ResetOutcome::NotFound), Vec::new());
             };
+            if let Some(abort) = &h.governed {
+                if !opts.force {
+                    return (Err(BridgeError::HandleBusy), Vec::new());
+                }
+                abort.abort.cancel();
+                h.expire_after_reconcile = true;
+                return (
+                    Ok(ResetOutcome::Cleared {
+                        generation: h.generation.get(),
+                    }),
+                    Vec::new(),
+                );
+            }
             match h.state {
                 SessionState::Idle => {}
                 SessionState::Running if opts.force => {}
@@ -2404,6 +3014,8 @@ mod tests {
         PermissionResolution,
     };
     use bridge_core::ports::{BackendStream, Resolved, Update};
+    use bridge_core::{accounting::*, governance::*, harvest::*, ids::*, task_store::*};
+    use futures::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{oneshot, Notify};
@@ -2434,6 +3046,8 @@ mod tests {
 
     /// Backend that replies with a fixed text then Done, and records warm-session lifecycle calls.
     struct FakeBackend {
+        prompts: AtomicUsize,
+        prompt_gate: StdMutex<Option<oneshot::Receiver<()>>>,
         reply: String,
         releases: StdMutex<Vec<String>>,
         release_result: StdMutex<Result<(), BridgeError>>,
@@ -2465,6 +3079,8 @@ mod tests {
     impl FakeBackend {
         fn new(reply: impl Into<String>) -> Self {
             Self {
+                prompts: AtomicUsize::new(0),
+                prompt_gate: StdMutex::new(None),
                 reply: reply.into(),
                 releases: StdMutex::new(Vec::new()),
                 release_result: StdMutex::new(Ok(())),
@@ -2615,6 +3231,11 @@ mod tests {
             _s: &SessionId,
             _p: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            let gate = self.prompt_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             let updates = vec![
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
@@ -2945,6 +3566,1321 @@ mod tests {
             .expect("pending permission should resolve promptly")
             .expect("permission sender should still be live");
         assert!(matches!(resolved, PermissionResolution::Cancelled));
+    }
+
+    struct ProbeStore {
+        inner: bridge_store::sqlite::SqliteStore,
+        admissions: AtomicUsize,
+        committed: AtomicUsize,
+        admission_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        refusal: StdMutex<Option<BudgetRefusalReasonV1>>,
+        fail_updates: AtomicBool,
+        admitted: Notify,
+    }
+    impl ProbeStore {
+        fn new() -> Self {
+            Self {
+                inner: bridge_store::sqlite::SqliteStore::open_in_memory_with_clock(Arc::new(|| 0))
+                    .unwrap(),
+                admissions: AtomicUsize::new(0),
+                committed: AtomicUsize::new(0),
+                admission_gate: StdMutex::new(None),
+                refusal: StdMutex::new(None),
+                fail_updates: AtomicBool::new(false),
+                admitted: Notify::new(),
+            }
+        }
+        fn block_admission(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.admission_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+        async fn wait_for_admission(&self) {
+            while self.admissions.load(Ordering::SeqCst) == 0 {
+                self.admitted.notified().await;
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl HarvestAuditStore for ProbeStore {
+        async fn commit_bundle(
+            &self,
+            _raw: HarvestRawRecordV1,
+            _decision: HarvestSanitizationDecisionV1,
+        ) -> Result<HarvestAuditCommit, HarvestAuditStoreError> {
+            unreachable!()
+        }
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            unreachable!()
+        }
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            unreachable!()
+        }
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            unreachable!()
+        }
+    }
+    #[async_trait::async_trait]
+    impl TaskStore for ProbeStore {
+        async fn start_usage_attempt_v1(&self, row: &UsageAttemptV1) -> Result<(), BridgeError> {
+            self.inner.start_usage_attempt_v1(row).await
+        }
+        async fn ensure_usage_coverage_v1(&self) -> Result<(), BridgeError> {
+            self.inner.ensure_usage_coverage_v1().await
+        }
+        async fn usage_summary_v1(
+            &self,
+            query: &UsageQueryV1,
+        ) -> Result<UsageSummaryV1, BridgeError> {
+            self.inner.usage_summary_v1(query).await
+        }
+        async fn update_usage_attempt_v1(
+            &self,
+            id: &str,
+            dispatched: bool,
+            usage: Option<UsageSnapshot>,
+            finalized: bool,
+        ) -> Result<(), BridgeError> {
+            if self.fail_updates.load(Ordering::SeqCst) {
+                return Err(BridgeError::StoreFailure);
+            }
+            self.inner
+                .update_usage_attempt_v1(id, dispatched, usage, finalized)
+                .await
+        }
+        async fn admit_usage_attempt_v1(
+            &self,
+            policy: Option<&BudgetPolicyV1>,
+            attempt: &AttemptId,
+            context: &BudgetContextV1,
+            candidate: &BudgetCandidateV1,
+        ) -> BudgetAdmissionOutcomeV1 {
+            self.admissions.fetch_add(1, Ordering::SeqCst);
+            self.admitted.notify_one();
+            let gate = self.admission_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            if let Some(reason) = *self.refusal.lock().unwrap() {
+                return BudgetAdmissionOutcomeV1::Refused(BudgetRefusalV1::new(reason));
+            }
+            let outcome = self
+                .inner
+                .admit_usage_attempt_v1(policy, attempt, context, candidate)
+                .await;
+            if matches!(outcome, BudgetAdmissionOutcomeV1::Admitted(_)) {
+                self.committed.fetch_add(1, Ordering::SeqCst);
+            }
+            outcome
+        }
+        async fn create(&self, _rec: &TaskRecord) -> Result<(), BridgeError> {
+            unreachable!()
+        }
+        async fn set_terminal(
+            &self,
+            _id: &TaskId,
+            _status: TaskRecordStatus,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _updated_ms: i64,
+        ) -> Result<(), BridgeError> {
+            unreachable!()
+        }
+        async fn get(&self, _id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
+            unreachable!()
+        }
+        async fn list(&self, _limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+            unreachable!()
+        }
+        async fn sweep_interrupted(&self, _updated_ms: i64) -> Result<u64, BridgeError> {
+            unreachable!()
+        }
+        async fn cancel_if_working(
+            &self,
+            _id: &TaskId,
+            _updated_ms: i64,
+        ) -> Result<bool, BridgeError> {
+            unreachable!()
+        }
+        async fn put_node_checkpoint(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _output: &str,
+            _ok: bool,
+            _ts: i64,
+        ) -> Result<(), BridgeError> {
+            unreachable!()
+        }
+        async fn node_checkpoints(
+            &self,
+            _task: &TaskId,
+        ) -> Result<
+            Vec<(
+                NodeId,
+                String,
+                bool,
+                Option<bridge_core::orch::UsageSnapshot>,
+            )>,
+            BridgeError,
+        > {
+            unreachable!()
+        }
+        async fn claim_resume_attempt(
+            &self,
+            _task: &TaskId,
+            _cap: u32,
+            _now_ms: i64,
+        ) -> Result<ResumeClaim, BridgeError> {
+            unreachable!()
+        }
+        async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+            unreachable!()
+        }
+        async fn record_node_started(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _operation_id: &OperationId,
+            _ts: i64,
+        ) -> Result<i64, BridgeError> {
+            unreachable!()
+        }
+        async fn put_node_checkpoint_sequenced(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _operation_id: &OperationId,
+            _output: &str,
+            _ok: bool,
+            _ts: i64,
+            _usage: Option<&bridge_core::orch::UsageSnapshot>,
+        ) -> Result<i64, BridgeError> {
+            unreachable!()
+        }
+        async fn set_terminal_sequenced(
+            &self,
+            _task: &TaskId,
+            _operation_id: &OperationId,
+            _status: TaskRecordStatus,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _ts: i64,
+        ) -> Result<i64, BridgeError> {
+            unreachable!()
+        }
+        async fn journal_from(
+            &self,
+            _task: &TaskId,
+            _after_seq: i64,
+        ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+            unreachable!()
+        }
+        async fn progress_snapshot(
+            &self,
+            _task: &TaskId,
+        ) -> Result<TaskProgressSnapshot, BridgeError> {
+            unreachable!()
+        }
+    }
+
+    async fn governed_usage(
+        claim: &GovernedTurnClaim,
+        turns: u64,
+    ) -> (
+        Arc<ProbeStore>,
+        bridge_core::translator::PreparedAccountingTurnV1,
+    ) {
+        use bridge_core::{
+            accounting::*, governance::*, task_store::TaskStore, translator::AccountingSelectionV1,
+        };
+        let store = Arc::new(ProbeStore::new());
+        store.ensure_usage_coverage_v1().await.unwrap();
+        let mut accounting = AccountingV1::new(store.clone());
+        accounting.clock = Arc::new(|| 0);
+        accounting.budget_policy = Some(Arc::new(
+            BudgetPolicyV1::new(
+                vec![BudgetRuleV1 {
+                    id: "day".into(),
+                    selector: BudgetSelectorV1::UtcDayAgent(agent()),
+                    limits: BudgetLimitsV1 {
+                        turns: Some(turns),
+                        terminal_tokens: None,
+                    },
+                }],
+                vec![],
+            )
+            .unwrap(),
+        ));
+        let (_, config) = claim.selection();
+        let usage = AccountingSelectionV1::new(
+            bridge_core::ids::AttemptIdentity::initial().unwrap(),
+            UsageAttributionV1 {
+                agent: agent().as_str().into(),
+                effective_model: config.model.clone(),
+                effective_effort: config.effort.map(|e| format!("{e:?}").to_ascii_lowercase()),
+                effective_mode: config.mode.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .start(&accounting)
+        .await
+        .unwrap();
+        (store, usage)
+    }
+
+    #[tokio::test]
+    async fn governed_preparation_rejection_excludes_provider_poll() {
+        use bridge_core::routing::ExclusionEvidenceV1::{Excluded, Unknown};
+        for admitted in [false, true] {
+            let (_, backend, _, _, claim) = governed_fixture(false).await;
+            let (_, usage) = governed_usage(&claim, 1).await;
+            let usage = if admitted {
+                usage.admit_direct().await.unwrap()
+            } else {
+                usage
+            };
+            let original = BridgeError::ConfigMismatch {
+                field: "accounting selection",
+            };
+            let failure = usage.reject_preparation(original.clone()).await;
+            let mut expected = bridge_core::translator::AccountingFailureV1::from(original);
+            let evidence = if admitted { Excluded } else { Unknown };
+            expected.replay.prompt_acceptance = evidence;
+            expected.replay.effects = evidence;
+            claim.rollback().await.unwrap();
+            assert_eq!(failure, expected);
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_crossing_first_provider_poll() {
+        use bridge_core::accounting_backend::AccountingBackendV1;
+        for cancel_before_poll in [true, false] {
+            let (mut sm, backend, _) = manager();
+            sm.clock = Arc::new(ManualClock::new(0));
+            let sm = Arc::new(sm);
+            let ctx = ctx("poll-crossing");
+            let initial = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+            sm.finish_turn(&ctx, initial.generation, &initial.op).await;
+            let before = retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap());
+            let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+            let (_, usage) = governed_usage(&claim, 1).await;
+            let (claim, usage) = claim.admit(usage).await.unwrap();
+            let dispatch = claim.apply(usage).await.unwrap();
+            let (allow_first_poll, before_poll) = oneshot::channel();
+            let mut allow_first_poll = Some(allow_first_poll);
+            let (allow_return, after_poll) = oneshot::channel();
+            *backend.prompt_gate.lock().unwrap() = Some(after_poll);
+            let capture = AccountingBackendV1::new(backend.clone());
+            let prompt = async {
+                before_poll.await.unwrap();
+                capture
+                    .prompt_prepared_v1(
+                        &dispatch.turn.session,
+                        vec![],
+                        dispatch.usage.into_attempt(),
+                        None,
+                    )
+                    .await
+            };
+            tokio::pin!(prompt);
+            assert!(futures::poll!(&mut prompt).is_pending());
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+            if !cancel_before_poll {
+                allow_first_poll.take().unwrap().send(()).unwrap();
+                assert!(futures::poll!(&mut prompt).is_pending());
+                assert_eq!(backend.prompts.load(Ordering::SeqCst), 1);
+            }
+            sm.cancel(&ctx).await.unwrap();
+            assert_eq!(backend.cancels().len(), usize::from(!cancel_before_poll));
+            if cancel_before_poll {
+                assert!(dispatch.turn.abort.is_cancelled());
+                allow_first_poll.take().unwrap().send(()).unwrap();
+                let failure = prompt.await.err().unwrap();
+                assert_canceled(&failure);
+                assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+                *backend.prompt_gate.lock().unwrap() = None;
+            } else {
+                allow_return.send(()).unwrap();
+                let mut stream = prompt.await.unwrap();
+                while let Some(item) = stream.next().await {
+                    item.unwrap();
+                }
+            }
+            dispatch.completion.complete().await.unwrap();
+            assert_eq!(sm.status(&ctx).await.unwrap().state, "idle");
+            assert_eq!(
+                retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap()),
+                before
+            );
+            let successor = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+            sm.finish_turn(&ctx, dispatch.turn.generation, &dispatch.turn.op)
+                .await;
+            assert_eq!(sm.status(&ctx).await.unwrap().state, "running");
+            let mut stream = backend.prompt(&successor.session, vec![]).await.unwrap();
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+            }
+            sm.finish_turn(&ctx, successor.generation, &successor.op)
+                .await;
+            assert_eq!(sm.status(&ctx).await.unwrap().state, "idle");
+            assert!(backend.releases().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_snapshot_before_governed_claim() {
+        let (mut sm, backend, _) = manager();
+        let clock = Arc::new(ManualClock::new(0));
+        sm.clock = clock.clone();
+        sm.idle_ttl = Duration::from_secs(5);
+        let sm = Arc::new(sm);
+        let ctx = ctx("reaper-claim");
+        let turn = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+        sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+        clock.advance(Duration::from_secs(6));
+        // The reaper snapshots by_context, then blocks on children before acting.
+        let children = sm.children.lock().await;
+        let reaper = sm.reap_idle();
+        tokio::pin!(reaper);
+        assert!(futures::poll!(&mut reaper).is_pending());
+        let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+        drop(children);
+        reaper.await;
+        if !backend.releases().is_empty() {
+            claim.rollback().await.unwrap();
+            panic!("reaper released the claimed context");
+        }
+        assert!(
+            !sm.by_context
+                .lock()
+                .await
+                .get(&ctx)
+                .unwrap()
+                .expire_after_reconcile
+        );
+        let (_, usage) = governed_usage(&claim, 1).await;
+        let (claim, usage) = claim.admit(usage).await.unwrap();
+        let dispatch = claim.apply(usage).await.unwrap();
+        let capture = bridge_core::accounting_backend::AccountingBackendV1::new(backend.clone());
+        let mut stream = capture
+            .prompt_prepared_v1(
+                &dispatch.turn.session,
+                vec![],
+                dispatch.usage.into_attempt(),
+                None,
+            )
+            .await
+            .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        dispatch.completion.complete().await.unwrap();
+        clock.advance(Duration::from_secs(6));
+        sm.reap_idle().await;
+        assert!(sm.status(&ctx).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn claim_is_reversible() {
+        let (sm, backend, _) = manager();
+        let sm = Arc::new(sm);
+        let ctx = ctx("governed-rollback");
+        let turn = sm
+            .checkout_turn(&ctx, agent(), Some(model_override("A")), None)
+            .await
+            .unwrap();
+        sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+        let (before, last_used, generation) = {
+            let mut tab = sm.by_context.lock().await;
+            let h = tab.get_mut(&ctx).unwrap();
+            h.pending_seed = Some("seed".into());
+            h.pending_injects.push(QueuedInject {
+                text: "inject".into(),
+                mode: InjectMode::PrependNextTurn,
+                dedupe_key: None,
+            });
+            (h.fingerprint.clone(), h.last_used, h.generation)
+        };
+        let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+        assert!(matches!(
+            sm.claim_existing_turn(&ctx).await,
+            Err(BridgeError::HandleBusy)
+        ));
+        let (_, usage) = governed_usage(&claim, 0).await;
+        let failure = claim.admit(usage).await.err().unwrap();
+        assert!(
+            matches!(failure.original, BridgeError::BudgetRefused { refusal } if refusal.reason == bridge_core::governance::BudgetRefusalReasonV1::LimitExceeded)
+        );
+        let tab = sm.by_context.lock().await;
+        let h = tab.get(&ctx).unwrap();
+        assert_eq!(
+            (&h.fingerprint, h.last_used, h.generation, h.state, &h.op),
+            (&before, last_used, generation, SessionState::Idle, &None)
+        );
+        assert_eq!(h.pending_seed.as_deref(), Some("seed"));
+        assert_eq!(h.pending_injects[0].text, "inject");
+        assert!(h.turn_aborts.is_empty());
+        assert_eq!(backend.configured().len(), 1);
+        assert!(
+            backend.reconciled().is_empty()
+                && backend.cancels().is_empty()
+                && backend.releases().is_empty()
+        );
+        assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn admitted_selection_is_exact_and_direct_permit_is_single_use() {
+        use bridge_core::{
+            accounting::UsageQueryV1, accounting_backend::AccountingBackendV1,
+            task_store::TaskStore,
+        };
+        let (sm, backend, _) = manager();
+        let sm = Arc::new(sm);
+        let ctx = ctx("governed-selection");
+        let turn = sm
+            .checkout_turn(&ctx, agent(), Some(model_override("A")), None)
+            .await
+            .unwrap();
+        sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+        let claim = sm
+            .claim_turn_observed(
+                &ctx,
+                agent(),
+                Some(AgentOverride {
+                    model: Some("B".into()),
+                    effort: Some(Effort::High),
+                    mode: None,
+                }),
+                None,
+                Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+        let (store, usage) = governed_usage(&claim, 1).await;
+        let (claim, usage) = claim.admit(usage).await.unwrap();
+        let dispatch = claim.apply(usage).await.unwrap();
+        assert_eq!(dispatch.turn.session, turn.session);
+        assert_eq!(dispatch.turn.model.as_deref(), Some("B"));
+        assert_eq!(dispatch.turn.effort.as_deref(), Some("high"));
+        assert_eq!(backend.reconciled()[0].1.config.model.as_deref(), Some("B"));
+        let capture = AccountingBackendV1::new(backend.clone());
+        let mut stream = capture
+            .prompt_prepared_v1(&turn.session, vec![], dispatch.usage.into_attempt(), None)
+            .await
+            .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        dispatch.completion.complete().await.unwrap();
+        let summary = store
+            .usage_summary_v1(&UsageQueryV1::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (summary.buckets[0].attempted, summary.buckets[0].pending),
+            (1, 0)
+        );
+        assert_eq!(backend.prompts.load(Ordering::SeqCst), 1);
+        // A second authority call at the prompt would refuse DuplicateAttempt.
+        let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+        assert_eq!(claim.selection().1.model.as_deref(), Some("B"));
+        claim.rollback().await.unwrap();
+        assert!(matches!(
+            sm.claim_turn_observed(
+                &ctx,
+                agent(),
+                Some(mode_override("other")),
+                None,
+                Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default())
+            )
+            .await,
+            Err(BridgeError::ConfigReseedRequired { field: "mode" })
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_lifecycle_and_selection_divergence_never_readmits() {
+        for action in 0..5 {
+            let (sm, backend, registry) = manager();
+            let sm = Arc::new(sm);
+            let ctx = ctx("governed-lifecycle");
+            let turn = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+            sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+            let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+            assert!(matches!(
+                sm.reset_session(&ctx, ResetOpts { force: false }).await,
+                Err(BridgeError::HandleBusy)
+            ));
+            let (_, usage) = governed_usage(&claim, 1).await;
+            let (claim, usage) = claim.admit(usage).await.unwrap();
+            match action {
+                0 => sm.cancel(&ctx).await.unwrap(),
+                1 => sm.release(&ctx).await,
+                2 => {
+                    sm.reset_session(&ctx, ResetOpts { force: true })
+                        .await
+                        .unwrap();
+                }
+                3 => registry.retire(),
+                _ => {
+                    sm.reap_idle().await;
+                    assert!(sm.status(&ctx).await.is_some());
+                }
+            }
+            if action == 4 {
+                drop(claim);
+                usage.reject_preparation(BridgeError::SessionExpired).await;
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                assert!(claim.apply(usage).await.is_err());
+            }
+            assert!(backend.cancels().is_empty());
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                backend.releases().len(),
+                usize::from(action == 1 || action == 2)
+            );
+            assert_eq!(sm.status(&ctx).await.is_none(), action == 1 || action == 2);
+        }
+    }
+
+    async fn governed_fixture(
+        fresh: bool,
+    ) -> (
+        Arc<SessionManager>,
+        Arc<FakeBackend>,
+        Arc<FakeRegistry>,
+        ContextId,
+        GovernedTurnClaim,
+    ) {
+        let (sm, backend, registry) = manager();
+        let sm = Arc::new(sm);
+        let ctx = ctx("claim-fixture");
+        if !fresh {
+            let turn = sm
+                .checkout_turn(
+                    &ctx,
+                    agent(),
+                    Some(AgentOverride {
+                        model: Some("A".into()),
+                        effort: Some(Effort::Low),
+                        mode: Some("X".into()),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+            let mut tab = sm.by_context.lock().await;
+            let h = tab.get_mut(&ctx).unwrap();
+            h.pending_seed = Some("retained seed".into());
+            h.pending_injects.push(QueuedInject {
+                text: "retained inject".into(),
+                mode: InjectMode::AppendNextTurn,
+                dedupe_key: Some("key".into()),
+            });
+            h.last_used -= Duration::from_secs(60);
+        }
+        let claim = sm
+            .claim_turn_observed(
+                &ctx,
+                agent(),
+                Some(AgentOverride {
+                    model: Some("B".into()),
+                    effort: Some(Effort::High),
+                    mode: None,
+                }),
+                None,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+        (sm, backend, registry, ctx, claim)
+    }
+
+    fn retained_snapshot(h: &WarmHandle) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:p} {:p} {:?}",
+            h.id,
+            h.backend_session,
+            h.generation,
+            h.fingerprint,
+            h.caps,
+            h.usage,
+            h.pending_seed,
+            h.pending_injects,
+            h.last_used,
+            h.expire_after_reconcile,
+            Arc::as_ptr(&h.backend),
+            &*h.lease,
+            h.turn_aborts
+                .iter()
+                .map(|t| (
+                    &t.op,
+                    t.token.is_cancelled(),
+                    t.expiry_intent.0.load(Ordering::SeqCst)
+                ))
+                .collect::<Vec<_>>()
+        )
+    }
+    fn assert_canceled(failure: &bridge_core::translator::AccountingFailureV1) {
+        assert_eq!(
+            failure.preparation_exit,
+            bridge_core::translator::AccountingPreparationExitV1::Canceled
+        );
+        assert_eq!(
+            failure.replay.prompt_acceptance,
+            bridge_core::routing::ExclusionEvidenceV1::Excluded
+        );
+    }
+    async fn wait_settled(sm: &SessionManager, ctx: &ContextId) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sm
+                    .status(ctx)
+                    .await
+                    .is_none_or(|status| status.state == "idle")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refusal_reason_matrix() {
+        use BudgetRefusalReasonV1::*;
+        for fresh in [false, true] {
+            for reason in [
+                LimitExceeded,
+                UnknownMeasurement,
+                IncompleteCoverage,
+                MissingAllowance,
+                IdentityMismatch,
+                PolicyMismatch,
+                DuplicateAttempt,
+                Overflow,
+                AccountingUnavailable,
+                UnsupportedRoute,
+            ] {
+                for fail_persistence in [false, true] {
+                    let (sm, backend, _, ctx, claim) = governed_fixture(fresh).await;
+                    let before = retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap());
+                    let (store, usage) = governed_usage(&claim, 1).await;
+                    *store.refusal.lock().unwrap() = Some(reason);
+                    store.fail_updates.store(fail_persistence, Ordering::SeqCst);
+                    let failure = claim.admit(usage).await.err().unwrap();
+                    assert!(
+                        matches!(&failure.original, BridgeError::BudgetRefused { refusal } if refusal.reason == reason)
+                    );
+                    assert_eq!(
+                        failure.persistence,
+                        fail_persistence.then_some(BridgeError::StoreFailure)
+                    );
+                    let tab = sm.by_context.lock().await;
+                    if fresh {
+                        assert!(tab.get(&ctx).is_none());
+                    } else {
+                        let h = tab.get(&ctx).unwrap();
+                        assert_eq!(retained_snapshot(h), before);
+                        assert_eq!(
+                            (h.state, h.op.as_ref(), h.governed.is_some()),
+                            (SessionState::Idle, None, false)
+                        );
+                    }
+                    assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+                    assert_eq!(store.committed.load(Ordering::SeqCst), 0);
+                    assert_eq!(backend.configured().len(), usize::from(!fresh));
+                    assert!(
+                        backend.reconciled().is_empty()
+                            && backend.cancels().is_empty()
+                            && backend.releases().is_empty()
+                    );
+                    assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
+
+    async fn claim_action(sm: &SessionManager, ctx: &ContextId, action: u8) {
+        match action {
+            0 => sm.cancel(ctx).await.unwrap(),
+            1 => sm.release(ctx).await,
+            2 => {
+                sm.reset_session(ctx, ResetOpts { force: true })
+                    .await
+                    .unwrap();
+            }
+            3 => assert!(matches!(
+                sm.reset_session(ctx, ResetOpts { force: false }).await,
+                Err(BridgeError::HandleBusy)
+            )),
+            _ => sm.reap_idle().await,
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_lifecycle_matrix_admission_gates() {
+        for fresh in [false, true] {
+            for phase in 0..3 {
+                for action in 0..5 {
+                    let (sm, backend, _, ctx, claim) = governed_fixture(fresh).await;
+                    let before = retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap());
+                    let (store, usage) = governed_usage(&claim, 1).await;
+                    let result = match phase {
+                        0 => {
+                            claim_action(&sm, &ctx, action).await;
+                            claim.admit(usage).await
+                        }
+                        1 => {
+                            let gate = store.block_admission();
+                            let worker = tokio::spawn(claim.admit(usage));
+                            store.wait_for_admission().await;
+                            claim_action(&sm, &ctx, action).await;
+                            assert!(backend.releases().is_empty());
+                            assert!(matches!(
+                                sm.checkout_existing_turn(&ctx).await,
+                                Err(BridgeError::HandleBusy)
+                            ));
+                            gate.send(()).unwrap();
+                            worker.await.unwrap()
+                        }
+                        _ => {
+                            let (claim, usage) = claim.admit(usage).await.unwrap();
+                            claim_action(&sm, &ctx, action).await;
+                            if action < 3 {
+                                let failure = claim.apply(usage).await.err().unwrap();
+                                assert_canceled(&failure);
+                                assert_eq!(failure.cleanup, BackendCleanupDispositionV1::Complete);
+                                assert_eq!(store.committed.load(Ordering::SeqCst), 1);
+                                assert_eq!(
+                                    backend.releases().len(),
+                                    usize::from(!fresh && action != 0)
+                                );
+                                assert!(backend.cancels().is_empty());
+                                assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+                                continue;
+                            }
+                            Ok((claim, usage))
+                        }
+                    };
+                    if action < 3 {
+                        assert_canceled(&result.err().unwrap());
+                    } else {
+                        let (claim, usage) = result.unwrap();
+                        claim.rollback().await.unwrap();
+                        usage.reject_preparation(BridgeError::SessionExpired).await;
+                    }
+                    assert_eq!(
+                        store.admissions.load(Ordering::SeqCst),
+                        usize::from(phase != 0 || action >= 3)
+                    );
+                    assert_eq!(
+                        store.committed.load(Ordering::SeqCst),
+                        usize::from(phase != 0 || action >= 3)
+                    );
+                    assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+                    assert!(backend.cancels().is_empty());
+                    assert_eq!(
+                        backend.releases().len(),
+                        usize::from(!fresh && (action == 1 || action == 2))
+                    );
+                    if !fresh && (action == 0 || action >= 3) {
+                        assert_eq!(
+                            retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap()),
+                            before
+                        );
+                    } else {
+                        assert!(!sm.has_live_contexts().await);
+                    }
+                    let summary = store
+                        .usage_summary_v1(&UsageQueryV1::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(summary.buckets[0].pending, 0);
+                    assert_eq!(summary.buckets[0].total_tokens.missing_count, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_lifecycle_matrix_apply_gates() {
+        for fresh in [false, true] {
+            for action in 0..7 {
+                let (sm, backend, registry, ctx, claim) = governed_fixture(fresh).await;
+                let (store, usage) = governed_usage(&claim, 1).await;
+                let (claim, usage) = claim.admit(usage).await.unwrap();
+                let gate = if fresh {
+                    backend.block_next_configure()
+                } else {
+                    backend.block_next_reconcile()
+                };
+                let worker = tokio::spawn(claim.apply(usage));
+                if fresh {
+                    backend.wait_for_configure().await;
+                } else {
+                    backend.wait_for_reconcile().await;
+                }
+                match action {
+                    5 => registry.retire(),
+                    6 => {
+                        worker.abort();
+                        let _ = worker.await;
+                        gate.send(()).unwrap();
+                        wait_settled(&sm, &ctx).await;
+                        assert!(sm.status(&ctx).await.is_none());
+                        assert_eq!(backend.releases().len(), 1);
+                        assert_eq!(store.committed.load(Ordering::SeqCst), 1);
+                        assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+                        continue;
+                    }
+                    _ => claim_action(&sm, &ctx, action).await,
+                }
+                assert!(backend.releases().is_empty() && backend.cancels().is_empty());
+                gate.send(()).unwrap();
+                let result = worker.await.unwrap();
+                if action == 3 || action == 4 {
+                    let dispatch = result.unwrap();
+                    dispatch
+                        .usage
+                        .reject_preparation(BridgeError::SessionExpired)
+                        .await;
+                    dispatch.completion.complete().await.unwrap();
+                    assert!(sm.status(&ctx).await.is_some());
+                } else {
+                    let failure = result.err().unwrap();
+                    if action < 3 {
+                        assert_canceled(&failure);
+                    } else {
+                        assert!(matches!(
+                            failure.original,
+                            BridgeError::ConfigMismatch { .. }
+                        ));
+                    }
+                    assert_eq!(failure.cleanup, BackendCleanupDispositionV1::Complete);
+                    assert!(sm.status(&ctx).await.is_none());
+                    assert_eq!(backend.releases().len(), 1);
+                }
+                assert_eq!(
+                    (
+                        store.admissions.load(Ordering::SeqCst),
+                        store.committed.load(Ordering::SeqCst)
+                    ),
+                    (1, 1)
+                );
+                assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_admission_retains_pending_liability() {
+        for fresh in [false, true] {
+            let (sm, backend, _, ctx, claim) = governed_fixture(fresh).await;
+            let (store, usage) = governed_usage(&claim, 1).await;
+            let gate = store.block_admission();
+            let worker = tokio::spawn(claim.admit(usage));
+            store.wait_for_admission().await;
+            worker.abort();
+            let _ = worker.await;
+            assert!(matches!(
+                sm.claim_existing_turn(&ctx).await,
+                Err(BridgeError::HandleBusy)
+            ));
+            gate.send(()).unwrap();
+            wait_settled(&sm, &ctx).await;
+            assert_eq!(
+                (
+                    store.admissions.load(Ordering::SeqCst),
+                    store.committed.load(Ordering::SeqCst)
+                ),
+                (1, 1)
+            );
+            let summary = store
+                .usage_summary_v1(&UsageQueryV1::default())
+                .await
+                .unwrap();
+            assert_eq!(summary.buckets[0].pending, 1);
+            assert_eq!(sm.status(&ctx).await.is_none(), fresh);
+            assert!(backend.releases().is_empty() && backend.cancels().is_empty());
+        }
+    }
+
+    struct ClaimPolicy;
+    impl bridge_core::ports::PolicyEngine for ClaimPolicy {
+        fn decide(
+            &self,
+            _: &bridge_core::domain::PermissionRequest,
+            _: &bridge_core::domain::SessionContext,
+        ) -> Result<bridge_core::domain::PermissionDecision, BridgeError> {
+            unreachable!()
+        }
+    }
+    fn claim_observation(turn: &WarmTurn, ctx: &ContextId) -> bridge_core::ports::TurnContext {
+        bridge_core::ports::TurnContext {
+            turn_id: TurnId::parse("claim-test").unwrap(),
+            session_id: ctx.clone(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: turn.agent.as_str().into(),
+            model: turn.model.clone(),
+            effort: turn.effort.clone(),
+            mode: turn.mode.clone(),
+            prompt_id: None,
+            traceparent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_cancel_before_first_poll_has_no_backend_effect() {
+        for action in 0..4 {
+            let (sm, backend, registry, ctx, claim) = governed_fixture(false).await;
+            let (store, usage) = governed_usage(&claim, 1).await;
+            let (claim, usage) = claim.admit(usage).await.unwrap();
+            let mut dispatch = claim.apply(usage).await.unwrap();
+            if action == 2 {
+                registry.retire();
+            } else if action < 2 {
+                claim_action(&sm, &ctx, action).await;
+            }
+            let prompt_backend = if action == 3 {
+                Arc::new(FakeBackend::new("wrong backend"))
+            } else {
+                backend.clone()
+            };
+            let translator = bridge_core::translator::Translator::for_turn(
+                prompt_backend.clone(),
+                Some(dispatch.usage),
+            );
+            let task = TaskId::parse("claim-task").unwrap();
+            let mut stream = translator.run_observed(
+                backend.as_ref(),
+                &store.inner,
+                &ClaimPolicy,
+                &task,
+                &dispatch.turn.session,
+                vec![],
+                Arc::new(NoopDiagnosticObserver::default()),
+                claim_observation(&dispatch.turn, &ctx),
+                Arc::new(NoopHarvestAuditStore),
+            );
+            let failure = stream.next().await.unwrap().unwrap_err();
+            if action < 2 {
+                assert_canceled(&failure);
+            }
+            dispatch
+                .completion
+                .observe_exit(WarmCompletionExit::Error(&failure.original));
+            let cleanup = dispatch.completion.complete().await;
+            let failure = failure.with_checked_cleanup(cleanup);
+            assert_eq!(failure.cleanup, BackendCleanupDispositionV1::Complete);
+            assert!(backend.cancels().is_empty());
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+            assert_eq!(prompt_backend.prompts.load(Ordering::SeqCst), 0);
+            assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+            let summary = store
+                .usage_summary_v1(&UsageQueryV1::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    summary.buckets[0].pending,
+                    summary.buckets[0].total_tokens.missing_count
+                ),
+                (0, 1)
+            );
+            if action == 0 {
+                let successor = sm.claim_existing_turn(&ctx).await.unwrap();
+                successor.rollback().await.unwrap();
+                assert!(backend.releases().is_empty());
+            } else {
+                assert!(sm.status(&ctx).await.is_none());
+                assert_eq!(backend.releases().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_permit_is_single_use_and_workflow_admission_control() {
+        for direct in [false, true] {
+            let (sm, backend, _, ctx, claim) = governed_fixture(true).await;
+            let (store, usage) = governed_usage(&claim, 1).await;
+            let dispatch = if direct {
+                let (claim, usage) = claim.admit(usage).await.unwrap();
+                assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+                claim.apply(usage).await.unwrap()
+            } else {
+                // Ordinary workflow envelopes reach the prompt boundary unadmitted.
+                assert_eq!(store.admissions.load(Ordering::SeqCst), 0);
+                claim.rollback().await.unwrap();
+                let turn = sm
+                    .checkout_turn(
+                        &ctx,
+                        agent(),
+                        Some(AgentOverride {
+                            model: Some("B".into()),
+                            effort: Some(Effort::High),
+                            mode: None,
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let completion = WarmCompletionGuard::finish_owner(
+                    sm.clone(),
+                    ctx.clone(),
+                    turn.generation,
+                    turn.op.clone(),
+                    turn.expiry_intent.clone(),
+                    Arc::new(NoopDiagnosticObserver::default()),
+                );
+                crate::dispatch::GovernedDispatch {
+                    turn,
+                    usage,
+                    completion,
+                }
+            };
+            let translator = bridge_core::translator::Translator::for_turn(
+                backend.clone(),
+                Some(dispatch.usage),
+            );
+            let task = TaskId::parse("single-use").unwrap();
+            for invocation in 0..2 {
+                let mut stream = translator.run_observed(
+                    backend.as_ref(),
+                    &store.inner,
+                    &ClaimPolicy,
+                    &task,
+                    &dispatch.turn.session,
+                    vec![],
+                    Arc::new(NoopDiagnosticObserver::default()),
+                    claim_observation(&dispatch.turn, &ctx),
+                    Arc::new(NoopHarvestAuditStore),
+                );
+                if invocation == 0 {
+                    while let Some(item) = stream.next().await {
+                        item.unwrap();
+                    }
+                } else {
+                    assert_eq!(
+                        stream.next().await.unwrap().unwrap_err().original,
+                        BridgeError::StoreFailure
+                    );
+                }
+            }
+            dispatch.completion.complete().await.unwrap();
+            assert_eq!(
+                (
+                    store.admissions.load(Ordering::SeqCst),
+                    store.committed.load(Ordering::SeqCst),
+                    backend.prompts.load(Ordering::SeqCst)
+                ),
+                (1, 1, 1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn predecessor_expiry_is_transferred_after_claim_refusal() {
+        let (sm, backend, _) = manager();
+        let sm = Arc::new(sm);
+        let ctx = ctx("predecessor");
+        let turn = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+        let mut completion = WarmCompletionGuard::finish_owner(
+            sm.clone(),
+            ctx.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            Arc::new(NoopDiagnosticObserver::default()),
+        );
+        sm.cancel(&ctx).await.unwrap();
+        let claim = sm.claim_existing_turn(&ctx).await.unwrap();
+        let (store, usage) = governed_usage(&claim, 1).await;
+        *store.refusal.lock().unwrap() = Some(BudgetRefusalReasonV1::LimitExceeded);
+        let gate = store.block_admission();
+        let worker = tokio::spawn(claim.admit(usage));
+        store.wait_for_admission().await;
+        completion.observe_exit(WarmCompletionExit::Error(&structured_failure(
+            DiagnosticFailureClass::Protocol,
+        )));
+        completion.complete().await.unwrap();
+        gate.send(()).unwrap();
+        let failure = worker.await.unwrap().err().unwrap();
+        assert!(
+            matches!(&failure.original, BridgeError::BudgetRefused { refusal } if refusal.reason == BudgetRefusalReasonV1::LimitExceeded)
+        );
+        assert_eq!(store.committed.load(Ordering::SeqCst), 0);
+        assert!(sm.status(&ctx).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
+        let next = sm.checkout_turn(&ctx, agent(), None, None).await.unwrap();
+        sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+        assert_eq!(sm.status(&ctx).await.unwrap().state, "running");
+        sm.finish_turn(&ctx, next.generation, &next.op).await;
+    }
+
+    #[tokio::test]
+    async fn mode_change_refused_at_claim() {
+        let (sm, backend, _, ctx, claim) = governed_fixture(false).await;
+        claim.rollback().await.unwrap();
+        let before = retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap());
+        let claim = sm
+            .claim_turn_observed(
+                &ctx,
+                agent(),
+                Some(mode_override("Y")),
+                None,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await;
+        assert!(matches!(
+            claim,
+            Err(BridgeError::ConfigReseedRequired { field: "mode" })
+        ));
+        assert_eq!(
+            retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap()),
+            before
+        );
+        assert_eq!(backend.configured().len(), 1);
+        assert!(
+            backend.reconciled().is_empty()
+                && backend.releases().is_empty()
+                && backend.cancels().is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_divergence_never_readmits() {
+        for replace_backend in [false, true] {
+            let (sm, backend, _, ctx, claim) = governed_fixture(false).await;
+            let (store, usage) = governed_usage(&claim, 1).await;
+            let (claim, usage) = claim.admit(usage).await.unwrap();
+            {
+                let mut tab = sm.by_context.lock().await;
+                let h = tab.get_mut(&ctx).unwrap();
+                if replace_backend {
+                    h.backend = Arc::new(FakeBackend::new("replacement"));
+                } else {
+                    h.fingerprint.config.model = Some("diverged".into());
+                }
+            }
+            let before = retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap());
+            let failure = claim.apply(usage).await.err().unwrap();
+            assert!(matches!(
+                failure.original,
+                BridgeError::ConfigMismatch { .. }
+            ));
+            assert_eq!(
+                retained_snapshot(sm.by_context.lock().await.get(&ctx).unwrap()),
+                before
+            );
+            assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+            assert_eq!(store.committed.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+            assert!(backend.reconciled().is_empty() && backend.releases().is_empty());
+            let summary = store
+                .usage_summary_v1(&UsageQueryV1::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    summary.buckets[0].pending,
+                    summary.buckets[0].total_tokens.missing_count
+                ),
+                (0, 1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_or_failed_apply_expires_with_checked_disposition() {
+        for disposition in [
+            BackendCleanupDispositionV1::Complete,
+            BackendCleanupDispositionV1::Retained,
+            BackendCleanupDispositionV1::Preserved,
+            BackendCleanupDispositionV1::Unknown,
+        ] {
+            let (sm, backend, _, ctx, claim) = governed_fixture(false).await;
+            let (store, usage) = governed_usage(&claim, 1).await;
+            let (claim, usage) = claim.admit(usage).await.unwrap();
+            backend.set_reconcile_result(Ok(ReconcileOutcome::Rejected));
+            backend.set_release_disposition(disposition);
+            let failure = claim.apply(usage).await.err().unwrap();
+            assert_eq!(failure.cleanup, disposition);
+            assert!(sm.status(&ctx).await.is_none());
+            assert_eq!(backend.releases().len(), 1);
+            assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.prompts.load(Ordering::SeqCst), 0);
+        }
+        let (sm, backend, _, ctx, claim) = governed_fixture(true).await;
+        let (store, usage) = governed_usage(&claim, 1).await;
+        let (claim, usage) = claim.admit(usage).await.unwrap();
+        backend.set_configure_result(Err(BridgeError::AgentTimedOut));
+        let failure = claim.apply(usage).await.err().unwrap();
+        assert_eq!(failure.original, BridgeError::AgentTimedOut);
+        assert_eq!(backend.releases().len(), 1);
+        assert!(sm.status(&ctx).await.is_none());
+        assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn governed_prompt_failure_preserves_persistence_and_cleanup() {
+        let (sm, backend, _, ctx, claim) = governed_fixture(false).await;
+        let (store, usage) = governed_usage(&claim, 1).await;
+        let (claim, usage) = claim.admit(usage).await.unwrap();
+        let dispatch = claim.apply(usage).await.unwrap();
+        sm.release(&ctx).await;
+        store.fail_updates.store(true, Ordering::SeqCst);
+        backend.set_release_disposition(BackendCleanupDispositionV1::Retained);
+        let translator =
+            bridge_core::translator::Translator::for_turn(backend.clone(), Some(dispatch.usage));
+        let task = TaskId::parse("persistence").unwrap();
+        let mut stream = translator.run_observed(
+            backend.as_ref(),
+            &store.inner,
+            &ClaimPolicy,
+            &task,
+            &dispatch.turn.session,
+            vec![],
+            Arc::new(NoopDiagnosticObserver::default()),
+            claim_observation(&dispatch.turn, &ctx),
+            Arc::new(NoopHarvestAuditStore),
+        );
+        let failure = stream.next().await.unwrap().unwrap_err();
+        assert_canceled(&failure);
+        assert_eq!(failure.persistence, Some(BridgeError::StoreFailure));
+        let failure = failure.with_checked_cleanup(dispatch.completion.complete().await);
+        assert_eq!(failure.cleanup, BackendCleanupDispositionV1::Retained);
+        assert_eq!(store.admissions.load(Ordering::SeqCst), 1);
+        assert!(backend.cancels().is_empty());
     }
 
     fn model_override(model: &str) -> AgentOverride {
