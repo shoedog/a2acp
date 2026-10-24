@@ -11,7 +11,9 @@ use std::time::Duration;
 #[derive(Default)]
 pub struct Recording {
     pub prompts: Mutex<Vec<SessionId>>,
+    pub parts: Mutex<Vec<Vec<Part>>>,
     pub fail_config: AtomicBool,
+    pub fail_prompt: AtomicBool,
     pub config_error: Mutex<Option<BridgeError>>,
     pub releases: Mutex<Vec<SessionId>>,
     pub stall: AtomicBool,
@@ -48,6 +50,10 @@ impl AgentBackend for Recording {
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
         self.prompts.lock().unwrap().push(session.clone());
+        self.parts.lock().unwrap().push(parts.clone());
+        if self.fail_prompt.load(Ordering::SeqCst) {
+            return Err(BridgeError::AgentTimedOut);
+        }
         let mut reported = usage();
         if parts.iter().any(|p| p.text.contains("double")) {
             reported.terminal.as_mut().unwrap().total_tokens = 30;
@@ -127,30 +133,67 @@ impl Fixture {
         Self::with_registry(backend, registry)
     }
     pub fn with_registry(backend: Arc<Recording>, registry: Arc<dyn AgentRegistry>) -> Self {
+        Self::with_policy(backend, registry, None)
+    }
+    pub fn with_policy(
+        backend: Arc<Recording>,
+        registry: Arc<dyn AgentRegistry>,
+        policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
+    ) -> Self {
+        Self::with_policy_and_store(backend, registry, policy, None)
+    }
+    pub fn with_policy_and_store(
+        backend: Arc<Recording>,
+        registry: Arc<dyn AgentRegistry>,
+        policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
+        store: Option<Arc<SqliteStore>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(SqliteStore::open_shared_history(&dir.path().join("tasks.sqlite")).unwrap());
+        let store = store.unwrap_or_else(|| {
+            Arc::new(SqliteStore::open_shared_history(&dir.path().join("tasks.sqlite")).unwrap())
+        });
         let manager = Arc::new(bridge_coordinator::session_manager::SessionManager::new(
             registry.clone(),
             Duration::from_secs(3600),
         ));
+        let graph = Arc::new(bridge_core::graph::WorkflowGraph {
+            id: WorkflowId::parse("fixture-workflow").unwrap(),
+            nodes: vec![bridge_core::graph::WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("agent").unwrap(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: None,
+        });
         let coordinator = Arc::new(
             bridge_coordinator::Coordinator::new(
                 manager,
-                None,
-                Arc::new(Default::default()),
+                Some(Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+                    registry.clone(),
+                ))),
+                Arc::new([(graph.id.clone(), graph)].into_iter().collect()),
                 store.clone(),
                 store.clone(),
                 Arc::new(bridge_policy::permission::AutoPolicy),
                 registry,
                 Arc::new(bridge_coordinator::clock::SystemClock),
                 None,
-                None,
+                Some(bridge_coordinator::batch::BatchRuntime::new_noop(1, 1)),
                 Arc::new(bridge_observ::NoopObserver),
                 3,
             )
             .with_workflow_history(Ok(store.clone()))
-            .with_accounting(billing_accounting(store.clone())),
+            .with_accounting(AccountingV1 {
+                budget_policy: policy,
+                ..billing_accounting(store.clone())
+            }),
         );
         Self {
             dir,

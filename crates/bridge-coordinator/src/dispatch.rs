@@ -240,6 +240,10 @@ impl WarmCompletionGuard {
         let next = match exit {
             WarmCompletionExit::Normal => WarmCompletionAction::Finish,
             WarmCompletionExit::Canceled => self.canceled_action,
+            WarmCompletionExit::Error(BridgeError::BudgetRefused { .. }) => {
+                self.expiry_intent.mark_budget_refused();
+                WarmCompletionAction::Finish
+            }
             WarmCompletionExit::Error(error)
                 if warm_session_survivability(error) == WarmSessionSurvivability::Expire =>
             {

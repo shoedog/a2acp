@@ -475,10 +475,12 @@ pub async fn admit_direct_attempt_with_history(
             field: "attempt linkage",
         });
     }
-    if !matches!(
+    if !(matches!(
         surface,
         ExecutionSurface::DirectUnary | ExecutionSurface::Mcp | ExecutionSurface::Smoke
-    ) {
+    ) || surface == ExecutionSurface::Other
+        && matches!(task_class, "a2a_stream" | "compaction"))
+    {
         return Err(BridgeError::InvalidRequest {
             field: "direct execution surface",
         });
@@ -697,6 +699,23 @@ impl Coordinator {
         self
     }
 
+    pub fn has_budget_policy(&self) -> bool {
+        self.accounting
+            .as_ref()
+            .is_some_and(|a| a.budget_policy.is_some())
+    }
+
+    pub fn refuse_governed_unsupported_route(&self) -> Result<(), BridgeError> {
+        if self.has_budget_policy() {
+            return Err(BridgeError::BudgetRefused {
+                refusal: Box::new(bridge_core::governance::BudgetRefusalV1::new(
+                    bridge_core::governance::BudgetRefusalReasonV1::UnsupportedRoute,
+                )),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn prepare_usage(
         &self,
         owner: bridge_core::ids::AttemptIdentity,
@@ -736,9 +755,21 @@ impl Coordinator {
         kind: &str,
         node: Option<String>,
     ) -> Result<Option<bridge_core::translator::PreparedAccountingTurnV1>, BridgeError> {
+        if kind == "fanout_local" {
+            self.refuse_governed_unsupported_route()?;
+        }
         let Some(accounting) = &self.accounting else {
             return Ok(None);
         };
+        let mut accounting = accounting.clone();
+        if accounting.budget_policy.is_some() {
+            accounting.budget_context = Some(bridge_core::governance::BudgetContextV1 {
+                request: bridge_core::governance::BudgetRequestIdV1::Execution(
+                    owner.execution_id.clone(),
+                ),
+                workflow_run: None,
+            });
+        }
         let selection = bridge_core::translator::AccountingSelectionV1::new(
             owner,
             bridge_core::accounting::UsageAttributionV1 {
@@ -753,7 +784,7 @@ impl Coordinator {
                 ..Default::default()
             },
         )?;
-        selection.start(accounting).await.map(Some)
+        selection.start(&accounting).await.map(Some)
     }
 
     #[must_use]
@@ -928,6 +959,7 @@ impl Coordinator {
     }
 
     pub async fn run_batch(&self, p: BatchParams) -> Result<BatchId, BridgeError> {
+        self.refuse_governed_unsupported_route()?;
         let bdeps = self.batch_deps().ok_or(BridgeError::InvalidRequest {
             field: "batch (not configured)",
         })?;
@@ -1012,6 +1044,15 @@ impl Coordinator {
         let selection = self.workflow_history.clone().unwrap_or(Err(
             bridge_core::workflow_history::LedgerUnavailableReason::Open,
         ));
+        if let Some(accounting) = self
+            .accounting
+            .as_ref()
+            .filter(|a| a.budget_policy.is_some())
+        {
+            // Initialize coverage before sampling the new owner's birth time.
+            // Dispatch markers invalidate the store's lazy-bootstrap exception.
+            accounting.store.ensure_usage_coverage_v1().await?;
+        }
         admit_direct_attempt_with_history(
             selection,
             self.observer.clone(),
@@ -1680,6 +1721,7 @@ impl Coordinator {
         p: OpParams,
         supplied_identity: Option<bridge_core::ids::AttemptIdentity>,
     ) -> Result<WorkflowLocator, BridgeError> {
+        self.refuse_governed_unsupported_route()?;
         if p.agent.is_some() || p.model.is_some() || p.effort.is_some() || p.mode.is_some() {
             return Err(BridgeError::InvalidRequest {
                 field: "agent/model/effort/mode (run_workflow ignores overrides)",
@@ -2187,6 +2229,7 @@ impl Coordinator {
     /// uses `resume()` and the configured cap.
     #[doc(hidden)]
     pub async fn resume_with_cap(&self, cap: u32) -> Result<(), BridgeError> {
+        self.refuse_governed_unsupported_route()?;
         // Hidden terminal rows from a prior crash must reconcile before any
         // checkpoint scan or conservative active-summary interruption.
         if !reconcile_pending_terminal_projections(&self.detached_deps()).await {
@@ -6919,6 +6962,63 @@ mod tests {
             1
         );
         assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn governed_recovery_preserves_outstanding_task_and_batch() {
+        use bridge_core::governance::*;
+        let fixture = coordinator_fixture(Arc::new(HashMap::new()));
+        let id = task("governed-recovery");
+        fixture
+            .task_store
+            .create(&working_record(id.clone()))
+            .await
+            .unwrap();
+        let batch = bridge_core::task_store::BatchRecord {
+            id: BatchId::parse("parked-batch").unwrap(),
+            workflow: "code-review".into(),
+            concurrency: 1,
+            total: 1,
+            status: bridge_core::task_store::BatchStatus::Working,
+            items_json: "[]".into(),
+            error: None,
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        fixture.task_store.create_batch(&batch).await.unwrap();
+        let policy = BudgetPolicyV1::new(
+            vec![BudgetRuleV1 {
+                id: "request".into(),
+                selector: BudgetSelectorV1::EachRequest,
+                limits: BudgetLimitsV1 {
+                    turns: Some(1),
+                    terminal_tokens: None,
+                },
+            }],
+            vec![],
+        )
+        .unwrap();
+        let coordinator =
+            fixture
+                .coordinator
+                .with_accounting(bridge_core::accounting::AccountingV1 {
+                    budget_policy: Some(Arc::new(policy)),
+                    ..bridge_core::accounting::AccountingV1::new(fixture.task_store.clone())
+                });
+        assert!(matches!(coordinator.resume_with_cap(3).await,
+            Err(BridgeError::BudgetRefused { refusal }) if refusal.reason == BudgetRefusalReasonV1::UnsupportedRoute));
+        let retained = fixture.task_store.get(&id).await.unwrap().unwrap();
+        assert_eq!(retained.status, TaskRecordStatus::Working);
+        assert_eq!(retained.resume_attempts, 0);
+        assert_eq!(retained.updated_ms, 10);
+        let retained_batch = fixture
+            .task_store
+            .get_batch(&batch.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_batch.status, batch.status);
+        assert_eq!(retained_batch.updated_ms, batch.updated_ms);
     }
 
     /// #10 slice 4: `coordinator.resume()` is the serve boot-resume entry point that

@@ -112,7 +112,10 @@ struct TurnAbort {
 /// the Tokio table lock, so concurrent cancel settlement cannot reopen the
 /// poisoned backend session before the expiry claim arrives.
 #[derive(Clone)]
-pub struct WarmExpiryIntent(Arc<std::sync::atomic::AtomicU8>);
+pub struct WarmExpiryIntent(
+    Arc<std::sync::atomic::AtomicU8>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
 
 impl WarmExpiryIntent {
     const OPEN: u8 = 0;
@@ -120,7 +123,18 @@ impl WarmExpiryIntent {
     const SUCCESSOR_RESERVED: u8 = 2;
 
     pub(crate) fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicU8::new(Self::OPEN)))
+        Self(
+            Arc::new(std::sync::atomic::AtomicU8::new(Self::OPEN)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn mark_budget_refused(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn budget_refused(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn arm(&self) {
@@ -196,6 +210,7 @@ struct WarmHandle {
     /// appends rather than overwrites; `finish_turn` removes only its exact operation token, closing the
     /// cancel-A -> checkout-B -> release/reset orphan window.
     turn_aborts: Vec<TurnAbort>,
+    checked_out_payload: Option<(Option<String>, Vec<QueuedInject>)>,
     pending_seed: Option<String>,
     pending_injects: Vec<QueuedInject>,
     last_used: Instant,
@@ -714,6 +729,9 @@ impl SessionManager {
         expiry_intent: WarmExpiryIntent,
         abort: CancellationToken,
     ) -> WarmTurn {
+        let seed = h.pending_seed.take();
+        let injects = std::mem::take(&mut h.pending_injects);
+        h.checked_out_payload = Some((seed.clone(), injects.clone()));
         WarmTurn {
             backend: h.backend.clone(),
             session: h.backend_session.clone(),
@@ -722,8 +740,8 @@ impl SessionManager {
             op,
             expiry_intent,
             abort,
-            seed: h.pending_seed.take(),
-            injects: std::mem::take(&mut h.pending_injects),
+            seed,
+            injects,
             agent: h.agent.clone(),
             model: h.fingerprint.config.model.clone(),
             effort: h
@@ -920,13 +938,13 @@ impl SessionManager {
             expiry_intent: expiry_intent.clone(),
         });
         h.last_used = self.clock.now_instant();
-        let seed = h.pending_seed.take();
-        let injects = std::mem::take(&mut h.pending_injects);
-        Ok(WarmTurn {
-            seed,
-            injects,
-            ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
-        })
+        Ok(Self::warm_turn_from_handle(
+            h,
+            usage_warning,
+            op,
+            expiry_intent,
+            abort,
+        ))
     }
 
     async fn checkout_turn_inner(
@@ -1029,14 +1047,14 @@ impl SessionManager {
                     expiry_intent: expiry_intent.clone(),
                 });
                 h.last_used = self.clock.now_instant();
-                let seed = h.pending_seed.take();
-                let injects = std::mem::take(&mut h.pending_injects);
                 return (
-                    Ok(WarmTurn {
-                        seed,
-                        injects,
-                        ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
-                    }),
+                    Ok(Self::warm_turn_from_handle(
+                        h,
+                        usage_warning,
+                        op,
+                        expiry_intent,
+                        abort,
+                    )),
                     Vec::new(),
                 );
             }
@@ -1132,14 +1150,14 @@ impl SessionManager {
                     expiry_intent: expiry_intent.clone(),
                 });
                 h.last_used = self.clock.now_instant();
-                let seed = h.pending_seed.take();
-                let injects = std::mem::take(&mut h.pending_injects);
                 return (
-                    Ok(WarmTurn {
-                        seed,
-                        injects,
-                        ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
-                    }),
+                    Ok(Self::warm_turn_from_handle(
+                        h,
+                        usage_warning,
+                        op,
+                        expiry_intent,
+                        abort,
+                    )),
                     Vec::new(),
                 );
             }
@@ -1223,6 +1241,7 @@ impl SessionManager {
                 expire_after_reconcile: false,
                 op: Some(claim.clone()),
                 turn_aborts: Vec::new(),
+                checked_out_payload: None,
                 pending_seed: None,
                 pending_injects: Vec::new(),
                 last_used: self.clock.now_instant(),
@@ -1307,14 +1326,14 @@ impl SessionManager {
                     expiry_intent: expiry_intent.clone(),
                 });
                 h.last_used = self.clock.now_instant();
-                let seed = h.pending_seed.take();
-                let injects = std::mem::take(&mut h.pending_injects);
                 (
-                    Ok(WarmTurn {
-                        seed,
-                        injects,
-                        ..Self::warm_turn_from_handle(h, None, op, expiry_intent, abort)
-                    }),
+                    Ok(Self::warm_turn_from_handle(
+                        h,
+                        None,
+                        op,
+                        expiry_intent,
+                        abort,
+                    )),
                     Vec::new(),
                 )
             }
@@ -1467,14 +1486,25 @@ impl SessionManager {
     /// (reset-away, cancelled, or claim-state) completion touches NOTHING.
     pub async fn finish_turn(&self, ctx: &ContextId, gen: SessionGeneration, op: &OperationId) {
         if let Some(h) = self.by_context.lock().await.get_mut(ctx) {
-            if h.generation == gen {
-                h.turn_aborts.retain(|abort| abort.op != *op);
-            }
             if h.generation == gen && h.op.as_ref() == Some(op) && h.state == SessionState::Running
             {
+                if let Some((seed, mut injects)) = h.checked_out_payload.take() {
+                    if h.turn_aborts
+                        .iter()
+                        .any(|turn| turn.op == *op && turn.expiry_intent.budget_refused())
+                    {
+                        h.pending_seed = seed;
+                        // Entries queued during this turn follow the undelivered original payload.
+                        injects.append(&mut h.pending_injects);
+                        h.pending_injects = injects;
+                    }
+                }
                 h.state = SessionState::Idle;
                 h.op = None;
                 h.last_used = self.clock.now_instant();
+            }
+            if h.generation == gen {
+                h.turn_aborts.retain(|abort| abort.op != *op);
             }
         }
     }
@@ -2213,7 +2243,7 @@ impl SessionManager {
         )
         .await;
 
-        // (3) Bad summary (Err / empty / timeout) -> EXPIRE (FIX-1/2). Never restore Idle.
+        // (3) Provider failure expires the session. A proven pre-prompt budget refusal preserves it.
         let summary = match summarized {
             Ok(Ok(s)) if !s.trim().is_empty() => s,
             bad => {
@@ -2226,6 +2256,19 @@ impl SessionManager {
                         reason: "compact summarize timed out".into(),
                     },
                 };
+                if matches!(err, BridgeError::BudgetRefused { .. }) {
+                    let mut tab = self.by_context.lock().await;
+                    if let Some(h) = tab.get_mut(ctx) {
+                        if h.id == claimed_id
+                            && h.state == SessionState::Compacting
+                            && !h.expire_after_reconcile
+                        {
+                            // Admission proved no summarize prompt ran; keep the exact claimed conversation.
+                            h.state = SessionState::Idle;
+                            return Err(err);
+                        }
+                    }
+                }
                 self.expire_after_summarize(ctx, &claimed_id, backend.as_ref(), &old_id)
                     .await;
                 return Err(err);
@@ -3090,6 +3133,74 @@ mod tests {
         }
         assert!(manager.child_registered(&parent, &child).await);
         drop(turn);
+    }
+
+    #[tokio::test]
+    async fn budget_payload_restore_is_owned_by_exact_operation_and_generation() {
+        let (manager, _, _) = manager();
+        let c = ctx("budget-payload-owner");
+        let t = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, t.generation, &t.op).await;
+        manager
+            .compact_session(&c, |_, _| async { Ok("retained summary".into()) })
+            .await
+            .unwrap();
+        let denied = manager.checkout_existing_turn(&c).await.unwrap();
+        denied.expiry_intent.mark_budget_refused();
+        manager.finish_turn(&c, denied.generation, &denied.op).await;
+        let admitted = manager.checkout_existing_turn(&c).await.unwrap();
+        assert_eq!(admitted.seed.as_deref(), Some("retained summary"));
+        // A late old completion cannot restore the payload into the admitted successor.
+        manager.finish_turn(&c, denied.generation, &denied.op).await;
+        manager
+            .finish_turn(&c, admitted.generation, &admitted.op)
+            .await;
+        assert!(manager
+            .checkout_existing_turn(&c)
+            .await
+            .unwrap()
+            .seed
+            .is_none());
+        manager
+            .reset_session(&c, ResetOpts { force: true })
+            .await
+            .unwrap();
+        manager
+            .finish_turn(&c, admitted.generation, &admitted.op)
+            .await;
+        assert!(manager
+            .checkout_existing_turn(&c)
+            .await
+            .unwrap()
+            .seed
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn budget_compaction_refusal_honors_concurrent_release_intent() {
+        let (manager, backend, _) = manager();
+        let c = ctx("budget-compact-release");
+        let t = manager
+            .checkout_turn(&c, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(&c, t.generation, &t.op).await;
+        let result = manager
+            .compact_session(&c, |_, _| async {
+                manager.release(&c).await;
+                Err(BridgeError::BudgetRefused {
+                    refusal: Box::new(bridge_core::governance::BudgetRefusalV1::new(
+                        bridge_core::governance::BudgetRefusalReasonV1::LimitExceeded,
+                    )),
+                })
+            })
+            .await;
+        assert!(matches!(result, Err(BridgeError::BudgetRefused { .. })));
+        assert!(manager.status(&c).await.is_none());
+        assert_eq!(backend.releases().len(), 1);
     }
 
     #[tokio::test]
