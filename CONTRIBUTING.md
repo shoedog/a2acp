@@ -50,6 +50,8 @@ the change instead, and it may get implemented independently.
 - Gates that must stay green: `cargo fmt --check`, `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo deny check`, per-crate coverage floors (see
   `.github/workflows/ci.yml`), and `a2a-bridge validate --repo-hygiene`.
+- For local test runs, use `cargo nextest run --workspace`; run
+  `cargo test --workspace --doc` as well when checking doctests, which nextest does not run.
 - **Non-unix lane — no local gate exists yet; be careful when touching
   `crates/bridge-core`.** All the gates above are unix-only on a developer
   machine, but CI compiles `bridge-core` for Windows (via `bridge-store`).

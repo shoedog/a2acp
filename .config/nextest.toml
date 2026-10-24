@@ -1,0 +1,11 @@
+# Do not hide flaky tests by retrying them.
+[profile.default]
+retries = 0
+
+# Test-isolation audit:
+# - ENV_LOCK (bin/a2a-bridge/src/main.rs) protects process environment changes.
+# - GC_TEST_LOCK (compatibility_schedule_retention.rs) protects in-process scheduler state.
+# - PLATFORM_BOOTSTRAP_TEST_SERIAL and PLATFORM_OPEN_TEST_SERIAL (bridge-store/sqlite.rs)
+#   protect static test hooks; their filesystem fixtures are temporary directories.
+# All four locks protect process-local state, so nextest's process isolation makes cross-test
+# serialization unnecessary. No tests use fixed external paths, ports, or global configuration.
