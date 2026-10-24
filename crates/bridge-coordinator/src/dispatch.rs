@@ -272,13 +272,18 @@ impl WarmCompletionGuard {
     pub async fn transfer_cleanup_custody(mut self) -> DetachedWarmCleanup {
         match self.action {
             WarmCompletionAction::Finish => {
-                self.sm
-                    .finish_turn(&self.ctx, self.generation, &self.op)
+                let result = self
+                    .sm
+                    .finish_owned_turn(&self.ctx, self.generation, &self.op)
                     .await;
                 self.armed = false;
                 DetachedWarmCleanup {
                     task: None,
-                    immediate: Some(DetachedCleanupDisposition::Complete),
+                    immediate: Some(
+                        result
+                            .map(DetachedCleanupDisposition::from)
+                            .unwrap_or(DetachedCleanupDisposition::Failed),
+                    ),
                 }
             }
             WarmCompletionAction::Cancel => {
@@ -352,11 +357,12 @@ impl WarmCompletionGuard {
     pub async fn complete(mut self) -> Result<BackendCleanupDispositionV1, BridgeError> {
         match self.action {
             WarmCompletionAction::Finish => {
-                self.sm
-                    .finish_turn(&self.ctx, self.generation, &self.op)
+                let result = self
+                    .sm
+                    .finish_owned_turn(&self.ctx, self.generation, &self.op)
                     .await;
                 self.armed = false;
-                Ok(BackendCleanupDispositionV1::Complete)
+                result
             }
             WarmCompletionAction::Cancel => {
                 let result = self
@@ -471,4 +477,12 @@ impl Drop for WarmCompletionGuard {
             }
         }
     }
+}
+
+/// Governed apply transfers both single-use accounting and exact completion
+/// ownership together. R2 route adapters move these into LocalDispatch's seams.
+pub struct GovernedDispatch {
+    pub turn: crate::session_manager::WarmTurn,
+    pub usage: bridge_core::translator::PreparedAccountingTurnV1,
+    pub completion: WarmCompletionGuard,
 }

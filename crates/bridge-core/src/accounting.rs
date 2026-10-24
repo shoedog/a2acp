@@ -271,9 +271,30 @@ impl AccountingV1 {
                 }),
             id: row.id,
             attribution: row.attribution,
+            admitted: None,
+            prompt_gate: None,
         })
     }
 }
+/// An exact-operation gate polls the provider once while its session ownership lock
+/// is held. Cancellation before that poll cannot latch cancellation on the backend.
+pub type DirectPromptFutureV1<'a> = dyn std::future::Future<Output = Result<crate::ports::BackendStream, BridgeError>>
+    + Send
+    + Unpin
+    + 'a;
+#[async_trait::async_trait]
+pub trait DirectPromptGateV1: Send + Sync {
+    async fn first_poll(
+        &self,
+        session: &SessionId,
+        backend: &Arc<dyn crate::ports::AgentBackend>,
+        prompt: &mut DirectPromptFutureV1<'_>,
+    ) -> Result<
+        std::task::Poll<Result<crate::ports::BackendStream, BridgeError>>,
+        crate::translator::AccountingFailureV1,
+    >;
+}
+
 /// Not Clone: a completed/replayed result cannot reuse this dispatch authority.
 /// Dropping this handle or its stream deliberately leaves durable pending accounting.
 pub struct PreparedUsageAttemptV1 {
@@ -282,6 +303,8 @@ pub struct PreparedUsageAttemptV1 {
     context: BudgetContextV1,
     id: String,
     attribution: UsageAttributionV1,
+    admitted: Option<BudgetPermitV1>,
+    prompt_gate: Option<Arc<dyn DirectPromptGateV1>>,
 }
 impl PreparedUsageAttemptV1 {
     pub fn attribution(&self) -> &UsageAttributionV1 {
@@ -289,6 +312,56 @@ impl PreparedUsageAttemptV1 {
     }
     pub fn id(&self) -> &str {
         &self.id
+    }
+    /// Consume direct admission authority before applying any retained session changes.
+    /// A dropped future leaves accounting pending; its session owner must retain the claim
+    /// until this operation resolves (including cancellation).
+    pub async fn admit_direct(mut self) -> Result<Self, crate::translator::AccountingFailureV1> {
+        let outcome = if self.admitted.is_some() {
+            return Err(crate::translator::AccountingFailureV1::from(
+                BridgeError::InvalidStateTransition,
+            ));
+        } else {
+            self.admit().await
+        };
+        let original = match outcome {
+            Ok(BudgetAdmissionOutcomeV1::Admitted(permit)) => {
+                self.admitted = Some(permit);
+                return Ok(self);
+            }
+            Ok(BudgetAdmissionOutcomeV1::Refused(refusal)) => BridgeError::BudgetRefused {
+                refusal: Box::new(refusal),
+            },
+            Ok(BudgetAdmissionOutcomeV1::Ungoverned) => BridgeError::InvalidStateTransition,
+            Err(error) => return Err(error.into()), // unknown persistence outcome stays pending
+        };
+        let mut failure = crate::translator::AccountingFailureV1::from(original);
+        failure.persistence = self.preparation_failed().await.err();
+        Err(failure)
+    }
+    pub fn is_admitted(&self) -> bool {
+        self.admitted.is_some()
+    }
+    pub(crate) fn set_prompt_gate(&mut self, gate: Arc<dyn DirectPromptGateV1>) {
+        self.prompt_gate = Some(gate);
+    }
+    pub(crate) fn take_prompt_gate(&mut self) -> Option<Arc<dyn DirectPromptGateV1>> {
+        self.prompt_gate.take()
+    }
+    pub(crate) fn has_prompt_gate(&self) -> bool {
+        self.prompt_gate.is_some()
+    }
+    /// Settlement only, with no dispatch or attribution authority. This future
+    /// is used only after an exact prompt gate proves the provider was not polled.
+    pub(crate) fn preparation_settlement(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), BridgeError>> + Send + 'static {
+        let store = self.accounting.store.clone();
+        let id = self.id.clone();
+        async move { store.update_usage_attempt_v1(&id, false, None, true).await }
+    }
+    pub(crate) fn take_permit(&mut self) -> Option<BudgetPermitV1> {
+        self.admitted.take()
     }
     /// Called only by the capture boundary, immediately before the inner prompt.
     pub(crate) async fn admit(&self) -> Result<BudgetAdmissionOutcomeV1, BridgeError> {

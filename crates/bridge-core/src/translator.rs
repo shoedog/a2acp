@@ -189,6 +189,22 @@ impl PreparedAccountingTurnV1 {
     pub fn attribution(&self) -> &crate::accounting::UsageAttributionV1 {
         &self.attribution
     }
+    pub async fn admit_direct(self) -> Result<Self, AccountingFailureV1> {
+        Ok(Self {
+            attempt: self.attempt.admit_direct().await?,
+            attribution: self.attribution,
+        })
+    }
+    pub fn is_admitted(&self) -> bool {
+        self.attempt.is_admitted()
+    }
+    pub fn with_prompt_gate(
+        mut self,
+        gate: Arc<dyn crate::accounting::DirectPromptGateV1>,
+    ) -> Self {
+        self.attempt.set_prompt_gate(gate);
+        self
+    }
     pub fn into_attempt(self) -> crate::accounting::PreparedUsageAttemptV1 {
         self.attempt
     }
@@ -199,13 +215,26 @@ impl PreparedAccountingTurnV1 {
         effort: &Option<String>,
         mode: &Option<String>,
     ) -> bool {
-        self.attribution.effective_model == *model
+        (!self.is_admitted()
+            || (self.attribution == *self.attempt.attribution()
+                && self.attribution.turn.as_deref() == Some(self.attempt.id())))
+            && self.attribution.effective_model == *model
             && self.attribution.effective_effort == *effort
             && self.attribution.effective_mode == *mode
     }
     pub async fn reject_preparation(self, original: BridgeError) -> AccountingFailureV1 {
-        AccountingFailureV1::from(original).settle(Some(self)).await
+        AccountingFailureV1::before_prompt(original)
+            .settle(Some(self))
+            .await
     }
+}
+
+/// Distinct preparation outcome for governed consumers. R2 projects Canceled
+/// as canceled/interrupted history; the legacy BridgeError projection is insufficient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountingPreparationExitV1 {
+    Failed,
+    Canceled,
 }
 
 /// Routing evidence remains caller-owned and conservative. Accounting settlement
@@ -213,6 +242,7 @@ impl PreparedAccountingTurnV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountingFailureV1 {
     pub original: BridgeError,
+    pub preparation_exit: AccountingPreparationExitV1,
     pub replay: crate::routing::ReplayEvidenceV1,
     pub cleanup: crate::ports::BackendCleanupDispositionV1,
     pub persistence: Option<BridgeError>,
@@ -221,6 +251,7 @@ impl From<BridgeError> for AccountingFailureV1 {
     fn from(original: BridgeError) -> Self {
         Self {
             original,
+            preparation_exit: AccountingPreparationExitV1::Failed,
             replay: Default::default(),
             cleanup: crate::ports::BackendCleanupDispositionV1::Unknown,
             persistence: None,
@@ -228,9 +259,23 @@ impl From<BridgeError> for AccountingFailureV1 {
     }
 }
 impl AccountingFailureV1 {
+    /// Affirmative bridge-owned evidence: no provider future has been polled.
+    pub fn before_prompt(original: BridgeError) -> Self {
+        let mut failure = Self::from(original);
+        failure.replay.prompt_acceptance = crate::routing::ExclusionEvidenceV1::Excluded;
+        failure.replay.effects = crate::routing::ExclusionEvidenceV1::Excluded;
+        failure
+    }
+
+    pub fn canceled_before_prompt() -> Self {
+        let mut failure = Self::before_prompt(BridgeError::SessionExpired);
+        failure.preparation_exit = AccountingPreparationExitV1::Canceled;
+        failure
+    }
+
     // The same affirmative prompt-open determination used by workflow preflight.
     // A returned stream never enters here, even if no output has been observed.
-    fn prompt_open_failure(original: BridgeError) -> Self {
+    pub(crate) fn prompt_open_failure(original: BridgeError) -> Self {
         let excluded = match &original {
             BridgeError::AgentFailure { diagnostic } => !diagnostic.prompt_may_have_been_accepted(),
             _ => false,
@@ -262,6 +307,8 @@ impl AccountingFailureV1 {
         }
         self
     }
+    /// Error-only compatibility projection. Governed adapters inspect preparation_exit
+    /// first so a pre-prompt Canceled outcome becomes canceled/interrupted history.
     pub fn surfaced_error(&self) -> BridgeError {
         self.persistence.as_ref().unwrap_or(&self.original).clone()
     }
@@ -437,8 +484,7 @@ impl Translator {
                         Err(envelope.reject_preparation(BridgeError::ConfigMismatch { field: "accounting selection" }).await)?;
                         unreachable!();
                     }
-                    capture.backend.prompt_accounted_v1(session, parts, envelope.attempt, Some(observers)).await
-                        .map_err(AccountingFailureV1::prompt_open_failure)?
+                    capture.backend.prompt_prepared_v1(session, parts, envelope.attempt, Some(observers)).await?
                 }
                 None => backend.prompt_with_observers(session, parts, observers).await
                     .map_err(AccountingFailureV1::prompt_open_failure)?,
