@@ -11,6 +11,7 @@ use std::time::Duration;
 #[derive(Default)]
 pub struct Recording {
     pub prompts: Mutex<Vec<SessionId>>,
+    pub parts: Mutex<Vec<Vec<Part>>>,
     pub fail_config: AtomicBool,
     pub config_error: Mutex<Option<BridgeError>>,
     pub releases: Mutex<Vec<SessionId>>,
@@ -48,6 +49,7 @@ impl AgentBackend for Recording {
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
         self.prompts.lock().unwrap().push(session.clone());
+        self.parts.lock().unwrap().push(parts.clone());
         let mut reported = usage();
         if parts.iter().any(|p| p.text.contains("double")) {
             reported.terminal.as_mut().unwrap().total_tokens = 30;
@@ -127,6 +129,13 @@ impl Fixture {
         Self::with_registry(backend, registry)
     }
     pub fn with_registry(backend: Arc<Recording>, registry: Arc<dyn AgentRegistry>) -> Self {
+        Self::with_policy(backend, registry, None)
+    }
+    pub fn with_policy(
+        backend: Arc<Recording>,
+        registry: Arc<dyn AgentRegistry>,
+        policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store =
             Arc::new(SqliteStore::open_shared_history(&dir.path().join("tasks.sqlite")).unwrap());
@@ -150,7 +159,10 @@ impl Fixture {
                 3,
             )
             .with_workflow_history(Ok(store.clone()))
-            .with_accounting(billing_accounting(store.clone())),
+            .with_accounting(AccountingV1 {
+                budget_policy: policy,
+                ..billing_accounting(store.clone())
+            }),
         );
         Self {
             dir,
