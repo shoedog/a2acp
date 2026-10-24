@@ -7,3 +7,6 @@ mod direct_governance;
 mod path_closure;
 #[path = "accounting/support.rs"]
 mod support;
+
+#[path = "accounting/cold_acp_fixture.rs"]
+mod cold_acp_fixture;

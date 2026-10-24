@@ -16,6 +16,8 @@ use crate::session_manager::{ExpiryClaim, SessionManager, WarmExpiryIntent};
 /// lifetime. The lease drops when the binding is removed from the map ([`BindingGuard`]
 /// eviction on producer exit), decrementing the slot's active-task count.
 pub struct TaskBinding {
+    /// Opaque backend session identity owned by this cold binding incarnation.
+    pub session: SessionId,
     pub agent: bridge_core::ids::AgentId,
     pub backend: Arc<dyn AgentBackend>,
     /// The effective config applied to the task's session — reused by binding-driven
@@ -58,11 +60,13 @@ impl Drop for BindingGuard {
         // executes), leaving the binding and lease un-evicted. This is acceptable for
         // a single-process bridge that is exiting anyway.
         tokio::spawn(async move {
-            // Take the binding out of the map and drop its Lease explicitly → the
-            // slot's active-task count decrements. Then forget the per-session stash.
-            if let Some(binding) = bindings.lock().await.remove(&task) {
-                drop(binding.lease);
+            // Evict only this incarnation. A delayed older producer must leave a
+            // successor's binding and lease intact; its stash has a distinct key.
+            let mut bindings = bindings.lock().await;
+            if bindings.get(&task).is_some_and(|b| b.session == session) {
+                bindings.remove(&task);
             }
+            drop(bindings);
             backend.forget_session(&session).await;
         });
     }
@@ -76,7 +80,7 @@ impl Drop for BindingGuard {
 pub struct LocalDispatch {
     pub usage: Option<bridge_core::translator::PreparedAccountingTurnV1>,
     pub backend: Arc<dyn AgentBackend>,
-    /// The session to prompt against — warm `ctx-…` session, or legacy `session-{task}`.
+    /// The session to prompt against — warm `ctx-…` session, or an opaque cold binding key.
     pub session: SessionId,
     /// Warm-session summary seed to prepend to the prompt parts, when present.
     pub seed: Option<String>,

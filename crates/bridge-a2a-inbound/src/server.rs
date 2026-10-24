@@ -868,7 +868,7 @@ async fn governed_local_dispatch(
         lease: lease.clone(),
         bindings: srv.bindings().clone(),
         task: routed.task.clone(),
-        session: routed.session.clone(),
+        session: mint_cold_session()?,
         cleaned: Default::default(),
         applying: Default::default(),
     });
@@ -910,7 +910,7 @@ async fn governed_local_dispatch(
             .store(true, std::sync::atomic::Ordering::SeqCst);
         backend
             .configure_session(
-                &routed.session,
+                &claim.session,
                 &SessionSpec {
                     config: eff.clone(),
                     cwd: routed.session_cwd.clone(),
@@ -928,19 +928,21 @@ async fn governed_local_dispatch(
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
+                session: claim.session.clone(),
                 agent,
                 backend: backend.clone(),
                 eff,
                 lease: lease.clone(),
             },
         );
+        let _ = srv.store.put(&routed.task, &claim.session).await;
         claim
             .applying
             .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(LocalDispatch {
             usage: None,
             backend,
-            session: routed.session.clone(),
+            session: claim.session.clone(),
             seed: None,
             injects: vec![],
             turn_meta: None,
@@ -980,7 +982,6 @@ async fn resolve_configure_bind(
     session_cwd: Option<SessionCwd>,
     observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<LocalDispatch, BridgeError> {
-    let session = &routed.session;
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
     // route/resolve/recompute. Re-stash the bound effective config with the per-request
     // cwd (harmless idempotent overwrite; it only affects a not-yet-minted session,
@@ -988,6 +989,7 @@ async fn resolve_configure_bind(
     {
         let bindings = srv.bindings().lock().await;
         if let Some(binding) = bindings.get(&routed.task) {
+            let session = binding.session.clone();
             let backend = binding.backend.clone();
             let bound_agent = binding.agent.clone();
             let eff = binding.eff.clone();
@@ -996,7 +998,7 @@ async fn resolve_configure_bind(
             drop(bindings);
             backend
                 .configure_session(
-                    session,
+                    &session,
                     &SessionSpec {
                         config: eff.clone(),
                         cwd: session_cwd,
@@ -1026,6 +1028,7 @@ async fn resolve_configure_bind(
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
+    let session = mint_cold_session()?;
     let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
     let eff = effective_config(&resolved.entry, overrides);
     let obs_model = eff.model.clone();
@@ -1034,7 +1037,7 @@ async fn resolve_configure_bind(
     resolved
         .backend
         .configure_session(
-            session,
+            &session,
             &SessionSpec {
                 config: eff.clone(),
                 cwd: session_cwd,
@@ -1043,9 +1046,11 @@ async fn resolve_configure_bind(
         .await?;
     let backend = resolved.backend.clone();
     let lease: Arc<dyn Lease> = Arc::from(resolved.lease);
-    srv.bindings().lock().await.insert(
+    let mut bindings = srv.bindings().lock().await;
+    bindings.insert(
         routed.task.clone(),
         TaskBinding {
+            session: session.clone(),
             agent: resolved.entry.id.clone(),
             backend: backend.clone(),
             eff,
@@ -1058,6 +1063,8 @@ async fn resolve_configure_bind(
         backend: backend.clone(),
         session: session.clone(),
     };
+    let _ = srv.store.put(&routed.task, &session).await;
+    drop(bindings);
     Ok(LocalDispatch {
         usage: None,
         backend,
@@ -1078,6 +1085,10 @@ async fn resolve_configure_bind(
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
         abort: tokio_util::sync::CancellationToken::new(),
     })
+}
+
+fn mint_cold_session() -> Result<SessionId, BridgeError> {
+    SessionId::parse(format!("cold-{}", mint_turn_id()?.as_str()))
 }
 
 fn mint_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
@@ -1501,15 +1512,19 @@ async fn resolve_for_fanout(
 async fn cancel_backend_for(
     srv: &InboundServer,
     task: &TaskId,
-) -> Result<(Arc<dyn AgentBackend>, Arc<dyn Lease>), BridgeError> {
+) -> Result<(Arc<dyn AgentBackend>, Arc<dyn Lease>, Option<SessionId>), BridgeError> {
     if let Some(binding) = srv.bindings().lock().await.get(task) {
-        return Ok((binding.backend.clone(), binding.lease.clone()));
+        return Ok((
+            binding.backend.clone(),
+            binding.lease.clone(),
+            Some(binding.session.clone()),
+        ));
     }
     // Fallback: no binding exists — resolve the registry default agent.
     // See function doc for the two legitimate no-binding cases this covers.
     let default = srv.registry().default_id();
     let resolved = srv.registry().resolve(&default).await?;
-    Ok((resolved.backend, Arc::from(resolved.lease)))
+    Ok((resolved.backend, Arc::from(resolved.lease), None))
 }
 
 // ---- axum handlers ----
@@ -2275,8 +2290,10 @@ async fn stream_message(
         Ok(())
     };
 
-    // Persist task->session before driving the backend.
-    let _ = srv.store.put(&routed.task, &routed.session).await;
+    // Cold local dispatch publishes its actual key under the binding lock.
+    if !matches!(routed.target, RouteTarget::Local(_)) || routed.context_id.is_some() {
+        let _ = srv.store.put(&routed.task, &routed.session).await;
+    }
 
     // The SSE producer feeds events into an mpsc channel; the response stream
     // owns no borrowed references. Both the local and delegate paths reuse this
@@ -2319,7 +2336,9 @@ async fn stream_message(
                 .await;
                 match dispatch {
                     Ok(dispatch) => {
-                        let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                        if routed.context_id.is_some() {
+                            let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                        }
                         spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, history)
                     }
                     Err(e) => {
@@ -4650,7 +4669,9 @@ async fn unary_message(
     let mut detached_cleanup: Option<bridge_coordinator::dispatch::DetachedWarmCleanup> = None;
     let mut child_liveness = bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
 
-    let _ = srv.store.put(&routed.task, &routed.session).await;
+    if !matches!(routed.target, RouteTarget::Local(_)) || routed.context_id.is_some() {
+        let _ = srv.store.put(&routed.task, &routed.session).await;
+    }
 
     // Fan-out unary: collect all fanout::run events and build an a2a::Task
     // response with both labeled artifacts.
@@ -4694,7 +4715,9 @@ async fn unary_message(
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
-            let _ = srv.store.put(&routed.task, &dispatch.session).await;
+            if routed.context_id.is_some() {
+                let _ = srv.store.put(&routed.task, &dispatch.session).await;
+            }
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
@@ -5501,8 +5524,11 @@ async fn cancel_task(
             // Prefer the task's bound instance; fall back to the default agent if no
             // binding exists yet (binding-or-fallback; T11 makes this binding-only).
             match cancel_backend_for(&srv, &task).await {
-                Ok((backend, _lease)) => {
-                    if let Err(e) = backend.cancel(&session).await {
+                Ok((backend, _lease, bound_session)) => {
+                    if let Err(e) = backend
+                        .cancel(bound_session.as_ref().unwrap_or(&session))
+                        .await
+                    {
                         first_err.get_or_insert(e);
                     }
                 }
@@ -5547,11 +5573,14 @@ async fn cancel_task(
                         .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
                 };
                 // `_lease` keeps the backend leased until its cancel completes.
-                let (backend, _lease) = match cancel_backend_for(&srv, &task).await {
+                let (backend, _lease, bound_session) = match cancel_backend_for(&srv, &task).await {
                     Ok(target) => target,
                     Err(e) => return bridge_err_to_jsonrpc(id, &e),
                 };
-                if let Err(e) = backend.cancel(&session).await {
+                if let Err(e) = backend
+                    .cancel(bound_session.as_ref().unwrap_or(&session))
+                    .await
+                {
                     return bridge_err_to_jsonrpc(id, &e);
                 }
             }
