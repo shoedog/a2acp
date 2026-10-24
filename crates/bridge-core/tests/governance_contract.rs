@@ -121,6 +121,7 @@ fn refusal_is_static_and_non_transient() {
             },
         }),
         metric: Some(BudgetMetricV1::TerminalTokens),
+        persistence: None,
     };
     let e = BridgeError::BudgetRefused {
         refusal: Box::new(refusal),

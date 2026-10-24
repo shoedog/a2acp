@@ -1,10 +1,10 @@
 //! Explicit workflow accounting ownership, independent of observers and liveness.
-//! This contract is not yet installed in workflow execution paths.
 
 use bridge_core::{
     accounting::{AccountingV1, UsageAttributionV1},
     domain::EffectiveConfig,
     error::BridgeError,
+    governance::{BudgetContextV1, BudgetRequestIdV1},
     ids::{AgentId, AttemptIdentity, NodeId, WorkflowId},
     translator::{AccountingSelectionV1, PreparedAccountingTurnV1},
 };
@@ -20,7 +20,11 @@ pub struct WorkflowAccountingInvocationV1 {
 }
 
 impl WorkflowAccountingInvocationV1 {
-    pub fn new(accounting: AccountingV1, owner: AttemptIdentity, workflow: WorkflowId) -> Self {
+    pub fn new(mut accounting: AccountingV1, owner: AttemptIdentity, workflow: WorkflowId) -> Self {
+        accounting.budget_context = Some(BudgetContextV1 {
+            request: BudgetRequestIdV1::Execution(owner.execution_id.clone()),
+            workflow_run: Some(owner.execution_id.clone()),
+        });
         Self {
             accounting,
             owner,
