@@ -2745,6 +2745,11 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
+    fn warm_up_executable(path: &Path) {
+        // Close the cross-thread fork/write ETXTBSY race before this fixture is executed.
+        crate::cli_tests::warm_up_script(path);
+    }
+
     struct Fx {
         _td: tempfile::TempDir,
         root: PathBuf,
@@ -2812,6 +2817,7 @@ mod tests {
         write(&runtime, "#!/bin/sh\nexit 0\n");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        warm_up_executable(&runtime);
         let config_path = root.join("recorded.toml");
         write(&config_path, &format!("default = \"test\"\n[server]\naddr = \"127.0.0.1:0\"\n[custody]\ndelete_remote_on_merge = true\n[evidence]\npath = {:?}\n[verify]\nruntime = {:?}\nimage = \"test\"\ncache = \"test\"\negress = \"open\"\n", root.join("archives").to_str().unwrap(), runtime.to_str().unwrap()));
         let mut ck = bridge_controller::implement_resume::ImplementCheckpoint {
@@ -4398,6 +4404,7 @@ mod tests {
                     write(&f.root.join("recorded-runtime"), &format!(
                         "#!/bin/sh\nfor arg in \"$@\"; do\nprintf '%s\\n' \"$arg\" >> '{}'\n{response}\ndone\n", queries.display()
                     ));
+                    warm_up_executable(&f.root.join("recorded-runtime"));
                     let lic = license(&f, &[&f.run_id]);
                     let env = FakeEnv::new();
                     let report = run_licensed(
@@ -4472,6 +4479,7 @@ mod tests {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&invocation, std::fs::Permissions::from_mode(0o755))
                     .unwrap();
+                warm_up_executable(&invocation);
                 assert!(Command::new(&invocation)
                     .args(["ps", "-aq"])
                     .output()
@@ -4482,6 +4490,7 @@ mod tests {
                     &f.root.join("recorded-runtime"),
                     &format!("#!/bin/sh\n{response}\n"),
                 );
+                warm_up_executable(&f.root.join("recorded-runtime"));
                 let mut items = scan(&f.implement);
                 for item in &mut items {
                     item.consumers.container_mount = sr::HolderState::Free;

@@ -787,14 +787,23 @@ mod tests {
     use std::io::Read;
     use std::process::Stdio;
 
+    static FIXTURE_SPAWN_EAGAIN_INJECTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     fn run(repo: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = spawn_with_would_block_retry(&mut command)
+            .unwrap()
+            .wait_with_output()
             .unwrap();
         assert!(
             out.status.success(),
@@ -1852,6 +1861,74 @@ mod tests {
         };
         assert!(cfg.validate().is_err());
     }
+
+    fn retry_would_block<T>(
+        attempts: u32,
+        pause: Duration,
+        mut operation: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut attempt = 1;
+        loop {
+            match operation() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock && attempt < attempts =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(pause);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    fn fixture_spawn_eagain_once() -> bool {
+        std::env::var_os("CUSTODY_TEST_FIXTURE_SPAWN_EAGAIN").is_some_and(|value| value == "1")
+            && !FIXTURE_SPAWN_EAGAIN_INJECTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn spawn_with_would_block_retry(command: &mut Command) -> std::io::Result<std::process::Child> {
+        // A saturated CI worker can reject any fixture-owned fork with the EAGAIN spawn race.
+        retry_would_block(50, Duration::from_millis(10), || {
+            if fixture_spawn_eagain_once() {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            command.spawn()
+        })
+    }
+
+    #[test]
+    fn would_block_retry_is_bounded_and_retries_only_eagain() {
+        let mut calls = 0;
+        let outcome = retry_would_block(50, Duration::ZERO, || {
+            calls += 1;
+            if calls <= 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(outcome.unwrap(), 4);
+
+        let mut calls = 0;
+        let outcome: std::io::Result<()> = retry_would_block(7, Duration::ZERO, || {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        });
+        assert_eq!(outcome.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(calls, 7);
+
+        let mut calls = 0;
+        let outcome: std::io::Result<()> = retry_would_block(50, Duration::ZERO, || {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            outcome.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(calls, 1);
+    }
+
     // Run environment-sensitive controls in a child test process, never mutating
     // process-wide environment while other Rust tests are executing.
     #[test]
@@ -1882,6 +1959,7 @@ mod tests {
             "object-format",
             "object-format-sha256",
             "credentials",
+            "fixture-spawn-eagain",
         ] {
             let scratch_root = root.path().join(scenario);
             std::fs::create_dir(&scratch_root).unwrap();
@@ -1896,7 +1974,8 @@ mod tests {
                 },
             )
             .unwrap();
-            let out = Command::new(std::env::current_exe().unwrap())
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "custody_push::tests::transport_scenario_child",
@@ -1921,8 +2000,15 @@ mod tests {
                 .env("HTTPS_PROXY", "")
                 .env("ALL_PROXY", "")
                 .env("NO_PROXY", "*")
-                .output()
-                .unwrap();
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if scenario == "fixture-spawn-eagain" {
+                command.env("CUSTODY_TEST_FIXTURE_SPAWN_EAGAIN", "1");
+            }
+            // A saturated CI worker can reject fork with EAGAIN before the isolated child starts.
+            let child = retry_would_block(50, Duration::from_millis(10), || command.spawn())
+                .expect("spawn isolated transport control");
+            let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
                 "{scenario}: {} {}",
@@ -2075,7 +2161,8 @@ mod tests {
                     let method = parts.next().unwrap();
                     let target = parts.next().unwrap();
                     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-                    let mut child = Command::new("git")
+                    let mut command = Command::new("git");
+                    command
                         .args(["-c", "http.receivepack=true", "http-backend"])
                         .env("GIT_PROJECT_ROOT", &root)
                         .env("GIT_HTTP_EXPORT_ALL", "1")
@@ -2087,9 +2174,8 @@ mod tests {
                         .env("CONTENT_LENGTH", length.to_string())
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .unwrap();
+                        .stderr(Stdio::null());
+                    let mut child = spawn_with_would_block_retry(&mut command).unwrap();
                     child.stdin.take().unwrap().write_all(&body).unwrap();
                     let output = child.wait_with_output().unwrap();
                     assert!(output.status.success());
@@ -2231,6 +2317,14 @@ mod tests {
             "sha1"
         });
         match scenario.as_str() {
+            "fixture-spawn-eagain" => {
+                assert!(
+                    FIXTURE_SPAWN_EAGAIN_INJECTED.load(std::sync::atomic::Ordering::SeqCst),
+                    "fixture initialization did not exercise the injected EAGAIN retry"
+                );
+                f.push();
+                assert_eq!(f.remote_sha(), Some(f.head()));
+            }
             "usernames" => {
                 let mut state = CustodyState::default();
                 let alice = format!("alice@host:{}", f.remote.display());
@@ -2290,10 +2384,12 @@ mod tests {
             "object-format" | "object-format-sha256" => {
                 let format = object_format_from_head(&f.clone).unwrap();
                 let expected_host = if format == "sha1" { "sha256" } else { "sha1" };
-                let host_default = git()
+                let mut host_default = git();
+                host_default
                     .args(["config", "--global", "init.defaultObjectFormat"])
-                    .output()
-                    .unwrap();
+                    .stdout(Stdio::piped());
+                let host_default = spawn_with_would_block_retry(&mut host_default).unwrap();
+                let host_default = host_default.wait_with_output().unwrap();
                 assert_eq!(
                     String::from_utf8(host_default.stdout).unwrap().trim(),
                     expected_host
