@@ -5435,6 +5435,17 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
         bridge_core::accounting::AccountingV1 {
             billing: Some(cfg.billing_provider_v1()?),
+            budget_policy: cfg
+                .governance
+                .as_ref()
+                .map(|caps| {
+                    bridge_core::governance::BudgetPolicyV1::new(
+                        caps.rules.clone(),
+                        caps.allowances.clone(),
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?,
             ..bridge_core::accounting::AccountingV1::new(accounting_store.clone())
         },
         identity.clone(),
