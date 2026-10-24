@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["main", "feat/**"]
+    branches: ["main"]
   pull_request:
     branches: ["main"]
 
@@ -25,8 +25,8 @@ permissions:
   issues: read
 
 jobs:
-  ci:
-    name: Build, Lint, Coverage
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:
@@ -37,24 +37,17 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
-          components: rustfmt, clippy, llvm-tools-preview
+          components: rustfmt, clippy
 
-      - name: Print rustc version
-        run: rustc --version
-
-      - name: Install cargo-llvm-cov and cargo-deny
+      - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,cargo-deny
+          tool: cargo-deny
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: lint
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -88,45 +81,50 @@ jobs:
       - name: Workflow artifact hygiene
         run: cargo run -p a2a-bridge -- validate --repo-hygiene
 
-      - name: Coverage — workspace (≥85% line coverage)
-        # LLVM coverage already supplies its own coverage mapping. Full dev debuginfo can
-        # inflate the bridge executable beyond fallback-plan's intentional 256 MiB input cap.
+  coverage:
+    name: Build, Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov and pinned cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest@0.9.146
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keep coverage-instrumented artifacts apart from the uninstrumented control.
+          shared-key: coverage-instrumented
+
+      - name: Run instrumented workspace tests once
         env:
+          # LLVM coverage already supplies its own coverage mapping. Full dev debuginfo can
+          # inflate the bridge executable beyond fallback-plan's intentional 256 MiB input cap.
           CARGO_PROFILE_DEV_DEBUG: 0
-        run: cargo llvm-cov --workspace --fail-under-lines 85
+        run: cargo llvm-cov nextest --workspace --locked --no-report
 
-      # R2f1b currently measures 86.50%. Keep a hard floor while the deferred
-      # coverage follow-on restores the package to 90%.
-      - name: Coverage — bridge-core (≥86% line coverage)
-        run: cargo llvm-cov --package bridge-core --fail-under-lines 86
-
-      - name: Coverage — bridge-acp (≥90% line coverage)
-        run: cargo llvm-cov --package bridge-acp --fail-under-lines 90
-
-      - name: Coverage — bridge-api (≥90% line coverage)
-        run: cargo llvm-cov --package bridge-api --fail-under-lines 90
-
-      # R2f1b currently measures 87.63%. Keep a hard floor while the deferred
-      # coverage follow-on restores the package to 90%.
-      - name: Coverage — bridge-workflow (≥87% line coverage)
-        run: cargo llvm-cov --package bridge-workflow --fail-under-lines 87
-
-      - name: Coverage — bridge-coordinator (≥85% line coverage)
-        run: cargo llvm-cov --package bridge-coordinator --fail-under-lines 85
-
-      - name: Coverage — bridge-mcp (≥70% line coverage)
-        run: cargo llvm-cov --package bridge-mcp --fail-under-lines 70
+      - name: Check coverage reports
+        run: |
+          cargo llvm-cov report --locked --json --summary-only --fail-under-lines 85 > coverage-workspace.json
+          python3 tools/coverage_summary.py coverage-workspace.json
 
   test-uninstrumented:
     name: Test (uninstrumented control)
     runs-on: ubuntu-latest
 
-    # The workspace's only other full-suite execution is `cargo llvm-cov --workspace` in the
-    # `ci` job. Coverage instrumentation has its own failure modes (see
-    # docs/superpowers/reviews/2026-08-17-coverage-lane-flake-family-investigation.md), so a
-    # red there is ambiguous between a real regression and an instrumentation artifact. This
-    # job is the control that disambiguates them: same suite, no instrumentation. If this is
-    # green and the coverage lane is red, the defect is in the instrumented lane.
+    # Coverage instrumentation has its own failure modes (see
+    # docs/superpowers/reviews/2026-08-17-coverage-lane-flake-family-investigation.md), so this
+    # complete uninstrumented control separates instrumentation failures from regressions.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -136,24 +134,22 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Print rustc version
-        run: rustc --version
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # Distinct from the `ci` job's key: that target dir holds llvm-cov-instrumented
-          # artifacts, and sharing it would defeat the point of this job.
-          key: ${{ runner.os }}-cargo-uninstrumented-${{ hashFiles('**/Cargo.lock') }}
+          tool: cargo-nextest@0.9.146
 
-      # --no-fail-fast so a red run reports the complete failure population in one pass.
-      # Enumerating the whole population before the next retry is a standing lane rule.
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-uninstrumented
+
+      # --no-fail-fast reports the complete failure population in one pass. nextest does not
+      # run doctests, so the second command retains the workspace's doctest coverage.
       - name: Test workspace (no coverage instrumentation)
-        run: cargo test --workspace --locked --no-fail-fast
+        run: |
+          cargo nextest run --workspace --locked --no-fail-fast
+          cargo test --workspace --doc --locked
 
   bridge-store-macos:
     name: Bridge Store (macOS 14)
@@ -168,14 +164,10 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-bridge-store-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bridge-store
 
       - name: Test bridge-store
         run: cargo test -p bridge-store --locked -- --test-threads=1
@@ -193,14 +185,10 @@ jobs:
         with:
           toolchain: 1.94.0
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-bridge-store-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: bridge-store
 
       - name: Test unsupported history target contract
         run: >-
