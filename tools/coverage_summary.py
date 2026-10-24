@@ -9,13 +9,15 @@ from argparse import ArgumentParser
 from pathlib import PurePosixPath
 
 
+# Floors are the integer floor of each crate's measured line coverage from the single
+# instrumented workspace run (all tests together), PR #218 CI, 2026-10-24.
 THRESHOLDS = {
-    "bridge-core": 86.0,
-    "bridge-acp": 90.0,
-    "bridge-api": 90.0,
-    "bridge-workflow": 87.0,
-    "bridge-coordinator": 85.0,
-    "bridge-mcp": 70.0,
+    "bridge-core": 92.0,  # measured 92.996%
+    "bridge-acp": 95.0,  # measured 95.558%
+    "bridge-api": 96.0,  # measured 96.318%
+    "bridge-workflow": 91.0,  # measured 91.279%
+    "bridge-coordinator": 92.0,  # measured 92.427%
+    "bridge-mcp": 80.0,  # measured 80.995%
 }
 
 
