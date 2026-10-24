@@ -1498,6 +1498,7 @@ fn turn_log_observer_enabled(
 /// policy / batch plus the interactive-permission registry.
 #[allow(clippy::too_many_arguments)]
 fn build_coordinator(
+    budget_policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
     billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
     session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
     executor: Arc<bridge_workflow::executor::WorkflowExecutor>,
@@ -1522,12 +1523,14 @@ fn build_coordinator(
     >,
     workflow_admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
     perm_registry: Arc<PermissionRegistry>,
+    warm_idle_ttl_secs: u64,
 ) -> Arc<bridge_coordinator::Coordinator> {
     let accounting = bridge_core::accounting::AccountingV1 {
         billing: Some(billing),
+        budget_policy,
         ..bridge_core::accounting::AccountingV1::new(task_store.clone())
     };
-    Arc::new(
+    let coordinator = Arc::new(
         bridge_coordinator::Coordinator::new(
             session_manager,
             Some(executor),
@@ -1547,7 +1550,102 @@ fn build_coordinator(
         .with_workflow_history(workflow_history)
         .with_workflow_admission(workflow_admission)
         .with_permission_registry(perm_registry),
-    )
+    );
+    // Policy installation must finish before any background task can lock the session table.
+    start_session_reaper(&coordinator, warm_idle_ttl_secs);
+    coordinator
+}
+
+#[cfg(test)]
+thread_local! {
+    static REAPER_START_POLICIES: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn start_session_reaper(coordinator: &Arc<bridge_coordinator::Coordinator>, ttl_secs: u64) {
+    #[cfg(test)]
+    REAPER_START_POLICIES
+        .with(|policies| policies.borrow_mut().push(coordinator.has_budget_policy()));
+    let sm = coordinator.session_manager.clone();
+    let period = Duration::from_secs(ttl_secs.clamp(1, 30));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        loop {
+            ticker.tick().await;
+            sm.reap_idle().await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod governed_startup_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_installation_precedes_reaper_registration() {
+        for caps in [
+            "",
+            "[[governance.rules]]\nid='request'\nselector='each_request'\nlimits={turns=1}\n",
+        ] {
+            REAPER_START_POLICIES.with(|policies| policies.borrow_mut().clear());
+            let startup = governance_config::served_startup(&format!(
+                "default='a'\n[[agents]]\nid='a'\ncmd='never-spawn'\n[server]\n{caps}"
+            ))
+            .unwrap();
+            let spawn: SpawnFn =
+                Arc::new(|_| Box::pin(async { panic!("startup must not spawn an adapter") }));
+            let registry: Arc<dyn AgentRegistry> =
+                Arc::new(Registry::new(startup.snapshot, spawn).unwrap());
+            let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+            let clock: Arc<dyn bridge_coordinator::clock::Clock> =
+                Arc::new(bridge_coordinator::clock::SystemClock);
+            let manager = Arc::new(
+                bridge_coordinator::session_manager::SessionManager::new_with_clock(
+                    registry.clone(),
+                    Duration::from_secs(1),
+                    clock.clone(),
+                ),
+            );
+            let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+                registry.clone(),
+            ));
+            let dir = tempfile::tempdir().unwrap();
+            let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+                registry.clone(),
+                Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+                bridge_core::SessionCwd::parse(dir.path().to_str().unwrap()).unwrap(),
+                None,
+            ));
+            let coordinator = build_coordinator(
+                startup.policy,
+                startup.config.billing_provider_v1().unwrap(),
+                manager,
+                executor,
+                Default::default(),
+                store.clone(),
+                store.clone(),
+                make_policy(&startup.config.server),
+                registry,
+                clock,
+                None,
+                None,
+                Arc::new(bridge_observ::NoopObserver),
+                3,
+                false,
+                512,
+                Ok(store),
+                admission,
+                PermissionRegistry::new(),
+                1,
+            );
+            // This synchronous witness is recorded at the production spawn seam, before the
+            // initial reaper tick can race any session-table access on the second worker.
+            REAPER_START_POLICIES
+                .with(|policies| assert_eq!(*policies.borrow(), vec![!caps.is_empty()]));
+            tokio::task::yield_now().await;
+            assert_eq!(coordinator.has_budget_policy(), !caps.is_empty());
+            assert!(!coordinator.session_manager.has_live_contexts().await);
+        }
+    }
 }
 
 fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
@@ -4004,6 +4102,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("implement: read config {:?}: {e}", config_path))?;
     let cfg =
         config::RegistryConfig::parse(&raw).map_err(|e| format!("implement: config parse: {e}"))?;
+    governance_config::refuse_staged_execution(&cfg)?;
     let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("implement: {e}"))?;
     let root = cfg
         .allowed_cwd_root
@@ -9475,7 +9574,11 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     };
 
     let raw = std::fs::read_to_string(&config_path)?;
-    let cfg = RegistryConfig::parse(&raw)?;
+    let governance_config::ServedStartup {
+        config: cfg,
+        snapshot,
+        policy: budget_policy,
+    } = governance_config::served_startup(&raw)?;
     let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("mcp: {e}"))?;
 
     let policy = make_policy(&cfg.server);
@@ -9491,8 +9594,6 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
     );
 
-    let source = FileConfigSource::new(config_path.clone());
-    let snapshot = source.load().await?;
     // mcp never runs [verify] (implement-only) — nothing to include here.
     recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
@@ -9534,17 +9635,6 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             cfg.server.compact_summarize_timeout_secs.unwrap_or(120),
         )),
     );
-    {
-        let sm = session_manager.clone();
-        let period = Duration::from_secs(warm_ttl.clamp(1, 30));
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(period);
-            loop {
-                ticker.tick().await;
-                sm.reap_idle().await;
-            }
-        });
-    }
 
     let resume_cap = cfg
         .store
@@ -9615,6 +9705,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     )?;
 
     let coordinator = build_coordinator(
+        budget_policy.clone(),
         cfg.billing_provider_v1()?,
         session_manager,
         executor,
@@ -9633,9 +9724,14 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         workflow_history,
         workflow_admission,
         Arc::clone(&perm_registry),
+        warm_ttl,
     );
 
-    coordinator.resume().await?;
+    if budget_policy.is_some() {
+        eprintln!("a2a-bridge: recovery disabled under caps; outstanding records preserved");
+    } else {
+        coordinator.resume().await?;
+    }
     bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
     Ok(())
 }
@@ -11145,12 +11241,13 @@ async fn main() -> Result<(), BoxError> {
         start: epoch_secs(),
     };
 
-    // Read the non-registry config sections (server addr, delegation) directly:
-    // the FileConfigSource snapshot carries registry and billing mappings. Re-parsing the same
-    // file is cheap and keeps the [server]/[delegation] parsing (incl. env-expansion)
-    // working on the RegistryConfig path.
+    // Parse once: runtime settings, registry/billing and governance share this value.
     let raw = std::fs::read_to_string(&config_path)?;
-    let cfg = RegistryConfig::parse(&raw)?;
+    let governance_config::ServedStartup {
+        config: cfg,
+        snapshot,
+        policy: budget_policy,
+    } = governance_config::served_startup(&raw)?;
     let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("serve: {e}"))?;
 
     // 3. Build the policy engine FIRST so the SAME engine drives both the inbound
@@ -11180,11 +11277,11 @@ async fn main() -> Result<(), BoxError> {
         Some(Arc::clone(&liveness_board)),
     );
 
-    // 5. Config source + registry. `load()` is the initial desired state; the
-    //    delegation `[delegation]` env-expansion + `[server] addr` ride along on
-    //    the RegistryConfig we re-read below for the non-registry fields.
-    let source = FileConfigSource::new(config_path.clone());
-    let snapshot = source.load().await?; // initial desired state
+    // 5. Derive startup from the same parse; the watcher freezes even an absent policy.
+    let source = FileConfigSource::served(
+        config_path.clone(),
+        budget_policy.as_ref().map(|p| p.digest()),
+    );
     preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't responding at serve boot
                                          // Increment A before-first-use crash recovery: reap only DEAD
                                          // (same host + free lease) orphans of this instance's owners
@@ -11414,17 +11511,6 @@ async fn main() -> Result<(), BoxError> {
             cfg.server.compact_summarize_timeout_secs.unwrap_or(120),
         )),
     );
-    {
-        let sm = session_manager.clone();
-        let period = Duration::from_secs(warm_ttl.clamp(1, 30));
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(period);
-            loop {
-                ticker.tick().await;
-                sm.reap_idle().await;
-            }
-        });
-    }
 
     // 8. Build the ONE Coordinator (#10 slice 1), then construct the inbound server
     //    ADOPTING its shared turn-lifecycle STATE. The Coordinator owns the state;
@@ -11451,6 +11537,7 @@ async fn main() -> Result<(), BoxError> {
         &[],
     )?;
     let coordinator = build_coordinator(
+        budget_policy.clone(),
         billing,
         session_manager,
         executor,
@@ -11469,6 +11556,7 @@ async fn main() -> Result<(), BoxError> {
         workflow_history,
         workflow_admission,
         Arc::clone(&perm_registry),
+        warm_ttl,
     );
 
     // The inbound server is a thin adapter over the ONE Coordinator (#10 slice 7):
@@ -11530,7 +11618,11 @@ async fn main() -> Result<(), BoxError> {
     //     batch::resume_all / detached::resume_non_batch_tasks over the SHARED store +
     //     BatchRuntime as the adapter's resume_working_tasks). This REPLACES the adapter
     //     call — NEVER both, or a working task double-spawns two runners (Fable M4).
-    coordinator.resume().await?;
+    if budget_policy.is_some() {
+        eprintln!("a2a-bridge: recovery disabled under caps; outstanding records preserved");
+    } else {
+        coordinator.resume().await?;
+    }
     if let Some(prometheus) = &prometheus_observer {
         match &workflow_history_for_metrics {
             Ok(history) => match history.completed_between(0, i64::MAX).await {
