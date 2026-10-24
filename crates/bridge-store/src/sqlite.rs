@@ -4439,6 +4439,38 @@ impl HarvestAuditStore for SqliteStore {
 
 #[async_trait::async_trait]
 impl bridge_core::task_store::TaskStore for SqliteStore {
+    async fn admit_usage_attempt_v1(
+        &self,
+        policy: Option<&bridge_core::governance::BudgetPolicyV1>,
+        attempt: &bridge_core::ids::AttemptId,
+        context: &bridge_core::governance::BudgetContextV1,
+        candidate: &bridge_core::governance::BudgetCandidateV1,
+    ) -> bridge_core::governance::BudgetAdmissionOutcomeV1 {
+        use bridge_core::governance::*;
+        match self.with_usage_conn(|conn| {
+            crate::governance::admit(conn, policy, attempt, context, candidate, &*self.now_ms, &|row, coverage| {
+                let primary = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
+                // The initial ledger row proves birth during coverage. A still-active initial
+                // attempt with no dispatch also proves a fresh lazy-initialization bootstrap;
+                // do not backdate global/day coverage or infer birth from missing usage rows.
+                primary.query_row("SELECT EXISTS(SELECT 1 FROM workflow_attempt_summaries
+                    WHERE execution_id=?1 AND ordinal=0 AND parent_attempt_id IS NULL
+                    AND (started_ms>=?2 OR (attempt_id=?3 AND status='active'
+                        AND prompt_acceptance='not_dispatched' AND
+                        (SELECT count(*) FROM workflow_attempt_summaries WHERE execution_id=?1)=1)))",
+                    rusqlite::params![row.attribution.execution, coverage, row.attribution.run_attempt], |r| r.get(0))
+                    .map_err(|_| BridgeError::StoreFailure)
+            })
+        }) {
+            Ok(outcome) => outcome,
+            Err(BridgeError::BudgetRefused { refusal }) => {
+                BudgetAdmissionOutcomeV1::Refused(*refusal)
+            }
+            Err(_) => BudgetAdmissionOutcomeV1::Refused(BudgetRefusalV1::new(
+                BudgetRefusalReasonV1::AccountingUnavailable,
+            )),
+        }
+    }
     async fn start_usage_attempt_v1(&self, row: &UsageAttemptV1) -> Result<(), BridgeError> {
         bridge_core::ids::AttemptId::parse(&row.id)?;
         if row.dispatched
@@ -4491,12 +4523,14 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 .map_err(|_| BridgeError::StoreFailure)?;
             let mut row: UsageAttemptV1 =
                 serde_json::from_str(&json).map_err(|_| BridgeError::StoreFailure)?;
+            let mut overrun = false;
             if !row.finalized {
                 row.dispatched |= dispatched;
                 if let Some(usage) = usage {
                     row.observe(usage);
                 }
                 row.finalized = finalized;
+                overrun = crate::governance::reconcile(&tx, &row)?;
                 let json = serde_json::to_string(&row).map_err(|_| BridgeError::StoreFailure)?;
                 tx.execute(
                     "UPDATE usage_attempts_v1 SET record_json=?2 WHERE id=?1",
@@ -4504,7 +4538,11 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 )
                 .map_err(|_| BridgeError::StoreFailure)?;
             }
-            tx.commit().map_err(|_| BridgeError::StoreFailure)
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            if overrun {
+                tracing::warn!("governed turn completed above its token allowance");
+            }
+            Ok(())
         })
     }
     async fn usage_summary_v1(&self, query: &UsageQueryV1) -> Result<UsageSummaryV1, BridgeError> {
