@@ -49,6 +49,30 @@ fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
     )
 }
 
+// Provider telemetry can precede a prompt-open error. Such effects override
+// the rejection's acceptance assertion, even when no translated stream opened.
+struct ReplayActivity {
+    inner: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    effects: std::sync::atomic::AtomicBool,
+}
+impl bridge_core::attempt_activity::AttemptRecorder for ReplayActivity {
+    fn record(
+        &self,
+        phase: bridge_core::attempt_activity::AttemptPhase,
+        reason: bridge_core::attempt_activity::ActivityReason,
+        advance: u64,
+    ) -> Option<bridge_core::attempt_activity::AttemptActivity> {
+        use bridge_core::attempt_activity::ActivityReason::*;
+        if matches!(reason, MessageDelta | ThoughtDelta | ToolTransition) {
+            self.effects.store(true, Ordering::Relaxed);
+        }
+        self.inner.record(phase, reason, advance)
+    }
+    fn tally(&self) -> Option<bridge_core::attempt_activity::ActivityTally> {
+        self.inner.tally()
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StatusDto {
@@ -606,6 +630,8 @@ impl From<&TaskRecord> for TaskStatusDto {
 /// over it. Concrete struct (one impl, no trait).
 pub struct Coordinator {
     accounting: Option<bridge_core::accounting::AccountingV1>,
+    mcp_fallback: Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    fallback_entries: HashMap<AgentId, Arc<bridge_core::domain::AgentEntry>>,
     pub session_manager: Arc<crate::session_manager::SessionManager>,
     executor: Option<Arc<WorkflowExecutor>>,
     workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
@@ -665,6 +691,8 @@ impl Coordinator {
     ) -> Self {
         Self {
             accounting: None,
+            mcp_fallback: Vec::new(),
+            fallback_entries: HashMap::new(),
             session_manager,
             executor,
             workflows,
@@ -695,6 +723,58 @@ impl Coordinator {
     pub fn with_accounting(mut self, accounting: bridge_core::accounting::AccountingV1) -> Self {
         self.accounting = Some(accounting);
         self
+    }
+
+    /// Operator declarations only. Snapshot reads do not resolve or probe targets.
+    #[must_use]
+    pub fn with_mcp_fallback(
+        mut self,
+        chains: Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    ) -> Self {
+        for candidate in chains
+            .iter()
+            .flat_map(|c| std::iter::once(&c.source).chain(&c.steps))
+        {
+            if let Some(entry) = self.registry.entry_snapshot(&candidate.agent) {
+                self.fallback_entries.insert(candidate.agent.clone(), entry);
+            }
+        }
+        self.mcp_fallback = chains;
+        self
+    }
+
+    fn bind_fallback_candidate(
+        &self,
+        declared: &bridge_core::routing::FallbackCandidateV1,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<bridge_core::routing::FallbackCandidateV1> {
+        let frozen = self.fallback_entries.get(&declared.agent)?;
+        let current = self.registry.entry_snapshot(&declared.agent)?;
+        // Refuse authority drift since composition, without resolving the adapter.
+        if current.kind != frozen.kind
+            || current.cmd != frozen.cmd
+            || current.args != frozen.args
+            || current.sandbox != frozen.sandbox
+            || current.cwd != frozen.cwd
+            || current.session_cwd != frozen.session_cwd
+            || current.mcp != frozen.mcp
+            || current.mcp_delivery != frozen.mcp_delivery
+            || current.extensions != frozen.extensions
+            || current.base_url != frozen.base_url
+            || current.api_key_env != frozen.api_key_env
+            || current.model_provider != frozen.model_provider
+        {
+            return None;
+        }
+        let config = bridge_core::domain::effective_config(&current, Some(overrides));
+        let mut effective = declared.clone();
+        effective.model = config.model?;
+        effective.posture.mode = config.mode;
+        if let Some(cwd) = cwd {
+            effective.posture.session_cwd = cwd.as_str().to_string();
+        }
+        Some(effective)
     }
 
     pub async fn prepare_usage(
@@ -1096,8 +1176,95 @@ impl Coordinator {
 
     async fn prompt_inner(
         &self,
+        mut p: OpParams,
+        mut attempt: Option<DirectAttemptHandle>,
+    ) -> Result<TurnOutput, AccountingFailureV1> {
+        let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+        let agent = p
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.registry.default_id());
+        // Existing contexts may carry hidden conversation state. No migration grant.
+        let cold = p.context.is_none();
+        let mut routing = if cold && attempt.is_some() {
+            self.mcp_fallback
+                .iter()
+                .find(|c| c.source.agent == agent)
+                .and_then(|c| {
+                    self.bind_fallback_candidate(&c.source, &p.agent_override(), cwd.as_ref())
+                })
+                .and_then(|source| {
+                    bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(
+                        self.mcp_fallback.clone(),
+                        source,
+                    )
+                })
+        } else {
+            None
+        };
+        let mut identity = attempt.as_ref().map(|a| a.identity.clone());
+        let mut prepared = false;
+        let mut result = self
+            .prompt_once(p.clone(), attempt.take(), &mut prepared)
+            .await;
+        loop {
+            let failure = match result {
+                Ok(output) => return Ok(output),
+                Err(failure) => failure,
+            };
+            let Some(run) = routing.take() else {
+                return Err(failure);
+            };
+            let (run, candidate) = run.transition(failure.clone(), false, |next| {
+                let overrides = AgentOverride {
+                    model: Some(next.model.clone()),
+                    ..p.agent_override()
+                };
+                self.bind_fallback_candidate(next, &overrides, cwd.as_ref())
+                    .ok_or(BridgeError::ConfigMismatch {
+                        field: "fallback authority",
+                    })
+            })?;
+            let Some(previous) = identity.take() else {
+                return Err(failure);
+            };
+            let next_identity = previous.resume()?;
+            p.agent = Some(candidate.agent);
+            p.model = Some(candidate.model);
+            p.context = Some(self.mint_context_id());
+            let (fingerprint, complete) = self.direct_workload_fingerprint(
+                p.agent.as_ref().expect("selected agent"),
+                Some(&p.agent_override()),
+                "mcp_prompt",
+            );
+            let next = self
+                .admit_direct_attempt(
+                    next_identity.clone(),
+                    bridge_core::workflow_history::ExecutionSurface::Mcp,
+                    "direct",
+                    fingerprint,
+                    complete,
+                )
+                .await?;
+            identity = Some(next_identity);
+            prepared = false;
+            result = self.prompt_once(p.clone(), Some(next), &mut prepared).await;
+            if let Err(setup) = &result {
+                if !prepared {
+                    let mut original = failure;
+                    original.persistence = setup.persistence.clone().or(original.persistence);
+                    return Err(original);
+                }
+            }
+            routing = Some(run);
+        }
+    }
+
+    async fn prompt_once(
+        &self,
         p: OpParams,
         mut attempt: Option<DirectAttemptHandle>,
+        prepared: &mut bool,
     ) -> Result<TurnOutput, AccountingFailureV1> {
         let _deferred_cold_bindings = &self.bindings;
         let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
@@ -1135,8 +1302,16 @@ impl Coordinator {
                 return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
+        *prepared = true;
+        let stateful = turn.seed.is_some() || !turn.injects.is_empty();
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
+            .map_err(|mut failure| {
+                if stateful {
+                    failure.replay = Default::default();
+                }
+                failure
+            })
     }
 
     /// Continue an EXISTING warm context. Unlike `prompt`, this REUSES the context's stored fingerprint
@@ -1219,6 +1394,7 @@ impl Coordinator {
                 return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
+        // Retained conversation state has no cross-provider equivalence proof.
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
     }
@@ -1432,6 +1608,10 @@ impl Coordinator {
                     as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
             ),
         };
+        let replay_activity = Arc::new(ReplayActivity {
+            inner: activity_recorder,
+            effects: std::sync::atomic::AtomicBool::new(false),
+        });
         let translator = match attempt.as_mut().and_then(|a| a.usage.take()) {
             Some(usage) => Translator::for_turn(turn.backend.clone(), Some(usage)),
             None => Translator::new(), // Explicit compatibility entry without installed accounting.
@@ -1449,7 +1629,7 @@ impl Coordinator {
             diagnostic,
             obs_ctx.clone(),
             harvest_audit_store,
-            activity_recorder,
+            replay_activity.clone(),
             terminal_evidence,
         );
         let mut collected = Vec::new();
@@ -1558,15 +1738,24 @@ impl Coordinator {
                 usage: last_usage.as_ref(),
                 fin: UsageFinalization::TurnFinal,
             });
-            if let Some(attempt) = attempt.as_mut() {
-                if let Err(terminal_error) = attempt
+            let terminal_persistence = match attempt.as_mut() {
+                Some(attempt) => attempt
                     .finish("failed", "prompt_failed", true, cleanup_disposition)
                     .await
-                {
-                    tracing::warn!(error = ?terminal_error, "direct attempt finalization failed after prompt error");
-                }
+                    .err(),
+                None => None,
+            };
+            let mut failure = e.clone().with_checked_cleanup(cleanup_result);
+            if aborted
+                || turn.abort.is_cancelled()
+                || replay_activity.effects.load(Ordering::Relaxed)
+            {
+                failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
             }
-            return Err(e.clone());
+            if let Some(error) = terminal_persistence {
+                failure.persistence = Some(error);
+            }
+            return Err(failure);
         }
         if let Err(error) = cleanup_result {
             if let Some(attempt) = attempt.as_mut() {
