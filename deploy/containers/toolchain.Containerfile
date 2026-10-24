@@ -58,6 +58,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # Coverage tools available so an opt-in `cargo llvm-cov` command never hits "command not found".
 # Pinned for reproducibility (chosen against the 1.94.0 toolchain).
 RUN cargo install --locked cargo-llvm-cov --version 0.6.21 \
+ && cargo install --locked cargo-nextest --version 0.9.146 \
  && cargo install --locked cargo-tarpaulin --version 0.32.7
 
 # L3 Slice B: rust-analyzer (semantic nav) + rust-src (RA needs it to resolve std/core types — spike
@@ -70,7 +71,7 @@ RUN rustup component add rust-analyzer rust-src
 # Include cargo's installed subcommands: finding `cargo` alone is insufficient for `cargo clippy` or
 # opt-in coverage when their companion executables are absent from the login-shell PATH.
 RUN set -eux; for t in cargo rustc rustfmt rustup clippy-driver cargo-clippy rust-analyzer \
-      cargo-llvm-cov cargo-tarpaulin; do \
+      cargo-llvm-cov cargo-nextest cargo-tarpaulin; do \
       ln -sf "/usr/local/cargo/bin/$t" "/usr/local/bin/$t"; \
     done
 
