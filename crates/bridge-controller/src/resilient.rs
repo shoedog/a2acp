@@ -402,6 +402,7 @@ mod tests {
             BridgeError::InvalidRequest { .. } => "InvalidRequest",
             BridgeError::IdentityUnavailable => "IdentityUnavailable",
             BridgeError::DurableEvidenceUnavailable { .. } => "DurableEvidenceUnavailable",
+            BridgeError::BudgetRefused { .. } => "BudgetRefused",
             BridgeError::TaskNotFound => "TaskNotFound",
             BridgeError::SessionNotFound => "SessionNotFound",
             BridgeError::AuthRequired { .. } => "AuthRequired",

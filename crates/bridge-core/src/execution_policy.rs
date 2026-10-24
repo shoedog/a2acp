@@ -705,6 +705,7 @@ impl NodeCauseV1 {
             BridgeError::AgentFailure { .. } => unreachable!("handled above"),
             BridgeError::AgentOverloaded => (Class::Overloaded, "bridge.agent_overloaded"),
             BridgeError::UpstreamA2aError => (Class::Transport, "bridge.upstream_a2a_error"),
+            BridgeError::BudgetRefused { .. } => (Class::Config, "bridge.budget_refused"),
             BridgeError::StoreFailure => (Class::Persistence, "bridge.store_failure"),
             BridgeError::HarvestAuditPersistFailed { .. } => {
                 (Class::Persistence, "bridge.harvest_audit_persist_failed")

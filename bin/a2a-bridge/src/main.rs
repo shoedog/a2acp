@@ -57,6 +57,7 @@ mod config;
 mod containers;
 mod doctor;
 mod fallback_plan;
+mod governance_config;
 mod heartbeat;
 mod local_file;
 mod provider_refresh;
@@ -10135,7 +10136,7 @@ pub(crate) fn validate_config_contents(
     let prompt_count = cfg.prompts.len();
     let workflow_count = workflows.len();
     let snap = cfg
-        .into_snapshot()
+        .into_validation_snapshot()
         .map_err(|e| format!("registry snapshot: {e}"))?;
 
     // Registry::new validates the snapshot without resolving any agent. Keep the validate path explicit:
