@@ -1,0 +1,16 @@
+# Do not hide flaky tests by retrying them.
+[profile.default]
+retries = 0
+
+# Test-isolation audit:
+# - ENV_LOCK (bin/a2a-bridge/src/main.rs) protects process environment changes.
+# - GC_TEST_LOCK (compatibility_schedule_retention.rs) protects in-process scheduler state.
+# - HISTORY_PREVALIDATION_PAUSE_HOOKS, HISTORY_FILE_OPEN_TEST_CONTROLS,
+#   PLATFORM_BOOTSTRAP_PAUSE_HOOK, PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES,
+#   PLATFORM_OPEN_TEST_HOOKS, CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT,
+#   HISTORY_TRANSACTION_PAUSE_HOOK, HISTORY_ADMISSION_CONTENTION_HOOK, and
+#   HISTORY_MUTATION_FAILPOINTS (bridge-store/sqlite.rs) are static test hooks.
+# - PLATFORM_BOOTSTRAP_TEST_SERIAL and PLATFORM_OPEN_TEST_SERIAL (bridge-store/sqlite.rs)
+#   protect those hooks; their filesystem fixtures are temporary directories.
+# All observed test locks protect process-local state. No test uses a fixed external path, port,
+# platform state directory, or global Git configuration, so no nextest test group is required.
