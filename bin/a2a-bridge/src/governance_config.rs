@@ -1,4 +1,4 @@
-//! Pure configuration admission; no provider/catalog/store access in this staging slice.
+//! Pure route admission; caps are active only for local workflows.
 use crate::config::{ConfigError, RegistryConfig};
 use bridge_core::{governance::*, ids::AgentId};
 
@@ -27,12 +27,19 @@ pub fn validate(cfg: &RegistryConfig) -> Result<(), ConfigError> {
     }
     Ok(())
 }
-/// All snapshot entrances, including direct deserialization, fail before resolution or storage.
+/// All general snapshot entrances fail before resolution or storage.
+/// Only the local workflow command may use the validated snapshot below.
+pub fn local_workflow_snapshot(
+    cfg: RegistryConfig,
+) -> Result<bridge_core::domain::RegistrySnapshot, ConfigError> {
+    validate(&cfg)?;
+    cfg.into_validation_snapshot()
+}
 pub fn refuse_staged_execution(cfg: &RegistryConfig) -> Result<(), ConfigError> {
     validate(cfg)?;
     if cfg.governance.is_some() {
         return Err(ConfigError::Registry(
-            "budget execution is unavailable during governance staging".into(),
+            "budget execution is unavailable during governance staging for this route; only local run-workflow supports caps".into(),
         ));
     }
     Ok(())

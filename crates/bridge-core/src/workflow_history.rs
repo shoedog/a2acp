@@ -1384,6 +1384,7 @@ impl MemoryWorkflowHistoryStore {
                 .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
         let mut trigger_mentions = 0_usize;
         let mut qualifying_failure = false;
+        let mut budget_stop = false;
         let mut selected_terminal_valid = false;
         let trigger = structured
             .policy_trigger_json
@@ -1401,6 +1402,7 @@ impl MemoryWorkflowHistoryStore {
                 .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
             let terminal = NodeTerminalV1::decode_canonical(encoded.as_bytes())
                 .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            budget_stop |= crate::governance::is_budget_stop_terminal_v1(&terminal);
             qualifying_failure |= matches!(
                 terminal.primary,
                 NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
@@ -1440,6 +1442,7 @@ impl MemoryWorkflowHistoryStore {
             None => {
                 if trigger_mentions != 0
                     || (qualifying_failure
+                        && !budget_stop
                         && !matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent))
                 {
                     return Err(LedgerError::new(LedgerUnavailableReason::Schema));
