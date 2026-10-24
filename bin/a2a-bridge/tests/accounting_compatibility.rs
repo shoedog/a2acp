@@ -532,10 +532,12 @@ fn scratch_accounting_destinations_refuse_before_provider_prompting() {
             .unwrap();
         // The first real smoke child waits before its fixture replies to initialize. The
         // target case cannot be admitted until setup finishes and we release that child.
+        // CI worker-load can delay setup; this gate verifies ordering, not startup latency.
+        let gate_deadline = std::time::Duration::from_secs(120);
         let started = Instant::now();
         while !ready.exists() {
             assert!(
-                started.elapsed().as_secs() < 20,
+                started.elapsed() < gate_deadline,
                 "gate not reached: {route}"
             );
             assert!(
