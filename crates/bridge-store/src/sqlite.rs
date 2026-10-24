@@ -4540,7 +4540,11 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             }
             tx.commit().map_err(|_| BridgeError::StoreFailure)?;
             if overrun {
-                tracing::warn!("governed turn completed above its token allowance");
+                if tracing::enabled!(tracing::Level::WARN) {
+                    tracing::warn!("governed turn completed above its token allowance");
+                } else {
+                    eprintln!("governed turn completed above its token allowance");
+                }
             }
             Ok(())
         })
@@ -11872,6 +11876,7 @@ fn validate_structured_history_coherence(
     let mut trigger_mentions = 0_usize;
     let mut selected_terminal_valid = false;
     let mut qualifying_failure = false;
+    let mut budget_stop = false;
     for persisted in &evidence.node_terminals {
         let admitted = evidence
             .reservation
@@ -11882,6 +11887,7 @@ fn validate_structured_history_coherence(
         }
         let terminal = NodeTerminalV1::decode_canonical(persisted.terminal_json.as_bytes())
             .map_err(|_| LedgerError::new(R::Corruption))?;
+        budget_stop |= bridge_core::governance::is_budget_stop_terminal_v1(&terminal);
         qualifying_failure |= matches!(
             terminal.primary,
             NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
@@ -11922,6 +11928,7 @@ fn validate_structured_history_coherence(
             if trigger_mentions != 0
                 || (require_complete
                     && qualifying_failure
+                    && !budget_stop
                     && !matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent))
             {
                 return Err(LedgerError::new(R::Corruption));

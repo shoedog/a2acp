@@ -9,6 +9,8 @@ mod common;
 #[path = "accounting/support.rs"]
 mod support;
 mod text_file_busy;
+#[path = "accounting/uncapped_baseline.rs"]
+mod uncapped_baseline;
 
 struct Cli {
     dir: tempfile::TempDir,
@@ -17,6 +19,15 @@ struct Cli {
     store: PathBuf,
     platform: PathBuf,
 }
+
+struct RetainedOutput(PathBuf);
+
+impl Drop for RetainedOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 impl Cli {
     fn new(configured: bool, telemetry: bool, model: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -111,7 +122,10 @@ addr = "127.0.0.1:0"
         }
     }
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"));
+        let mut cmd = Command::new(
+            std::env::var_os("A2A_GMIN4_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_a2a-bridge").into()),
+        );
         cmd.args([
             "run-workflow",
             "flow",
@@ -122,7 +136,8 @@ addr = "127.0.0.1:0"
         ])
         .arg(&self.config)
         .current_dir(self.dir.path())
-        .env("A2A_BRIDGE_STATE_DIR", &self.platform);
+        .env("A2A_BRIDGE_STATE_DIR", &self.platform)
+        .env_remove("RUST_LOG");
         cmd
     }
     fn prompts(&self) -> Vec<serde_json::Value> {
@@ -463,4 +478,363 @@ async fn serve_client_leaves_accounting_and_prompt_ownership_to_executing_servic
     };
     support::assert_usage(&f.reopened(Some(&owner)).await, 1, 0);
     assert_eq!(f.rows().len(), 1, "only the executing service may account");
+}
+
+fn caps(cli: &Cli, request: u64, workflow: u64, tokens: bool) {
+    use std::io::Write;
+    let mut cfg = fs::OpenOptions::new()
+        .append(true)
+        .open(&cli.config)
+        .unwrap();
+    for (id, selector, cap) in [
+        ("request", "each_request", request),
+        ("workflow", "each_workflow_run", workflow),
+    ] {
+        writeln!(
+            cfg,
+            "\n[[governance.rules]]\nid='{id}'\nselector='{selector}'\nlimits={{turns={cap}}}"
+        )
+        .unwrap();
+    }
+    if tokens {
+        writeln!(cfg, "\n[[governance.rules]]\nid='tokens'\nselector={{utc_day_agent='agent'}}\nlimits={{terminal_tokens=100}}\n[[governance.allowances]]\ntarget={{agent='agent',model='good'}}\nterminal_tokens=1").unwrap();
+        // Agent/day admission needs independent coverage from before today's start.
+        let conn =
+            rusqlite::Connection::open(cli.store.with_extension("sqlite.usage-v1.sqlite")).unwrap();
+        conn.execute("UPDATE usage_coverage_v1 SET started_ms=0", [])
+            .unwrap();
+    }
+}
+
+#[test]
+fn governed_cli_enforces_both_owners_and_retains_completed_bytes() {
+    for (request, workflow) in [(1, 2), (2, 1), (0, 2)] {
+        let cli = Cli::new(true, false, "good");
+        let mut raw = fs::read_to_string(&cli.config).unwrap();
+        raw.push_str("\n[[workflows.nodes]]\nid='synth'\nagent='agent'\nmodel='good'\nprompt_text='{{review}}'\ninputs=['review']\n");
+        fs::write(&cli.config, raw).unwrap();
+        caps(&cli, request, workflow, false);
+        let result = cli.command().output().unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(stderr.contains("budget refused"), "{stderr}");
+        assert!(!stderr.contains("InvalidStateTransition"), "{stderr}");
+        assert!(!stderr.contains("LimitExceeded"), "{stderr}");
+        assert_eq!(cli.prompts().len(), usize::from(request > 0));
+        let path = stderr
+            .lines()
+            .find_map(|s| s.strip_prefix("[workflow] completed output retained at "))
+            .unwrap();
+        let _cleanup = RetainedOutput(PathBuf::from(path));
+        let manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&fs::read(PathBuf::from(path).join("completed.json")).unwrap())
+                .unwrap();
+        if request > 0 {
+            assert_eq!(
+                fs::read(PathBuf::from(path).join(&manifest["review"])).unwrap(),
+                b"answer"
+            );
+        } else {
+            assert!(manifest.is_empty());
+        }
+        assert!(cli.rows().iter().all(|r| r.finalized));
+    }
+}
+
+#[test]
+fn governed_cli_overrun_succeeds_once_and_other_routes_refuse_before_prompt() {
+    let cli = Cli::new(true, false, "good");
+    // Establish coverage without a provider turn.
+    let store = SqliteStore::open_shared_history(&cli.store).unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(store.usage_summary_v1(&Default::default()))
+        .unwrap();
+    drop(store);
+    caps(&cli, 1, 1, true);
+    let result = cli.command().output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("governed turn completed above its token allowance")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        cli.rows()[0].usage.terminal.as_ref().unwrap().total_tokens,
+        15
+    );
+    assert_eq!(cli.prompts().len(), 1);
+    for route in ["serve", "mcp", "models"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+            .args([route, "--config"])
+            .arg(&cli.config)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("only local run-workflow supports caps"),
+            "{route}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(cli.prompts().len(), 1);
+    }
+}
+
+fn parallel_budget_fixture(cli: &Cli) -> PathBuf {
+    let adapter = cli.dir.path().join("fixture-acp");
+    let release = cli.dir.path().join("release-sibling");
+    let script = fs::read_to_string(&adapter).unwrap()
+        .replace(r#"*'"method":"initialize"'*)"#, r#"*'"method":"initialize"'*) if [ "$2" = refused ]; then while [ ! -s "$1" ]; do sleep 0.01; done; fi;"#)
+        .replace(r#"printf '%s\n' "$line" >> "$1""#, r#"printf '%s\n' "$line" >> "$1"; if [ "$2" = sibling ]; then while [ ! -e "$3" ]; do sleep 0.01; done; fi"#);
+    fs::write(&adapter, script).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    let raw = fs::read_to_string(&cli.config).unwrap().replace(
+        &format!("args = [{:?}]", cli.prompts),
+        &format!("args = [{:?}, 'sibling', {:?}]", cli.prompts, release),
+    );
+    fs::write(&cli.config, format!("{raw}\n[[agents]]\nid='other'\ncmd={adapter:?}\nargs=[{:?}, 'refused']\npre_authenticated=true\n[[workflows.nodes]]\nid='refused'\nagent='other'\nmodel='good'\nprompt_text='{{{{input}}}}'\ninputs=[]\n[[workflows.nodes]]\nid='synth'\nagent='agent'\nmodel='good'\nprompt_text='{{{{review}}}}{{{{refused}}}}'\ninputs=['review','refused']\n", cli.prompts)).unwrap();
+    release
+}
+
+fn release_after_refusal(cli: &Cli, release: PathBuf) -> std::process::Output {
+    use std::io::{BufRead, Read};
+    let emergency_release = release.clone();
+    let mut child = cli
+        .command()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = std::io::BufReader::new(stderr);
+        loop {
+            let start = bytes.len();
+            if reader.read_until(b'\n', &mut bytes).unwrap() == 0 {
+                break;
+            }
+            if bytes[start..].starts_with(b"[workflow] node refused failed") {
+                fs::write(&release, b"finish").unwrap();
+            }
+        }
+        bytes
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            fs::write(&emergency_release, b"timeout").unwrap();
+            fs::write(&cli.prompts, b"timeout").unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!(
+                "CLI budget drain did not finish: {}",
+                String::from_utf8_lossy(&reader.join().unwrap())
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    std::process::Output {
+        status,
+        stdout,
+        stderr: reader.join().unwrap(),
+    }
+}
+
+#[test]
+fn budget_then_preparation_store_failure_preserves_completed_bytes() {
+    let cli = Cli::new(true, false, "good");
+    // Bootstrap the real usage schema, then reject only the sibling's node preparation.
+    assert!(cli.command().output().unwrap().status.success());
+    fs::remove_file(&cli.prompts).unwrap();
+    let conn =
+        rusqlite::Connection::open(cli.store.with_extension("sqlite.usage-v1.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_secondary BEFORE INSERT ON usage_attempts_v1
+        WHEN json_extract(NEW.record_json, '$.attribution.node') = 'secondary'
+        AND json_extract(NEW.record_json, '$.attribution.attempt_kind') = 'node'
+        BEGIN SELECT RAISE(FAIL, 'secondary preparation'); END;",
+    )
+    .unwrap();
+    let release = cli.dir.path().join("release-secondary");
+    let adapter = cli.dir.path().join("fixture-acp");
+    let script = fs::read_to_string(&adapter).unwrap()
+        .replace(r#"*'"method":"initialize"'*)"#, r#"*'"method":"initialize"'*) if [ "$2" = refused ]; then while [ "$(wc -l < "$1")" -lt 2 ]; do sleep 0.01; done; fi;"#)
+        .replace(r#"printf '%s\n' "$line" >> "$1""#, r#"printf '%s\n' "$line" >> "$1"; if [ "$2" = secondary ]; then while [ ! -e "$3" ]; do sleep 0.01; done; fi"#)
+        .replace(r#""text":"answer""#, r#""text":"'"${4:-answer}"'""#);
+    fs::write(&adapter, script).unwrap();
+    text_file_busy::warm_up_script(&adapter);
+    let raw = fs::read_to_string(&cli.config).unwrap();
+    fs::write(
+        &cli.config,
+        format!(
+            "{raw}\n[[agents]]\nid='probe'\ncmd={adapter:?}\nargs=[{prompts:?}, 'secondary', {release:?}, 'PONG']\npre_authenticated=true\npreflight=true\n[[agents]]\nid='other'\ncmd={adapter:?}\nargs=[{prompts:?}, 'refused']\npre_authenticated=true\n[[workflows.nodes]]\nid='secondary'\nagent='probe'\nmodel='good'\nprompt_text='{{{{review}}}}'\ninputs=['review']\n[[workflows.nodes]]\nid='refused'\nagent='other'\nmodel='good'\nprompt_text='{{{{review}}}}'\ninputs=['review']\n[[workflows.nodes]]\nid='queued'\nagent='agent'\nmodel='good'\nprompt_text='{{{{secondary}}}}{{{{refused}}}}'\ninputs=['secondary','refused']\n",
+            prompts = cli.prompts
+        ),
+    )
+    .unwrap();
+    caps(&cli, 2, 2, false);
+    let result = release_after_refusal(&cli, release);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("[workflow] error:"))
+            .collect::<Vec<_>>(),
+        [
+            "[workflow] error: budget refused",
+            "[workflow] error: StoreFailure"
+        ],
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.lines().last(),
+        Some("Error: \"budget refused\""),
+        "{stderr}"
+    );
+    let path = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("[workflow] completed output retained at "))
+        .unwrap();
+    let _cleanup = RetainedOutput(PathBuf::from(path));
+    let manifest: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&fs::read(PathBuf::from(path).join("completed.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        fs::read(PathBuf::from(path).join(&manifest["review"])).unwrap(),
+        b"answer"
+    );
+    assert_eq!(cli.prompts().len(), 2, "queued node must never prompt");
+}
+
+#[tokio::test]
+async fn governed_policy_stops_finalize_real_history_and_only_budget_evidence_waives_trigger() {
+    use bridge_core::{execution_policy::*, workflow_history::*};
+    for policy in ["fail_fast", "fixed_grace"] {
+        for mode in ["zero", "sibling-success", "sibling-failure"] {
+            let parallel = mode != "zero";
+            let cli = Cli::new(true, false, "good");
+            let release = parallel.then(|| parallel_budget_fixture(&cli));
+            if mode == "sibling-failure" {
+                let adapter = cli.dir.path().join("fixture-acp");
+                let script = fs::read_to_string(&adapter).unwrap().replace(
+                    r#""result":{"stopReason":"end_turn","usage":{"totalTokens":15,"inputTokens":10,"outputTokens":5}}"#,
+                    r#""error":{"code":-32603,"message":"fixture sibling failed"}"#,
+                );
+                fs::write(&adapter, script).unwrap();
+                text_file_busy::warm_up_script(&adapter);
+            }
+            let raw = fs::read_to_string(&cli.config).unwrap().replace(
+                "id = \"flow\"",
+                &format!(
+                    "id = \"flow\"\nfan_out_policy='{policy}'{}",
+                    if policy == "fixed_grace" {
+                        "\nfixed_grace_ms=100"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            fs::write(&cli.config, raw).unwrap();
+            caps(&cli, u64::from(parallel), 5, false);
+            let result = release.map_or_else(
+                || cli.command().output().unwrap(),
+                |release| release_after_refusal(&cli, release),
+            );
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success());
+            assert!(stderr.contains("budget refused"), "{stderr}");
+            assert!(!stderr.contains("telemetry_unavailable"), "{stderr}");
+            assert_eq!(cli.prompts().len(), usize::from(parallel));
+            let (_, attempt) = locator(&result);
+            let attempt = AttemptId::parse(attempt).unwrap();
+            let history = SqliteStore::open_history_read_only(&cli.store).unwrap();
+            let record = history.attempt(&attempt).await.unwrap().unwrap();
+            let terminal = record.terminal.expect("drained attempt was left active");
+            assert_eq!(terminal.outcome, "failed");
+            assert!(terminal.telemetry_complete);
+            assert_eq!(
+                terminal.node_counts.failed,
+                if mode == "sibling-failure" { 2 } else { 1 }
+            );
+            let evidence = history
+                .structured_evidence_v2(&attempt)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(evidence.node_terminals.len(), if parallel { 3 } else { 1 });
+            assert!(evidence.policy_trigger_json.is_none());
+            // Replay the real evidence through both history writers; a fabricated ordinary
+            // failure or acceptance claim must not obtain the budget-stop exemption.
+            for mutation in 0..4 {
+                let memory = MemoryWorkflowHistoryStore::default();
+                let sqlite = SqliteStore::open_in_memory().unwrap();
+                for store in [&memory as &dyn WorkflowHistoryStore, &sqlite] {
+                    store.reserve_v2(&evidence.reservation).await.unwrap();
+                    for persisted in &evidence.node_terminals {
+                        let mut node =
+                            NodeTerminalV1::decode_canonical(persisted.terminal_json.as_bytes())
+                                .unwrap();
+                        if bridge_core::governance::is_budget_stop_terminal_v1(&node) {
+                            match mutation {
+                                0 => {}
+                                1 => {
+                                    node.cause = Some(NodeCauseV1::from_bridge_error(
+                                        &bridge_core::error::BridgeError::StoreFailure,
+                                    ))
+                                }
+                                2 => node.prompt_may_have_been_accepted = true,
+                                _ => node.cause.as_mut().unwrap().cause_truncated = true,
+                            }
+                        }
+                        store
+                            .commit_node_terminal_v2(
+                                &attempt,
+                                &persisted.node,
+                                &String::from_utf8(node.encode_canonical().unwrap()).unwrap(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        store.terminalize(&attempt, &terminal).await.is_ok(),
+                        mutation == 0
+                    );
+                }
+            }
+            let retained = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("[workflow] completed output retained at "))
+                .unwrap();
+            let _cleanup = RetainedOutput(PathBuf::from(retained));
+            let outputs: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                &fs::read(PathBuf::from(retained).join("completed.json")).unwrap(),
+            )
+            .unwrap();
+            if mode == "sibling-success" {
+                assert_eq!(
+                    fs::read(PathBuf::from(retained).join(&outputs["review"])).unwrap(),
+                    b"answer"
+                );
+            } else {
+                assert!(outputs.is_empty());
+            }
+        }
+    }
 }
