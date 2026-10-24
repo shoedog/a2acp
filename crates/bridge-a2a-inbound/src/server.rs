@@ -1886,6 +1886,25 @@ async fn stream_message(
         return durable_workflow_a2a_sse_response(&srv, &locator.task_id, id).await;
     }
 
+    let governed = srv.coordinator().has_budget_policy();
+    let mut history = None;
+    let preparation = if matches!(routed.target, RouteTarget::Fanout) {
+        srv.coordinator().refuse_governed_unsupported_route()
+    } else if governed && matches!(routed.target, RouteTarget::Local(_)) {
+        srv.coordinator()
+            .admit_direct_attempt(
+                stream_owner.clone(),
+                bridge_core::workflow_history::ExecutionSurface::Other,
+                "a2a_stream",
+                bridge_core::workflow_history::fingerprint_workload_shape(b"a2a_stream"),
+                false,
+            )
+            .await
+            .map(|handle| history = Some(handle))
+    } else {
+        Ok(())
+    };
+
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
@@ -1900,6 +1919,13 @@ async fn stream_message(
         .map(|c| c.as_str().to_string())
         .unwrap_or_else(|| task_id_str.clone());
 
+    if let Err(error) = preparation {
+        let _ = tx.send(Err(error)).await;
+        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+        return Sse::new(sse_event_stream(rx, task_id_str, context_id_str))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
     match routed.target {
         RouteTarget::Local(_) => {
             // Bind-before-spawn: resolve+configure+bind (or reuse a follow-up binding)
@@ -1921,10 +1947,15 @@ async fn stream_message(
             match dispatch {
                 Ok(dispatch) => {
                     let _ = srv.store.put(&routed.task, &dispatch.session).await;
-                    spawn_local_producer(&srv, routed, dispatch, diagnostic, tx)
+                    spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, history)
                 }
                 Err(e) => {
                     tokio::spawn(async move {
+                        if let Some(history) = history.as_mut() {
+                            let _ = history
+                                .finish("failed", "preparation_failed", true, "not_needed")
+                                .await;
+                        }
                         let _ = tx.send(Err(e.surfaced_error())).await;
                         let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
                     });
@@ -2847,6 +2878,7 @@ fn spawn_local_producer(
     dispatch: LocalDispatch,
     diagnostic: Arc<dyn DiagnosticObserver>,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
+    mut history: Option<bridge_coordinator::DirectAttemptHandle>,
 ) {
     let store = srv.store.clone();
     let policy = srv.policy().clone();
@@ -2896,6 +2928,17 @@ fn spawn_local_producer(
             Some(usage) => Translator::for_turn(backend.clone(), Some(usage)),
             None => Translator::new(), // Explicit compatibility path without installed accounting.
         };
+        if let Some(history) = history.as_mut() {
+            if let Err(error) = history.mark_prompt_dispatch().await {
+                let failure = translator.reject_preparation(error.into()).await;
+                let _ = history
+                    .finish("failed", "dispatch_barrier_failed", true, "not_needed")
+                    .await;
+                let _ = tx.send(Err(failure.surfaced_error())).await;
+                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                return;
+            }
+        }
         let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
@@ -2908,6 +2951,7 @@ fn spawn_local_producer(
             harvest_audit_store.clone(),
         );
         let mut errored = false;
+        let mut budget_refused = false;
         // Whether the translator already emitted its own terminal frame (a
         // user-cancelled turn ends with Update::Done{stop_reason:"cancelled"},
         // which the translator maps to a terminal Canceled event). If so we must
@@ -2955,6 +2999,11 @@ fn spawn_local_producer(
                 // cleanup; a merely pending backend still loses immediately to
                 // `tx.closed()`. The force-reset abort remains first because it
                 // must never poll a session that has already been released.
+                // Governed admission must never be polled for an already-gone client.
+                _ = tx.closed(), if history.is_some() => {
+                    disconnected = true;
+                    break;
+                }
                 maybe = events.next() => match maybe {
                     Some(ev) => ev,
                     None => break,
@@ -2985,6 +3034,7 @@ fn spawn_local_producer(
             }
             // Track whether the stream ended with an error.
             if let Err(error) = &ev {
+                budget_refused |= matches!(error.original, BridgeError::BudgetRefused { .. });
                 if let Some(warm) = warm.as_mut() {
                     // Arm expiry before the channel send below can await or be
                     // canceled by a disconnected receiver.
@@ -3037,6 +3087,24 @@ fn spawn_local_producer(
                 let _ = warm.complete().await;
             }
             return;
+        }
+        if let Some(history) = history.as_mut() {
+            let outcome = if errored {
+                "failed"
+            } else if translator_terminal {
+                "canceled"
+            } else {
+                "completed"
+            };
+            if let Err(error) = history
+                .finish(outcome, "stream_finished", errored, "unknown")
+                .await
+            {
+                errored = true;
+                if !budget_refused {
+                    let _ = tx.send(Err(error)).await;
+                }
+            }
         }
         // Append exactly one terminal frame after the inner stream ends, UNLESS
         // the translator already sent its own terminal (cancelled turn).
@@ -4076,6 +4144,12 @@ async fn unary_message(
         );
     }
 
+    if matches!(routed.target, RouteTarget::Fanout) {
+        if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
+
     let direct_history = if matches!(&routed.target, RouteTarget::Workflow(_)) {
         None
     } else {
@@ -4508,6 +4582,11 @@ async fn unary_message(
             // The ledger is the accepted-work authority. If it cannot publish
             // terminal truth, that failure wins over the transient backend cause.
             if let Err(terminal_error) = durable {
+                let mut original = e.surfaced_error();
+                if let BridgeError::BudgetRefused { refusal } = &mut original {
+                    refusal.persistence = Some(Box::new(terminal_error));
+                    return bridge_err_to_jsonrpc(id, &original);
+                }
                 return bridge_err_to_jsonrpc(id, &terminal_error);
             }
         }
@@ -5173,6 +5252,9 @@ async fn session_inject(
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
     }
+    if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
+        return bridge_err_to_jsonrpc(id, &error);
+    }
     let params = match InjectParams::from_a2a(&params) {
         Ok(p) => p,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
@@ -5270,6 +5352,9 @@ async fn session_compact(
 ) -> Response {
     if let Err(e) = authorize_headers(&srv, &headers) {
         return bridge_err_to_jsonrpc(id, &e);
+    }
+    if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
+        return bridge_err_to_jsonrpc(id, &error);
     }
     let sm = srv.session_manager().clone();
     let ctx = match context_id_arg(&params) {
@@ -13427,7 +13512,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
 
-        spawn_local_producer(&srv, routed, dispatch, diagnostic, tx);
+        spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, None);
         for _ in 0..100 {
             if backend.releases.load(Ordering::SeqCst) == 1 {
                 break;
@@ -13574,7 +13659,14 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
 
-        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        spawn_local_producer(
+            &srv,
+            routed,
+            dispatch,
+            direct_diagnostic_observer(),
+            tx,
+            None,
+        );
         wait_until(|| {
             observer.snapshot().iter().any(|event| {
                 matches!(
@@ -13718,7 +13810,14 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        spawn_local_producer(
+            &srv,
+            routed,
+            dispatch,
+            direct_diagnostic_observer(),
+            tx,
+            None,
+        );
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -13784,7 +13883,14 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        spawn_local_producer(
+            &srv,
+            routed,
+            dispatch,
+            direct_diagnostic_observer(),
+            tx,
+            None,
+        );
 
         wait_until(|| {
             matches!(
@@ -13879,7 +13985,14 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        spawn_local_producer(
+            &srv,
+            routed,
+            dispatch,
+            direct_diagnostic_observer(),
+            tx,
+            None,
+        );
 
         wait_until(|| {
             matches!(
@@ -14003,7 +14116,14 @@ mod tests {
         // Capacity=1: first tx.send succeeds, second blocks → dropping rx makes it fail.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        spawn_local_producer(
+            &srv,
+            routed,
+            dispatch,
+            direct_diagnostic_observer(),
+            tx,
+            None,
+        );
 
         // Wait for TurnStarted so the producer is running, then drop the receiver.
         wait_until(|| {

@@ -114,7 +114,10 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
             }
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
-        "inject" => match InjectParams::from_mcp_args(&args) {
+        "inject" => match coord
+            .refuse_governed_unsupported_route()
+            .and_then(|()| InjectParams::from_mcp_args(&args))
+        {
             Ok(p) => coord
                 .inject(p.into_request())
                 .await

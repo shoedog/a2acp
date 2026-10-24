@@ -4549,6 +4549,9 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             Ok(())
         })
     }
+    async fn ensure_usage_coverage_v1(&self) -> Result<(), BridgeError> {
+        self.with_usage_conn(|_| Ok(()))
+    }
     async fn usage_summary_v1(&self, query: &UsageQueryV1) -> Result<UsageSummaryV1, BridgeError> {
         self.with_usage_conn(|conn| {
             let coverage = conn
