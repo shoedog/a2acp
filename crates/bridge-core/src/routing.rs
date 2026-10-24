@@ -211,12 +211,12 @@ pub fn decide_fallback(
         FallbackPositionV1::Step(index) if index < chain.steps.len() => index + 1,
         FallbackPositionV1::Step(_) => return RoutingDecisionV1::PolicyViolation,
     };
-    let Some(step) = chain.steps.get(next) else {
-        return RoutingDecisionV1::Exhausted;
-    };
     if !chain.causes.contains(&cause) {
         return RoutingDecisionV1::OriginalFailure;
     }
+    let Some(step) = chain.steps.get(next) else {
+        return RoutingDecisionV1::Exhausted;
+    };
     if !evidence.permits_replay() {
         return RoutingDecisionV1::ReplayUnsafe;
     }
