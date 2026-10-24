@@ -23,10 +23,14 @@ impl AgentBackend for AccountingBackendV1 {
         &self,
         session: &SessionId,
         parts: Vec<Part>,
-        attempt: PreparedUsageAttemptV1,
+        mut attempt: PreparedUsageAttemptV1,
         observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
-        match attempt.admit().await? {
+        let admission = match attempt.take_permit() {
+            Some(permit) => BudgetAdmissionOutcomeV1::Admitted(permit),
+            None => attempt.admit().await?,
+        };
+        match admission {
             BudgetAdmissionOutcomeV1::Ungoverned => attempt.update(true, None, false).await?,
             BudgetAdmissionOutcomeV1::Admitted(permit) => {
                 // Consuming the single-use permit authorizes exactly this inner prompt.

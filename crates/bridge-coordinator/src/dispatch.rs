@@ -472,3 +472,11 @@ impl Drop for WarmCompletionGuard {
         }
     }
 }
+
+/// Governed apply transfers both single-use accounting and exact completion
+/// ownership together. R2 route adapters move these into LocalDispatch's seams.
+pub struct GovernedDispatch {
+    pub turn: crate::session_manager::WarmTurn,
+    pub usage: bridge_core::translator::PreparedAccountingTurnV1,
+    pub completion: WarmCompletionGuard,
+}

@@ -189,6 +189,15 @@ impl PreparedAccountingTurnV1 {
     pub fn attribution(&self) -> &crate::accounting::UsageAttributionV1 {
         &self.attribution
     }
+    pub async fn admit_direct(self) -> Result<Self, AccountingFailureV1> {
+        Ok(Self {
+            attempt: self.attempt.admit_direct().await?,
+            attribution: self.attribution,
+        })
+    }
+    pub fn is_admitted(&self) -> bool {
+        self.attempt.is_admitted()
+    }
     pub fn into_attempt(self) -> crate::accounting::PreparedUsageAttemptV1 {
         self.attempt
     }
@@ -199,7 +208,10 @@ impl PreparedAccountingTurnV1 {
         effort: &Option<String>,
         mode: &Option<String>,
     ) -> bool {
-        self.attribution.effective_model == *model
+        (!self.is_admitted()
+            || (self.attribution == *self.attempt.attribution()
+                && self.attribution.turn.as_deref() == Some(self.attempt.id())))
+            && self.attribution.effective_model == *model
             && self.attribution.effective_effort == *effort
             && self.attribution.effective_mode == *mode
     }
