@@ -462,6 +462,23 @@ pub enum DetachedTerminalCas {
 
 #[async_trait::async_trait]
 pub trait TaskStore: HarvestAuditStore + Send + Sync {
+    /// Sole governed dispatch authority. Unsupported stores fail closed.
+    async fn admit_usage_attempt_v1(
+        &self,
+        policy: Option<&crate::governance::BudgetPolicyV1>,
+        _attempt: &crate::ids::AttemptId,
+        _context: &crate::governance::BudgetContextV1,
+        _candidate: &crate::governance::BudgetCandidateV1,
+    ) -> crate::governance::BudgetAdmissionOutcomeV1 {
+        use crate::governance::*;
+        if policy.is_none() {
+            BudgetAdmissionOutcomeV1::Ungoverned
+        } else {
+            BudgetAdmissionOutcomeV1::Refused(BudgetRefusalV1::new(
+                BudgetRefusalReasonV1::UnsupportedRoute,
+            ))
+        }
+    }
     async fn start_usage_attempt_v1(&self, _row: &UsageAttemptV1) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
     }
