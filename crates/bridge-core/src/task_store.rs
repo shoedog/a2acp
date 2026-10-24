@@ -491,6 +491,11 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
     ) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
     }
+    /// Establish accounting coverage without reading or aggregating historical attempts.
+    /// Stores that support governed direct execution must opt in; defaults fail closed.
+    async fn ensure_usage_coverage_v1(&self) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
     async fn usage_summary_v1(&self, _query: &UsageQueryV1) -> Result<UsageSummaryV1, BridgeError> {
         Err(BridgeError::StoreFailure)
     }
