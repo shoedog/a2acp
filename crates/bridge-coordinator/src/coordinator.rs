@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use bridge_core::attestation::{
     append_attestation_contract_to_last_part, prefix_attestation_request_for_capability,
-    HarvestSanitizationMode,
+    HarvestSanitizationMode, PrefixAttestationCapability,
 };
 use bridge_core::domain::{AgentOverride, Effort, InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
@@ -15,11 +15,13 @@ use bridge_core::ids::{AgentId, BatchId, ContextId, SessionId, TaskId, WorkflowI
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
-    classify_failure, AgentRegistry, DiagnosticObserver, FailureClass, ObsEvent, Observer,
-    PolicyEngine, SessionStore, TurnContext, TurnOutcome, UsageFinalization,
+    classify_failure, AgentBackend, AgentRegistry, BackendObservers, BackendStream,
+    DiagnosticObserver, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore, TurnContext,
+    TurnOutcome, UsageFinalization,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
+use bridge_core::terminal_evidence::*;
 use bridge_core::translator::{AccountingFailureV1, Event, EventKind, TaskOutcome, Translator};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
@@ -47,6 +49,136 @@ fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
         bridge_core::diagnostics::InMemoryDiagnosticObserver::new(DIRECT_DIAGNOSTIC_CAPACITY)
             .expect("direct diagnostic capacity is nonzero"),
     )
+}
+
+// Provider telemetry can precede a prompt-open error. Such effects override
+// the rejection's acceptance assertion, even when no translated stream opened.
+struct ReplayActivity {
+    inner: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    effects: Arc<AtomicBool>,
+}
+impl bridge_core::attempt_activity::AttemptRecorder for ReplayActivity {
+    fn record(
+        &self,
+        phase: bridge_core::attempt_activity::AttemptPhase,
+        reason: bridge_core::attempt_activity::ActivityReason,
+        advance: u64,
+    ) -> Option<bridge_core::attempt_activity::AttemptActivity> {
+        use bridge_core::attempt_activity::ActivityReason::*;
+        if matches!(reason, MessageDelta | ThoughtDelta | ToolTransition) {
+            self.effects.store(true, Ordering::Relaxed);
+        }
+        self.inner.record(phase, reason, advance)
+    }
+    fn mark_overflowed(&self) {
+        self.inner.mark_overflowed();
+    }
+    fn tally(&self) -> Option<bridge_core::attempt_activity::ActivityTally> {
+        self.inner.tally()
+    }
+}
+
+// This view exists only inside one translator turn. Session lifecycle and cleanup
+// continue to use the original backend. Nothing before the provider poll is dispatch.
+type ProviderLeg = (
+    Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    Arc<dyn TerminalEvidenceSink>,
+);
+struct ProviderPollBackend {
+    inner: Arc<dyn AgentBackend>,
+    observed: Arc<AtomicBool>,
+    pending: std::sync::Mutex<Option<Box<dyn FnOnce() -> ProviderLeg + Send>>>,
+    leg: std::sync::OnceLock<ProviderLeg>,
+    evidence: Arc<dyn TerminalEvidenceSink>,
+    effects: Arc<AtomicBool>,
+}
+impl ProviderPollBackend {
+    fn observe(&self) {
+        if !self.observed.swap(true, Ordering::AcqRel) {
+            if let Some(register) = self.pending.lock().unwrap().take() {
+                let _ = self.leg.set(register());
+            }
+        }
+    }
+
+    fn evidence(&self) -> &dyn TerminalEvidenceSink {
+        self.leg
+            .get()
+            .map_or(self.evidence.as_ref(), |leg| leg.1.as_ref())
+    }
+}
+#[async_trait::async_trait]
+impl AgentBackend for ProviderPollBackend {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.observe();
+        self.inner.prompt(session, parts).await
+    }
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        mut observers: BackendObservers,
+    ) -> Result<BackendStream, BridgeError> {
+        self.observe();
+        if let Some((activity, sink)) = self.leg.get() {
+            // Preserve the source recorder when no multi-provider leg is armed.
+            observers.activity = Arc::new(ReplayActivity {
+                inner: activity.clone(),
+                effects: self.effects.clone(),
+            });
+            observers.terminal_evidence = sink.clone();
+        } else {
+            observers.terminal_evidence = self.evidence.clone();
+        }
+        self.inner
+            .prompt_with_observers(session, parts, observers)
+            .await
+    }
+    async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.inner.cancel(session).await
+    }
+    fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
+        self.inner.prefix_attestation_capability()
+    }
+}
+impl TerminalEvidenceSink for ProviderPollBackend {
+    fn declare_capability(&self, capability: EvidenceCapability) {
+        self.evidence().declare_capability(capability);
+    }
+    fn binding(&self) -> Option<TurnEvidenceBinding> {
+        self.evidence().binding()
+    }
+    fn accept(&self, envelope: TurnEvidenceEnvelope) -> EvidenceAcceptance {
+        self.evidence().accept(envelope)
+    }
+    fn reject(&self, disposition: EvidenceCompleteness) {
+        self.evidence().reject(disposition);
+    }
+    fn close(&self) {
+        self.evidence().close();
+    }
+    fn observation(&self) -> (EvidenceCompleteness, ProducerTerminal, FinalPresence, bool) {
+        self.evidence().observation()
+    }
+    fn capability(&self) -> EvidenceCapability {
+        self.evidence().capability()
+    }
+    fn record_child_liveness(&self, liveness: AcpChildLiveness) {
+        self.evidence().record_child_liveness(liveness);
+    }
+    fn child_liveness(&self) -> AcpChildLiveness {
+        self.evidence().child_liveness()
+    }
+    fn record_deliverable_final(&self) {
+        self.evidence().record_deliverable_final();
+    }
+    fn deliverable_final_present(&self) -> bool {
+        self.evidence().deliverable_final_present()
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -146,16 +278,22 @@ pub struct TaskStatusDto {
 
 pub struct DirectAttemptHandle {
     usage: Option<bridge_core::translator::PreparedAccountingTurnV1>,
-    barrier: bridge_core::workflow_history::DirectAttemptBarrier,
+    barrier: Arc<bridge_core::workflow_history::DirectAttemptBarrier>,
     pub identity: bridge_core::ids::AttemptIdentity,
     observer: Arc<dyn Observer>,
     workflow: &'static str,
     task_class: &'static str,
     surface: &'static str,
     finished: bool,
+    fallback_pending: bool,
 }
 
 impl DirectAttemptHandle {
+    fn barrier_mut(&mut self) -> &mut bridge_core::workflow_history::DirectAttemptBarrier {
+        Arc::get_mut(&mut self.barrier)
+            .expect("provider-poll callback released before barrier mutation")
+    }
+
     fn stop_observation(&mut self) {
         if self.finished {
             return;
@@ -174,7 +312,7 @@ impl DirectAttemptHandle {
         reason: bridge_core::attempt_activity::ActivityReason,
         advance: u64,
     ) {
-        self.barrier.record_activity(phase, reason, advance);
+        self.barrier_mut().record_activity(phase, reason, advance);
     }
 
     pub fn activity_recorder(&self) -> Arc<dyn bridge_core::attempt_activity::AttemptRecorder> {
@@ -242,7 +380,7 @@ impl DirectAttemptHandle {
     /// reached/valid/missing/invalid count; exact producer/final evidence
     /// projects only when exactly one leg was reached.
     pub fn begin_multi_provider_terminal(&mut self) {
-        self.barrier.begin_multi_provider_terminal();
+        self.barrier_mut().begin_multi_provider_terminal();
     }
 
     /// Mint one bounded evidence binding for a provider leg of a
@@ -282,11 +420,11 @@ impl DirectAttemptHandle {
         &mut self,
         liveness: bridge_core::terminal_evidence::AcpChildLiveness,
     ) {
-        self.barrier.seal_child_liveness(liveness);
+        self.barrier_mut().seal_child_liveness(liveness);
     }
 
     pub async fn mark_prompt_dispatch(&mut self) -> Result<(), BridgeError> {
-        match self.barrier.mark_prompt_dispatch().await {
+        match self.barrier_mut().mark_prompt_dispatch().await {
             Ok(()) => Ok(()),
             Err(error) => {
                 let reason = error.reason;
@@ -385,7 +523,7 @@ impl DirectAttemptHandle {
         telemetry_complete: bool,
     ) -> Result<bridge_core::workflow_history::AttemptTerminal, BridgeError> {
         match self
-            .barrier
+            .barrier_mut()
             .finish(
                 outcome,
                 reason,
@@ -527,13 +665,14 @@ pub async fn admit_direct_attempt_with_history(
     });
     Ok(DirectAttemptHandle {
         usage: None,
-        barrier,
+        barrier: Arc::new(barrier),
         identity,
         observer,
         workflow,
         task_class,
         surface: surface.as_str(),
         finished: false,
+        fallback_pending: false,
     })
 }
 
@@ -606,6 +745,8 @@ impl From<&TaskRecord> for TaskStatusDto {
 /// over it. Concrete struct (one impl, no trait).
 pub struct Coordinator {
     accounting: Option<bridge_core::accounting::AccountingV1>,
+    mcp_fallback: Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    fallback_entries: HashMap<AgentId, Arc<bridge_core::domain::AgentEntry>>,
     pub session_manager: Arc<crate::session_manager::SessionManager>,
     executor: Option<Arc<WorkflowExecutor>>,
     workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
@@ -665,6 +806,8 @@ impl Coordinator {
     ) -> Self {
         Self {
             accounting: None,
+            mcp_fallback: Vec::new(),
+            fallback_entries: HashMap::new(),
             session_manager,
             executor,
             workflows,
@@ -695,6 +838,58 @@ impl Coordinator {
     pub fn with_accounting(mut self, accounting: bridge_core::accounting::AccountingV1) -> Self {
         self.accounting = Some(accounting);
         self
+    }
+
+    /// Operator declarations only. Snapshot reads do not resolve or probe targets.
+    #[must_use]
+    pub fn with_mcp_fallback(
+        mut self,
+        chains: Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    ) -> Self {
+        for candidate in chains
+            .iter()
+            .flat_map(|c| std::iter::once(&c.source).chain(&c.steps))
+        {
+            if let Some(entry) = self.registry.entry_snapshot(&candidate.agent) {
+                self.fallback_entries.insert(candidate.agent.clone(), entry);
+            }
+        }
+        self.mcp_fallback = chains;
+        self
+    }
+
+    fn bind_fallback_candidate(
+        &self,
+        declared: &bridge_core::routing::FallbackCandidateV1,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<bridge_core::routing::FallbackCandidateV1> {
+        let frozen = self.fallback_entries.get(&declared.agent)?;
+        let current = self.registry.entry_snapshot(&declared.agent)?;
+        // Refuse authority drift since composition, without resolving the adapter.
+        if current.kind != frozen.kind
+            || current.cmd != frozen.cmd
+            || current.args != frozen.args
+            || current.sandbox != frozen.sandbox
+            || current.cwd != frozen.cwd
+            || current.session_cwd != frozen.session_cwd
+            || current.mcp != frozen.mcp
+            || current.mcp_delivery != frozen.mcp_delivery
+            || current.extensions != frozen.extensions
+            || current.base_url != frozen.base_url
+            || current.api_key_env != frozen.api_key_env
+            || current.model_provider != frozen.model_provider
+        {
+            return None;
+        }
+        let config = bridge_core::domain::effective_config(&current, Some(overrides));
+        let mut effective = declared.clone();
+        effective.model = config.model?;
+        effective.posture.mode = config.mode;
+        if let Some(cwd) = cwd {
+            effective.posture.session_cwd = cwd.as_str().to_string();
+        }
+        Some(effective)
     }
 
     pub async fn prepare_usage(
@@ -1084,7 +1279,7 @@ impl Coordinator {
             .settle(attempt.as_mut().and_then(|a| a.usage.take()))
             .await;
         if failure.persistence.is_none() {
-            if let Some(attempt) = attempt {
+            if let Some(attempt) = attempt.filter(|a| !a.fallback_pending) {
                 failure.persistence = attempt
                     .finish("failed", "pre_prompt_failure", true, "not_needed")
                     .await
@@ -1096,8 +1291,106 @@ impl Coordinator {
 
     async fn prompt_inner(
         &self,
-        p: OpParams,
+        mut p: OpParams,
         mut attempt: Option<DirectAttemptHandle>,
+    ) -> Result<TurnOutput, AccountingFailureV1> {
+        let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+        let agent = p
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.registry.default_id());
+        // Existing contexts may carry hidden conversation state. No migration grant.
+        let cold = p.context.is_none();
+        let mut routing = if cold && attempt.is_some() {
+            self.mcp_fallback
+                .iter()
+                .find(|c| c.source.agent == agent)
+                .and_then(|c| {
+                    self.bind_fallback_candidate(&c.source, &p.agent_override(), cwd.as_ref())
+                })
+                .and_then(|source| {
+                    bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(
+                        self.mcp_fallback.clone(),
+                        source,
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some(a) = attempt.as_mut() {
+            a.fallback_pending = routing.is_some();
+            if a.fallback_pending {
+                a.begin_multi_provider_terminal();
+            }
+        }
+        let mut result = self
+            .prompt_once(p.clone(), &mut attempt, Default::default())
+            .await;
+        loop {
+            let failure = match result {
+                Ok(output) => return Ok(output),
+                Err(failure) => failure,
+            };
+            let transition = routing.take().ok_or(failure.clone()).and_then(|run| {
+                run.transition(failure.clone(), false, |next| {
+                    let overrides = AgentOverride {
+                        model: Some(next.model.clone()),
+                        ..p.agent_override()
+                    };
+                    self.bind_fallback_candidate(next, &overrides, cwd.as_ref())
+                        .ok_or(BridgeError::ConfigMismatch {
+                            field: "fallback authority",
+                        })
+                })
+            });
+            let (run, candidate) = match transition {
+                Ok(next) => next,
+                Err(mut failure) => {
+                    if let Some(a) = attempt.as_mut().filter(|a| a.fallback_pending) {
+                        let persistence = a
+                            .finish("failed", "prompt_failed", true, failure.cleanup.as_str())
+                            .await
+                            .err();
+                        failure.persistence = failure.persistence.or(persistence);
+                    }
+                    return Err(failure);
+                }
+            };
+            p.agent = Some(candidate.agent);
+            p.model = Some(candidate.model);
+            p.context = Some(self.mint_context_id());
+            let observed = Arc::new(AtomicBool::new(false));
+            result = self
+                .prompt_once(p.clone(), &mut attempt, observed.clone())
+                .await;
+            // Preparation failures cannot replace the preceding provider failure.
+            // Accounting persistence still takes precedence at projection.
+            if let Err(setup) = &result {
+                if !observed.load(Ordering::Acquire) {
+                    let mut original = failure;
+                    original.persistence =
+                        setup.persistence.clone().or_else(|| match &setup.original {
+                            BridgeError::StoreFailure
+                            | BridgeError::DurableEvidenceUnavailable { .. } => {
+                                Some(setup.original.clone())
+                            }
+                            _ => original.persistence.clone(),
+                        });
+                    routing = None;
+                    result = Err(original);
+                }
+            }
+            if observed.load(Ordering::Acquire) {
+                routing = Some(run);
+            }
+        }
+    }
+
+    async fn prompt_once(
+        &self,
+        p: OpParams,
+        attempt: &mut Option<DirectAttemptHandle>,
+        observed: Arc<AtomicBool>,
     ) -> Result<TurnOutput, AccountingFailureV1> {
         let _deferred_cold_bindings = &self.bindings;
         let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
@@ -1116,7 +1409,8 @@ impl Coordinator {
                     "direct",
                     None,
                 )
-                .await?;
+                .await
+                .map_err(AccountingFailureV1::from)?;
         }
         let diagnostic = direct_diagnostic_observer();
         let turn = match self
@@ -1135,8 +1429,22 @@ impl Coordinator {
                 return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
-        self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
-            .await
+        let stateful = turn.seed.is_some() || !turn.injects.is_empty();
+        self.collect_turn_observed_with_attempt_and_turn_id(
+            ctx,
+            turn,
+            p.input,
+            diagnostic,
+            attempt.as_mut(),
+            (Self::new_turn_id(), observed),
+        )
+        .await
+        .map_err(|mut failure| {
+            if stateful {
+                failure.replay = Default::default();
+            }
+            failure
+        })
     }
 
     /// Continue an EXISTING warm context. Unlike `prompt`, this REUSES the context's stored fingerprint
@@ -1219,6 +1527,7 @@ impl Coordinator {
                 return Err(Self::settle_preparation_failure(attempt.as_mut(), error).await)
             }
         };
+        // Retained conversation state has no cross-provider equivalence proof.
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
     }
@@ -1301,15 +1610,15 @@ impl Coordinator {
         turn: crate::session_manager::WarmTurn,
         input: String,
         diagnostic: Arc<dyn DiagnosticObserver>,
-        attempt: Option<DirectAttemptHandle>,
+        mut attempt: Option<DirectAttemptHandle>,
     ) -> Result<TurnOutput, AccountingFailureV1> {
         self.collect_turn_observed_with_attempt_and_turn_id(
             ctx,
             turn,
             input,
             diagnostic,
-            attempt,
-            Self::new_turn_id(),
+            attempt.as_mut(),
+            (Self::new_turn_id(), Default::default()),
         )
         .await
     }
@@ -1320,8 +1629,11 @@ impl Coordinator {
         turn: crate::session_manager::WarmTurn,
         input: String,
         diagnostic: Arc<dyn DiagnosticObserver>,
-        mut attempt: Option<DirectAttemptHandle>,
-        turn_id: Result<bridge_core::ids::TurnId, BridgeError>,
+        mut attempt: Option<&mut DirectAttemptHandle>,
+        (turn_id, observed): (
+            Result<bridge_core::ids::TurnId, BridgeError>,
+            Arc<AtomicBool>,
+        ),
     ) -> Result<TurnOutput, AccountingFailureV1> {
         // The caller has already checked out this exact warm operation. Arm
         // completion before task/turn identity minting or any later fallible
@@ -1399,7 +1711,28 @@ impl Coordinator {
             )
             .await;
 
+        let mut pending_leg = None;
         let (activity_recorder, terminal_evidence) = match attempt.as_mut() {
+            Some(attempt) if attempt.fallback_pending => {
+                let capability = turn.backend.terminal_evidence_capability();
+                let (binding, usage) = bridge_core::translator::settle_usage_preparation_v1(
+                    attempt
+                        .multi_provider_leg_binding(
+                            turn.generation.get(),
+                            &turn.session,
+                            &obs_ctx.turn_id,
+                        )
+                        .map_err(Into::into),
+                    attempt.usage.take(),
+                )
+                .await?;
+                attempt.usage = usage;
+                pending_leg = Some((capability, binding));
+                (
+                    attempt.activity_recorder(),
+                    attempt.terminal_evidence_sink(),
+                )
+            }
             Some(attempt) => {
                 if let Err(error) = attempt.prepare_terminal_evidence(
                     turn.generation.get(),
@@ -1432,64 +1765,79 @@ impl Coordinator {
                     as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
             ),
         };
+        let replay_activity = Arc::new(ReplayActivity {
+            inner: activity_recorder,
+            effects: Arc::new(AtomicBool::new(false)),
+        });
+        let backend = Arc::new(ProviderPollBackend {
+            inner: turn.backend.clone(),
+            observed,
+            pending: std::sync::Mutex::new(None),
+            leg: std::sync::OnceLock::new(),
+            evidence: terminal_evidence,
+            effects: replay_activity.effects.clone(),
+        });
+        let terminal_evidence: Arc<dyn TerminalEvidenceSink> = backend.clone();
         let translator = match attempt.as_mut().and_then(|a| a.usage.take()) {
-            Some(usage) => Translator::for_turn(turn.backend.clone(), Some(usage)),
+            Some(usage) => Translator::for_turn(backend.clone(), Some(usage)),
             None => Translator::new(), // Explicit compatibility entry without installed accounting.
         };
         let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
             bridge_core::task_store::TaskStoreHarvestAuditStore::new(self.task_store.clone()),
         );
-        let mut events = translator.run_observed_with_attempt_telemetry(
-            turn.backend.as_ref(),
-            self.session_store.as_ref(),
-            self.policy.as_ref(),
-            &task,
-            &turn.session,
-            parts,
-            diagnostic,
-            obs_ctx.clone(),
-            harvest_audit_store,
-            activity_recorder,
-            terminal_evidence,
-        );
+        let mut events = None;
         let mut collected = Vec::new();
         // The backend records genuine provider message/thought deltas through the
         // attempt telemetry port. Translated Status and Artifact events are delivery
         // projections and cannot independently prove provider progress.
         let mut aborted = false;
-        let mut prompt_polled = false;
         loop {
             let ev = tokio::select! {
-                biased;
-                // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
-                // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
-                _ = turn.abort.cancelled() => {
-                    finish_guard.observe_exit(WarmCompletionExit::Canceled);
-                    aborted = true;
-                    break;
-                }
-                maybe = async {
-                    if !prompt_polled {
-                        if let Some(attempt) = attempt.as_mut() {
-                            attempt.mark_prompt_dispatch().await?;
-                        }
-                        // The async block continues in this same poll to
-                        // events.next(), so this state is never advanced by an
-                        // unpolled provider future.
-                        prompt_polled = true;
-                    }
-                    Ok::<_, BridgeError>(events.next().await)
-                } => match maybe {
-                    Ok(Some(ev)) => ev,
-                    Ok(None) => break,
-                    Err(error) => {
-                        let error = translator.reject_preparation(error.into()).await;
-                        finish_guard.observe_exit(WarmCompletionExit::Error(&error.original));
-                        collected.push(Err(error));
+                    biased;
+                    // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
+                    // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
+                    _ = turn.abort.cancelled() => {
+                        finish_guard.observe_exit(WarmCompletionExit::Canceled);
+                        aborted = true;
                         break;
                     }
-                },
-            };
+                    maybe = async {
+                        if events.is_none() {
+                            if let Some(attempt) = attempt.as_mut() {
+                                attempt.mark_prompt_dispatch().await.map_err(AccountingFailureV1::from)?;
+                                if let Some((capability, binding)) = pending_leg.take() {
+                                    let barrier = attempt.barrier.clone();
+                                    *backend.pending.lock().unwrap() = Some(Box::new(move || {
+                                        barrier.multi_provider_leg(capability, Some(binding))
+                                    }));
+                                }
+                            }
+                            events = Some(translator.run_observed_with_attempt_telemetry(
+                backend.as_ref(),
+                self.session_store.as_ref(),
+                self.policy.as_ref(),
+                &task,
+                &turn.session,
+                std::mem::take(&mut parts),
+                diagnostic.clone(),
+                obs_ctx.clone(),
+                harvest_audit_store.clone(),
+                replay_activity.clone(),
+                terminal_evidence.clone(),
+            ));
+                        }
+                        Ok::<_, AccountingFailureV1>(events.as_mut().unwrap().next().await)
+                    } => match maybe {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => break,
+                        Err(error) => {
+                            let error = translator.reject_preparation(error).await;
+                            finish_guard.observe_exit(WarmCompletionExit::Error(&error.original));
+                            collected.push(Err(error));
+                            break;
+                        }
+                    },
+                };
             if ttft.is_none() {
                 ttft = Some(started.elapsed());
             }
@@ -1523,11 +1871,12 @@ impl Coordinator {
         }
         // Sample only the exact bridge-owned ACP child before cleanup custody
         // moves. This observation never determines producer disposition.
-        if let Some(attempt) = attempt.as_mut() {
-            attempt.seal_child_liveness(turn.backend.bridge_owned_acp_child_liveness());
-        }
+        terminal_evidence.record_child_liveness(turn.backend.bridge_owned_acp_child_liveness());
         // Drop the translator stream BEFORE finishing (cancels the in-flight backend future on abort).
         drop(events);
+        // Release a callback left armed by an accounting refusal before mutating the barrier.
+        backend.pending.lock().unwrap().take();
+        drop(translator);
         if aborted {
             collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
         }
@@ -1538,6 +1887,8 @@ impl Coordinator {
         // Complete synchronously on the normal/error path. Cancellation before
         // or during this await drops the shared guard/claim and transfers cleanup
         // to the checked unobserved path.
+        // Expiry itself cancels the token; sample caller cancellation first.
+        let canceled = aborted || turn.abort.is_cancelled();
         let cleanup_result = finish_guard.complete().await;
         finish_guard.disarm();
         let cleanup_disposition = match &cleanup_result {
@@ -1558,18 +1909,24 @@ impl Coordinator {
                 usage: last_usage.as_ref(),
                 fin: UsageFinalization::TurnFinal,
             });
-            if let Some(attempt) = attempt.as_mut() {
-                if let Err(terminal_error) = attempt
+            let terminal_persistence = match attempt.as_mut().filter(|a| !a.fallback_pending) {
+                Some(attempt) => attempt
                     .finish("failed", "prompt_failed", true, cleanup_disposition)
                     .await
-                {
-                    tracing::warn!(error = ?terminal_error, "direct attempt finalization failed after prompt error");
-                }
+                    .err(),
+                None => None,
+            };
+            let mut failure = e.clone().with_checked_cleanup(cleanup_result);
+            if canceled || replay_activity.effects.load(Ordering::Relaxed) {
+                failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
             }
-            return Err(e.clone());
+            if let Some(error) = terminal_persistence {
+                failure.persistence = Some(error);
+            }
+            return Err(failure);
         }
         if let Err(error) = cleanup_result {
-            if let Some(attempt) = attempt.as_mut() {
+            if let Some(attempt) = attempt.as_mut().filter(|a| !a.fallback_pending) {
                 attempt
                     .finish("failed", "cleanup_failed", true, "failed")
                     .await?;
@@ -1614,15 +1971,42 @@ impl Coordinator {
             .unwrap_or(TurnOutcome::Success);
 
         if let Some(attempt) = attempt.as_mut() {
-            let (terminal_outcome, terminal_reason, degraded) = match outcome {
+            let (mut terminal_outcome, mut terminal_reason, mut degraded) = match outcome {
                 TurnOutcome::Success => ("completed", "completed", false),
                 TurnOutcome::Canceled => ("canceled", "canceled", true),
                 TurnOutcome::Failed(_) => ("failed", "prompt_failed", true),
             };
+            // Resolve this provider's contract before the attempt-wide count projection.
+            let leg_resolution = if attempt.fallback_pending
+                && terminal_evidence.capability()
+                    == bridge_core::terminal_evidence::EvidenceCapability::V1
+            {
+                use bridge_core::terminal_evidence::*;
+                terminal_evidence.close();
+                let (completeness, producer, final_presence, drained) =
+                    terminal_evidence.observation();
+                let resolved = resolve_terminal(TerminalObservation {
+                    capability: terminal_evidence.capability(),
+                    completeness,
+                    producer,
+                    final_presence,
+                    prompt_rpc: PromptRpcObservation::Resolved,
+                    ordered_notifications_drained: drained,
+                    deliverable_final_present: terminal_evidence.deliverable_final_present(),
+                    child_liveness: terminal_evidence.child_liveness(),
+                });
+                terminal_outcome = resolved.outcome.as_str();
+                terminal_reason = resolved.reason.as_str();
+                degraded |= terminal_outcome != "completed";
+                Some(resolved)
+            } else {
+                None
+            };
             let terminal = attempt
                 .finish_resolved(terminal_outcome, terminal_reason, degraded, "complete")
                 .await?;
-            stop_reason = terminal.terminal_reason;
+            stop_reason =
+                leg_resolution.map_or(terminal.terminal_reason, |r| r.reason.as_str().into());
             outcome = match terminal.outcome.as_str() {
                 "completed" => TurnOutcome::Success,
                 "canceled" => TurnOutcome::Canceled,
@@ -5096,7 +5480,7 @@ mod tests {
                 "hi".into(),
                 Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
                 None,
-                Err(BridgeError::IdentityUnavailable),
+                (Err(BridgeError::IdentityUnavailable), Default::default()),
             )
             .await;
         assert!(matches!(
