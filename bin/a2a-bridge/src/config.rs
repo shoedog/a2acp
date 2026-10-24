@@ -4982,18 +4982,24 @@ addr="127.0.0.1:8080"
         let build = ("build", "cargo build --locked", true);
         let bridge_test = (
             "test",
-            "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants",
+            "cargo nextest run --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants",
+            true,
+        );
+        // nextest does not run doctests, so the bridge examples keep them as a separate step.
+        let bridge_doctest = (
+            "doctest",
+            "cargo test --workspace --locked --doc --exclude bridge-container",
             true,
         );
         let slicing_test = ("test", "cargo test --locked --no-fail-fast", true);
         let cases = [
             (
                 include_str!("../../../examples/a2a-bridge.containerized.toml"),
-                vec![fmt, clippy, build, bridge_test],
+                vec![fmt, clippy, build, bridge_test, bridge_doctest],
             ),
             (
                 include_str!("../../../examples/a2a-bridge.containerized.podman.toml"),
-                vec![fmt, clippy, build, bridge_test],
+                vec![fmt, clippy, build, bridge_test, bridge_doctest],
             ),
             (
                 include_str!("../../../examples/a2a-bridge.slicing-implement.toml"),
