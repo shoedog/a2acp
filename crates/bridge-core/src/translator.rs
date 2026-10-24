@@ -228,6 +228,32 @@ impl From<BridgeError> for AccountingFailureV1 {
     }
 }
 impl AccountingFailureV1 {
+    // The same affirmative prompt-open determination used by workflow preflight.
+    // A returned stream never enters here, even if no output has been observed.
+    fn prompt_open_failure(original: BridgeError) -> Self {
+        let excluded = match &original {
+            BridgeError::AgentFailure { diagnostic } => !diagnostic.prompt_may_have_been_accepted(),
+            _ => false,
+        };
+        let mut failure = Self::from(original);
+        if excluded {
+            failure.replay.prompt_acceptance = crate::routing::ExclusionEvidenceV1::Excluded;
+            failure.replay.effects = crate::routing::ExclusionEvidenceV1::Excluded;
+        }
+        failure
+    }
+
+    /// Attach the checked cleanup result from this exact attempt. This cannot
+    /// upgrade unknown acceptance or effects, nor erase persistence failure.
+    pub fn with_checked_cleanup(
+        mut self,
+        cleanup: Result<crate::ports::BackendCleanupDispositionV1, BridgeError>,
+    ) -> Self {
+        self.cleanup = cleanup.unwrap_or(crate::ports::BackendCleanupDispositionV1::Unknown);
+        self.replay.cleanup_completed =
+            self.cleanup == crate::ports::BackendCleanupDispositionV1::Complete;
+        self
+    }
     pub async fn settle(mut self, attempt: Option<PreparedAccountingTurnV1>) -> Self {
         if let Some(attempt) = attempt {
             if let Err(error) = attempt.attempt.preparation_failed().await {
@@ -411,9 +437,11 @@ impl Translator {
                         Err(envelope.reject_preparation(BridgeError::ConfigMismatch { field: "accounting selection" }).await)?;
                         unreachable!();
                     }
-                    capture.backend.prompt_accounted_v1(session, parts, envelope.attempt, Some(observers)).await?
+                    capture.backend.prompt_accounted_v1(session, parts, envelope.attempt, Some(observers)).await
+                        .map_err(AccountingFailureV1::prompt_open_failure)?
                 }
-                None => backend.prompt_with_observers(session, parts, observers).await?,
+                None => backend.prompt_with_observers(session, parts, observers).await
+                    .map_err(AccountingFailureV1::prompt_open_failure)?,
             };
             // Accumulated text awaiting flush as a Status chunk.
             let mut acc = String::new();
@@ -722,6 +750,73 @@ mod tests {
 
     fn ids() -> (TaskId, SessionId) {
         (TaskId::parse("t").unwrap(), SessionId::parse("s").unwrap())
+    }
+
+    struct OpenFailure(BridgeError);
+    #[async_trait::async_trait]
+    impl AgentBackend for OpenFailure {
+        async fn prompt(&self, _: &SessionId, _: Vec<Part>) -> Result<BackendStream, BridgeError> {
+            Err(self.0.clone())
+        }
+        async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_evidence_requires_affirmative_open_rejection_and_checked_cleanup() {
+        use crate::ports::BackendCleanupDispositionV1 as Cleanup;
+        use crate::routing::ExclusionEvidenceV1::{Excluded, Unknown};
+        let (task, session) = ids();
+        let store = FakeStore::default();
+        for accepted in [false, true] {
+            let diagnostic = serde_json::from_value(serde_json::json!({
+                "schema_version": 1, "failed_phase": "prompt_start",
+                "class": "quota_exhausted", "disposition": "fatal",
+                "code": "upstream.quota_exhausted", "summary": "rejected", "causes": [],
+                "stderr_observed": false, "stderr_line_count": 0,
+                "prompt_may_have_been_accepted": accepted
+            }))
+            .unwrap();
+            let error = BridgeError::AgentFailure {
+                diagnostic: Box::new(diagnostic),
+            };
+            let backend = OpenFailure(error.clone());
+            let f = Translator::new()
+                .run(&backend, &store, &AutoApprove, &task, &session, vec![])
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(f.original, error);
+            assert!(!f.replay.cleanup_completed);
+            for cleanup in [
+                Ok(Cleanup::Complete),
+                Ok(Cleanup::Unknown),
+                Err(BridgeError::StoreFailure),
+            ] {
+                let checked = f.clone().with_checked_cleanup(cleanup.clone());
+                assert_eq!(
+                    checked.replay.prompt_acceptance,
+                    if accepted { Unknown } else { Excluded }
+                );
+                assert_eq!(checked.replay.effects, checked.replay.prompt_acceptance);
+                assert_eq!(
+                    checked.replay.cleanup_completed,
+                    cleanup == Ok(Cleanup::Complete)
+                );
+            }
+            // Even an empty opened stream followed by the same diagnostic cannot prove exclusion.
+            let backend = FakeBackend::new(vec![Err(error)]);
+            let f = Translator::new()
+                .run(&backend, &store, &AutoApprove, &task, &session, vec![])
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .with_checked_cleanup(Ok(Cleanup::Complete));
+            assert_eq!(f.replay.prompt_acceptance, Unknown);
+        }
     }
 
     #[tokio::test]

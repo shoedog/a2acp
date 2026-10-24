@@ -1926,6 +1926,12 @@ fn agent_posture(
     agent: &AgentEntryToml,
 ) -> Result<bridge_core::routing::CandidatePostureV1, ConfigError> {
     use bridge_core::routing::{CandidatePostureV1, McpPostureV1, SandboxPostureV1};
+    // These authorities have no normalized posture representation yet.
+    if !agent.extensions.is_empty() || !agent.skills.is_empty() {
+        return Err(ConfigError::Registry(
+            "fallback posture equivalence is unprovable for extensions or skills".into(),
+        ));
+    }
     let kind = match parse_kind(agent.kind.as_deref().unwrap_or("acp"))? {
         AgentKind::Acp => "acp",
         AgentKind::Api => "api",
@@ -3728,7 +3734,7 @@ steps = [{ agent = "third", model = "model-c" }]
                 evidence,
                 FallbackPositionV1::Step(0)
             ),
-            RoutingDecisionV1::Exhausted
+            RoutingDecisionV1::OriginalFailure
         );
         let overlap = separate.replace(
             "causes = [\"billing_failure\"]",
@@ -3780,6 +3786,20 @@ steps = [{ agent = "source", model = "model-a" }]
             .unwrap_err()
             .to_string()
             .contains("cycle"));
+    }
+
+    #[test]
+    fn provider_posture_refuses_unrepresented_authority() {
+        let mut config = RegistryConfig::parse(PROVIDER_CHAINS).unwrap();
+        config.agents[1]
+            .extensions
+            .insert("tools".into(), toml::Value::Boolean(true));
+        assert!(config.fallback_chains_v1().is_err());
+        config.agents[1].extensions.clear();
+        config.agents[1]
+            .skills
+            .push(skills::SkillDeclaration::default());
+        assert!(config.fallback_chains_v1().is_err());
     }
 
     #[test]
