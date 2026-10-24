@@ -368,6 +368,7 @@ pub(crate) fn admit(
                         reason,
                         scope: Some(scope),
                         metric: Some(metric),
+                        persistence: None,
                     }),
                 });
             }

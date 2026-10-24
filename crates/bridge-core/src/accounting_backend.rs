@@ -1,7 +1,7 @@
-//! The sole prompt-usage capture boundary. Intentionally not installed in production yet.
+//! The sole prompt-usage capture and budget admission boundary.
 use crate::{
-    accounting::PreparedUsageAttemptV1, attestation::*, domain::*, error::BridgeError, ids::*,
-    ports::*,
+    accounting::PreparedUsageAttemptV1, attestation::*, domain::*, error::BridgeError,
+    governance::BudgetAdmissionOutcomeV1, ids::*, ports::*,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -26,7 +26,20 @@ impl AgentBackend for AccountingBackendV1 {
         attempt: PreparedUsageAttemptV1,
         observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
-        attempt.update(true, None, false).await?;
+        match attempt.admit().await {
+            BudgetAdmissionOutcomeV1::Ungoverned => attempt.update(true, None, false).await?,
+            BudgetAdmissionOutcomeV1::Admitted(permit) => {
+                // Consuming the single-use permit authorizes exactly this inner prompt.
+                // Admission already committed dispatch intent atomically with liability.
+                let _reservation = permit.into_reservation();
+            }
+            BudgetAdmissionOutcomeV1::Refused(mut refusal) => {
+                refusal.persistence = attempt.preparation_failed().await.err().map(Box::new);
+                return Err(BridgeError::BudgetRefused {
+                    refusal: Box::new(refusal),
+                });
+            }
+        }
         let result = match observers {
             Some(observers) => {
                 self.inner

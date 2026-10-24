@@ -236,6 +236,8 @@ pub struct BudgetRefusalV1 {
     pub reason: BudgetRefusalReasonV1,
     pub scope: Option<BudgetScopeKeyV1>,
     pub metric: Option<BudgetMetricV1>,
+    /// Settlement failure is separate from the original refusal; public text stays static.
+    pub persistence: Option<Box<crate::error::BridgeError>>,
 }
 impl BudgetRefusalV1 {
     pub fn new(reason: BudgetRefusalReasonV1) -> Self {
@@ -243,6 +245,7 @@ impl BudgetRefusalV1 {
             reason,
             scope: None,
             metric: None,
+            persistence: None,
         }
     }
 }

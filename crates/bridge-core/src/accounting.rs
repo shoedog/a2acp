@@ -1,5 +1,7 @@
 //! Versioned actuals. Context occupancy and checkpoint projections are never charges.
-use crate::{error::BridgeError, orch::UsageSnapshot, task_store::TaskStore};
+use crate::{
+    error::BridgeError, governance::*, ids::*, orch::UsageSnapshot, task_store::TaskStore,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -216,12 +218,17 @@ pub struct AccountingV1 {
     pub store: Arc<dyn TaskStore>,
     pub billing: Option<Arc<dyn BillingIdentityProviderV1>>,
     pub clock: crate::task_store::PersistenceClock,
+    /// Operator-owned policy, independent of billing and metrics presentation.
+    pub budget_policy: Option<Arc<BudgetPolicyV1>>,
+    pub budget_context: Option<BudgetContextV1>,
 }
 impl AccountingV1 {
     pub fn new(store: Arc<dyn TaskStore>) -> Self {
         Self {
             store,
             billing: None,
+            budget_policy: None,
+            budget_context: None,
             clock: Arc::new(crate::task_store::system_wall_now_ms),
         }
     }
@@ -254,6 +261,14 @@ impl AccountingV1 {
         self.store.start_usage_attempt_v1(&row).await?;
         Ok(PreparedUsageAttemptV1 {
             accounting: self.clone(),
+            concrete: concrete_turn,
+            context: self
+                .budget_context
+                .clone()
+                .unwrap_or_else(|| BudgetContextV1 {
+                    request: BudgetRequestIdV1::Execution(owner.execution_id.clone()),
+                    workflow_run: None,
+                }),
             id: row.id,
             attribution: row.attribution,
         })
@@ -263,6 +278,8 @@ impl AccountingV1 {
 /// Dropping this handle or its stream deliberately leaves durable pending accounting.
 pub struct PreparedUsageAttemptV1 {
     accounting: AccountingV1,
+    concrete: AttemptId,
+    context: BudgetContextV1,
     id: String,
     attribution: UsageAttributionV1,
 }
@@ -272,6 +289,25 @@ impl PreparedUsageAttemptV1 {
     }
     pub fn id(&self) -> &str {
         &self.id
+    }
+    /// Called only by the capture boundary, immediately before the inner prompt.
+    pub(crate) async fn admit(&self) -> BudgetAdmissionOutcomeV1 {
+        // Legacy accounting permits empty attribution only when the store returns Ungoverned.
+        // This sentinel cannot match an empty persisted identity during governed admission.
+        let agent = AgentId::parse(&self.attribution.agent)
+            .unwrap_or_else(|_| AgentId::parse("legacy-unattributed").expect("static agent ID"));
+        self.accounting
+            .store
+            .admit_usage_attempt_v1(
+                self.accounting.budget_policy.as_deref(),
+                &self.concrete,
+                &self.context,
+                &BudgetCandidateV1 {
+                    agent,
+                    model: self.attribution.effective_model.clone(),
+                },
+            )
+            .await
     }
     pub async fn preparation_failed(self) -> Result<(), BridgeError> {
         self.update(false, None, true).await

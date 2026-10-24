@@ -688,13 +688,15 @@ async fn review_reload_between_admission_and_resolution_never_misattributes() {
             bridge_registry::registry::Registry::new(snapshot((*entry).clone()), spawn).unwrap(),
         );
         let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(10, None)).await;
         let run = WorkflowExecutor::new(registry.clone())
             .run_with_diagnostic_context(
                 single_graph(false),
                 "BRIEF".into(),
                 "reload".into(),
                 CancellationToken::new(),
-                context(&f, &owner),
+                WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+                    .with_accounting(invocation),
             )
             .collect::<Vec<_>>();
         let control = async {
@@ -717,6 +719,7 @@ async fn review_reload_between_admission_and_resolution_never_misattributes() {
             usize::from(drift == "unchanged"),
             "{drift}"
         );
+        assert_eq!(reservations(&f).len(), usize::from(drift == "unchanged"));
         let rows = f.rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].finalized);
@@ -934,5 +937,454 @@ async fn review_eof_retry_policy_and_pending_usage_match_legacy() {
                 assert_eq!(f.reopened(Some(&owner)).await.pending, 1);
             }
         }
+    }
+}
+
+use bridge_core::{accounting::AccountingV1, governance::*};
+
+fn budget(turns: u64, tokens: Option<u64>) -> Arc<BudgetPolicyV1> {
+    Arc::new(
+        BudgetPolicyV1::new(
+            [
+                BudgetSelectorV1::EachRequest,
+                BudgetSelectorV1::EachWorkflowRun,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| BudgetRuleV1 {
+                id: format!("rule-{i}"),
+                selector,
+                limits: BudgetLimitsV1 {
+                    turns: Some(turns),
+                    terminal_tokens: tokens,
+                },
+            })
+            .collect(),
+            tokens
+                .map(|_| TurnAllowanceV1 {
+                    target: BudgetCandidateV1 {
+                        agent: AgentId::parse("agent").unwrap(),
+                        model: Some("good".into()),
+                    },
+                    terminal_tokens: std::num::NonZeroU64::new(100).unwrap(),
+                })
+                .into_iter()
+                .collect(),
+        )
+        .unwrap(),
+    )
+}
+async fn governed(
+    f: &Fixture,
+    owner: &AttemptIdentity,
+    policy: Arc<BudgetPolicyV1>,
+) -> WorkflowAccountingInvocationV1 {
+    use bridge_core::workflow_history::*;
+    // A real initial ledger allocation proves owner coverage, independently of telemetry.
+    f.store
+        .reserve(&AttemptReservation {
+            identity: owner.clone(),
+            task_id: None,
+            workflow: "accounted".into(),
+            task_class: "test".into(),
+            surface: ExecutionSurface::Offline,
+            policy: "test".into(),
+            workload_fingerprint: "shape-test".into(),
+            started_ms: 1,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        })
+        .await
+        .unwrap();
+    let mut accounting = AccountingV1::new(f.store.clone()); // No billing or metrics.
+    accounting.budget_policy = Some(policy);
+    WorkflowAccountingInvocationV1::new(
+        accounting,
+        owner.clone(),
+        WorkflowId::parse("accounted").unwrap(),
+    )
+}
+fn reservations(f: &Fixture) -> Vec<serde_json::Value> {
+    let conn =
+        rusqlite::Connection::open(f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    let count: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if count == 0 {
+        return vec![];
+    }
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM governance_reservations_v1 ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect()
+}
+async fn prepared(
+    invocation: &WorkflowAccountingInvocationV1,
+) -> bridge_core::translator::PreparedAccountingTurnV1 {
+    invocation
+        .select(
+            &bridge_core::ids::NodeId::parse("draft").unwrap(),
+            &AgentId::parse("agent").unwrap(),
+            "node",
+            &bridge_core::domain::EffectiveConfig {
+                model: Some("good".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .prepare()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn budget_boundary_exhaustion_and_undispatched_settlement_failure() {
+    for (cap, fault) in [(0, false), (1, false), (0, true)] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(cap, None)).await;
+        let turn = prepared(&invocation).await;
+        if fault {
+            refuse(&f, "UPDATE");
+        }
+        let backend = Arc::new(WorkflowRecording::default());
+        let result = workflow_support::dispatch(
+            backend.clone(),
+            turn,
+            &SessionId::parse("budget").unwrap(),
+            vec![],
+        )
+        .await;
+        assert_eq!(backend.prompts.lock().unwrap().len(), cap as usize);
+        assert_eq!(reservations(&f).len(), cap as usize);
+        if cap == 0 {
+            let BridgeError::BudgetRefused { refusal } = result.unwrap_err() else {
+                panic!("expected refusal")
+            };
+            assert_eq!(refusal.reason, BudgetRefusalReasonV1::LimitExceeded);
+            assert_eq!(
+                refusal.persistence.as_deref(),
+                fault.then_some(&BridgeError::StoreFailure)
+            );
+            assert!(!f.rows()[0].dispatched);
+            assert_eq!(f.rows()[0].finalized, !fault);
+        } else {
+            assert!(result.is_ok());
+            assert!(f.rows()[0].finalized && f.rows()[0].dispatched);
+            let second = prepared(&invocation).await;
+            assert!(workflow_support::dispatch(
+                backend.clone(),
+                second,
+                &SessionId::parse("second").unwrap(),
+                vec![]
+            )
+            .await
+            .is_err());
+            assert_eq!(backend.prompts.lock().unwrap().len(), 1);
+            assert_eq!(reservations(&f).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn governed_preflight_retry_and_cache_keep_one_reservation_per_actual_prompt() {
+    for retry in [false, true] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(10, None)).await;
+        let backend = Arc::new(Backend::default());
+        backend.retry_once.store(retry, Ordering::SeqCst);
+        let events = WorkflowExecutor::new(registry(backend.clone(), true, false))
+            .run_with_diagnostic_context(
+                if retry { single_graph(true) } else { graph() },
+                "BRIEF".into(),
+                "governed".into(),
+                CancellationToken::new(),
+                WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+                    .with_accounting(invocation),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert_eq!(backend.preflight.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.recording.prompts.lock().unwrap().len(), 3);
+        let saved = reservations(&f);
+        assert_eq!(saved.len(), 3);
+        assert_eq!(f.rows().len(), 4); // Rejected model gets no reservation; cache hit adds none.
+        for r in saved {
+            let r = &r["reservation"];
+            assert_eq!(
+                r["context"]["request"]["Execution"],
+                owner.execution_id.as_str()
+            );
+            assert_eq!(r["context"]["workflow_run"], owner.execution_id.as_str());
+            assert_eq!(r["candidate"]["model"], "good");
+            assert_eq!(r["scopes"].as_array().unwrap().len(), 2);
+            assert_eq!(r["turns"], 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn governed_preparation_and_completed_replay_never_reserve() {
+    for mode in ["configure", "resolve", "replay"] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(0, None)).await;
+        let backend = Arc::new(Backend::default());
+        if mode == "configure" {
+            *backend.recording.reject_config.lock().unwrap() = Some(BridgeError::ModelNotAvailable);
+        }
+        let ctx = WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+            .with_accounting(invocation);
+        let executor = WorkflowExecutor::new(registry(backend.clone(), false, mode == "resolve"));
+        let seeds = if mode == "replay" {
+            [("draft".into(), ("cached".into(), true, None))]
+                .into_iter()
+                .collect()
+        } else {
+            Default::default()
+        };
+        let events = executor
+            .run_from_with_diagnostic_context(
+                single_graph(false),
+                "BRIEF".into(),
+                "prep".into(),
+                CancellationToken::new(),
+                seeds,
+                ctx,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert!(backend.recording.prompts.lock().unwrap().is_empty());
+        if mode == "replay" {
+            assert!(!f.dir.path().join("tasks.sqlite.usage-v1.sqlite").exists());
+            continue;
+        }
+        assert!(reservations(&f).is_empty());
+        assert_eq!(f.rows().len(), usize::from(mode != "replay"));
+        assert!(f.rows().iter().all(|r| r.finalized && !r.dispatched));
+    }
+}
+
+#[tokio::test]
+async fn governed_interruption_retains_liability_and_omitted_policy_cannot_bypass() {
+    use bridge_core::accounting_backend::AccountingBackendV1;
+    for mode in ["error", "eof", "drop", "cancel"] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(10, Some(100))).await;
+        let turn = prepared(&invocation).await;
+        let backend = Arc::new(Backend::default());
+        backend.retry_once.store(mode == "error", Ordering::SeqCst);
+        backend.eof_once.store(mode == "eof", Ordering::SeqCst);
+        let captured = AccountingBackendV1::new(backend.clone());
+        let session = SessionId::parse("pending").unwrap();
+        let result = captured
+            .prompt_accounted_v1(&session, vec![], turn.into_attempt(), None)
+            .await;
+        if mode == "error" {
+            assert!(result.is_err());
+        } else {
+            let mut stream = result.unwrap();
+            if mode == "eof" {
+                assert!(stream.collect::<Vec<_>>().await.last().unwrap().is_err());
+            } else {
+                if mode == "cancel" {
+                    assert!(stream.next().await.unwrap().is_ok());
+                    captured.cancel(&session).await.unwrap();
+                }
+                drop(stream);
+            }
+        }
+        assert_eq!(backend.recording.prompts.lock().unwrap().len(), 1);
+        assert!(f.rows()[0].dispatched && !f.rows()[0].finalized);
+        assert_eq!(reservations(&f)[0]["liability"]["Pending"], 100);
+        let second = prepared(&invocation).await;
+        assert!(captured
+            .prompt_accounted_v1(&session, vec![], second.into_attempt(), None)
+            .await
+            .is_err());
+        let ungoverned = WorkflowAccountingInvocationV1::new(
+            AccountingV1::new(f.store.clone()),
+            owner.clone(),
+            WorkflowId::parse("accounted").unwrap(),
+        );
+        let omitted = prepared(&ungoverned).await;
+        let error = captured
+            .prompt_accounted_v1(&session, vec![], omitted.into_attempt(), None)
+            .await
+            .err()
+            .unwrap();
+        let BridgeError::BudgetRefused { refusal } = error else {
+            panic!("expected refusal")
+        };
+        assert_eq!(refusal.reason, BudgetRefusalReasonV1::PolicyMismatch);
+        assert_eq!(backend.recording.prompts.lock().unwrap().len(), 1);
+        assert_eq!(reservations(&f).len(), 1);
+        let reopened = f.reopened(Some(&owner)).await;
+        assert_eq!(
+            (reopened.attempted, reopened.dispatched, reopened.pending),
+            (3, 1, 1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn allowance_overrun_preserves_output_and_final_actuals() {
+    use bridge_core::accounting_backend::AccountingBackendV1;
+    let f = Fixture::new();
+    let owner = AttemptIdentity::initial().unwrap();
+    let mut policy = (*budget(10, Some(100))).clone();
+    policy = BudgetPolicyV1::new(
+        policy.rules().to_vec(),
+        vec![TurnAllowanceV1 {
+            target: policy.allowances()[0].target.clone(),
+            terminal_tokens: std::num::NonZeroU64::new(1).unwrap(),
+        }],
+    )
+    .unwrap();
+    let invocation = governed(&f, &owner, Arc::new(policy)).await;
+    let backend = Arc::new(WorkflowRecording::default());
+    let output = workflow_support::dispatch(
+        backend.clone(),
+        prepared(&invocation).await,
+        &SessionId::parse("overrun").unwrap(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(output
+        .iter()
+        .any(|u| matches!(u, Update::Text(t) if t == "answer")));
+    assert!(f.rows()[0].finalized);
+    assert_eq!(reservations(&f)[0]["liability"]["Known"], 15);
+    assert_eq!(backend.prompts.lock().unwrap().len(), 1);
+    // Exact selector binding: the prepared model has no allowance for this candidate.
+    let turn = invocation
+        .select(
+            &bridge_core::ids::NodeId::parse("draft").unwrap(),
+            &AgentId::parse("agent").unwrap(),
+            "node",
+            &Default::default(),
+        )
+        .unwrap()
+        .prepare()
+        .await
+        .unwrap();
+    let error = AccountingBackendV1::new(backend.clone())
+        .prompt_accounted_v1(
+            &SessionId::parse("absent").unwrap(),
+            vec![],
+            turn.into_attempt(),
+            None,
+        )
+        .await
+        .err()
+        .unwrap();
+    let BridgeError::BudgetRefused { refusal } = error else {
+        panic!("expected refusal")
+    };
+    assert_eq!(refusal.reason, BudgetRefusalReasonV1::MissingAllowance);
+    assert_eq!(backend.prompts.lock().unwrap().len(), 1);
+    assert_eq!(reservations(&f).len(), 1);
+}
+
+#[tokio::test]
+async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() {
+    let f = Fixture::new();
+    let owner = AttemptIdentity::initial().unwrap();
+    let accounting = AccountingV1 {
+        clock: Arc::new(|| 123),
+        ..AccountingV1::new(f.store.clone())
+    };
+    let turn = accounting
+        .start(
+            &owner,
+            bridge_core::ids::AttemptId::mint().unwrap(),
+            bridge_core::accounting::UsageAttributionV1 {
+                agent: String::new(), // Legacy rows may lack attribution.
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut expected = f.rows()[0].clone();
+    let backend = Arc::new(WorkflowRecording::default());
+    let output = bridge_core::accounting_backend::AccountingBackendV1::new(backend.clone())
+        .prompt_accounted_v1(&SessionId::parse("uncapped").unwrap(), vec![], turn, None)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(output.iter().all(Result::is_ok));
+    expected.dispatched = true;
+    expected.finalized = true;
+    expected.observe(support::usage());
+    assert_eq!(
+        serde_json::to_vec(&f.rows()[0]).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(backend.prompts.lock().unwrap().len(), 1);
+    let conn =
+        rusqlite::Connection::open(f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    let tables: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0);
+}
+
+#[tokio::test]
+async fn governed_invalid_identity_never_prompts_or_reserves() {
+    for agent in ["agent", ""] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let accounting = AccountingV1 {
+            budget_policy: Some(budget(1, None)),
+            budget_context: Some(BudgetContextV1 {
+                request: BudgetRequestIdV1::Execution(
+                    AttemptIdentity::initial().unwrap().execution_id,
+                ),
+                workflow_run: None,
+            }),
+            ..AccountingV1::new(f.store.clone())
+        };
+        let turn = accounting
+            .start(
+                &owner,
+                bridge_core::ids::AttemptId::mint().unwrap(),
+                bridge_core::accounting::UsageAttributionV1 {
+                    agent: agent.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let backend = Arc::new(WorkflowRecording::default());
+        let error = bridge_core::accounting_backend::AccountingBackendV1::new(backend.clone())
+            .prompt_accounted_v1(&SessionId::parse("identity").unwrap(), vec![], turn, None)
+            .await
+            .err()
+            .unwrap();
+        let BridgeError::BudgetRefused { refusal } = error else {
+            panic!("expected refusal")
+        };
+        assert_eq!(refusal.reason, BudgetRefusalReasonV1::IdentityMismatch);
+        assert!(backend.prompts.lock().unwrap().is_empty());
+        assert!(reservations(&f).is_empty());
+        assert!(f.rows()[0].finalized && !f.rows()[0].dispatched);
     }
 }
