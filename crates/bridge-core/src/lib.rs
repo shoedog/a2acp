@@ -50,6 +50,7 @@ pub mod domain;
 pub mod error;
 pub mod execution_policy;
 pub mod failure_wire;
+pub mod fallback_runtime;
 pub mod fixed_grace_timer;
 pub mod fs_custody;
 pub mod governance;
