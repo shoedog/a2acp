@@ -1498,6 +1498,7 @@ fn turn_log_observer_enabled(
 /// policy / batch plus the interactive-permission registry.
 #[allow(clippy::too_many_arguments)]
 fn build_coordinator(
+    mcp_fallback: Vec<bridge_core::routing::FrozenFallbackChainV1>,
     billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
     session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
     executor: Arc<bridge_workflow::executor::WorkflowExecutor>,
@@ -1543,6 +1544,7 @@ fn build_coordinator(
             resume_cap,
         )
         .with_accounting(accounting)
+        .with_mcp_fallback(mcp_fallback)
         .with_trace_refs_config(trace_refs_enabled, max_task_turns)
         .with_workflow_history(workflow_history)
         .with_workflow_admission(workflow_admission)
@@ -9615,6 +9617,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     )?;
 
     let coordinator = build_coordinator(
+        cfg.fallback_chains_v1()?,
         cfg.billing_provider_v1()?,
         session_manager,
         executor,
@@ -11451,6 +11454,7 @@ async fn main() -> Result<(), BoxError> {
         &[],
     )?;
     let coordinator = build_coordinator(
+        Vec::new(), // Served paths remain inactive until C2b3.
         billing,
         session_manager,
         executor,
