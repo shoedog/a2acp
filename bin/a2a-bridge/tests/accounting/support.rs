@@ -11,6 +11,12 @@ use std::time::Duration;
 #[derive(Default)]
 pub struct Recording {
     pub prompts: Mutex<Vec<SessionId>>,
+    pub effects: Mutex<Vec<&'static str>>,
+    pub configs: Mutex<Vec<SessionSpec>>,
+    pub prompt_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pub reconcile_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pub before_turn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub prompt_error: Mutex<Option<BridgeError>>,
     pub fail_config: AtomicBool,
     pub fail_prompt: AtomicBool,
     pub config_error: Mutex<Option<BridgeError>>,
@@ -48,7 +54,15 @@ impl AgentBackend for Recording {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        self.effects.lock().unwrap().push("prompt");
         self.prompts.lock().unwrap().push(session.clone());
+        let gate = self.prompt_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        if let Some(error) = self.prompt_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         if self.fail_prompt.load(Ordering::SeqCst) {
             return Err(BridgeError::AgentTimedOut);
         }
@@ -73,7 +87,13 @@ impl AgentBackend for Recording {
             stopped: self.stopped.clone(),
         }))
     }
-    async fn configure_session(&self, _: &SessionId, _: &SessionSpec) -> Result<(), BridgeError> {
+    async fn configure_session(
+        &self,
+        _: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<(), BridgeError> {
+        self.effects.lock().unwrap().push("configure");
+        self.configs.lock().unwrap().push(spec.clone());
         let hook = self.before_config.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
@@ -87,17 +107,30 @@ impl AgentBackend for Recording {
             Ok(())
         }
     }
+    async fn configure_turn(&self, _: &SessionId, _: bridge_core::permission::TurnMeta) {
+        if let Some(hook) = self.before_turn.lock().unwrap().take() {
+            hook();
+        }
+    }
     async fn release_session(&self, session: &SessionId) {
+        self.effects.lock().unwrap().push("release");
         self.releases.lock().unwrap().push(session.clone());
     }
     async fn reconcile_config(
         &self,
         _: &SessionId,
-        _: &SessionSpec,
+        spec: &SessionSpec,
     ) -> Result<bridge_core::orch::ReconcileOutcome, BridgeError> {
+        self.effects.lock().unwrap().push("reconcile");
+        self.configs.lock().unwrap().push(spec.clone());
+        let gate = self.reconcile_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         Ok(bridge_core::orch::ReconcileOutcome::Applied)
     }
     async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+        self.effects.lock().unwrap().push("cancel");
         Ok(())
     }
 }

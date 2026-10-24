@@ -23,7 +23,7 @@ use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskSt
 use bridge_core::translator::{AccountingFailureV1, Event, EventKind, TaskOutcome, Translator};
 use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
 use bridge_workflow::graph::WorkflowGraph;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -694,6 +694,13 @@ impl Coordinator {
 
     #[must_use]
     pub fn with_accounting(mut self, accounting: bridge_core::accounting::AccountingV1) -> Self {
+        if accounting.budget_policy.is_some() {
+            assert_eq!(
+                self.session_manager.has_live_contexts().now_or_never(),
+                Some(false),
+                "cannot attach a budget policy to a non-empty or locked session manager"
+            );
+        }
         self.accounting = Some(accounting);
         self
     }
@@ -1146,6 +1153,19 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
+        if self.has_budget_policy() {
+            let claim = self
+                .session_manager
+                .claim_turn_observed(
+                    &ctx,
+                    agent,
+                    Some(p.agent_override()),
+                    cwd,
+                    direct_diagnostic_observer(),
+                )
+                .await;
+            return self.collect_governed(ctx, p.input, attempt, claim).await;
+        }
         if let Some(attempt) = attempt.as_mut() {
             attempt.usage = self
                 .prepare_usage(
@@ -1211,6 +1231,9 @@ impl Coordinator {
         p: OpParams,
         identity: bridge_core::ids::AttemptIdentity,
     ) -> Result<TurnOutput, AccountingFailureV1> {
+        if self.has_budget_policy() && p.context.is_none() {
+            return Err(BridgeError::SessionNotFound.into());
+        }
         if p.context.is_none() {
             return Err(BridgeError::InvalidRequest { field: "context" }.into());
         }
@@ -1239,6 +1262,10 @@ impl Coordinator {
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
+        if self.has_budget_policy() {
+            let claim = self.session_manager.claim_existing_turn(&ctx).await;
+            return self.collect_governed(ctx, p.input, attempt, claim).await;
+        }
         let diagnostic = direct_diagnostic_observer();
         if let Some(attempt) = attempt.as_mut() {
             let unknown = AgentId::parse("unknown")?;
@@ -1261,6 +1288,106 @@ impl Coordinator {
         };
         self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
+    }
+
+    pub fn direct_preparation_failure(mut failure: AccountingFailureV1) -> AccountingFailureV1 {
+        if let BridgeError::BudgetRefused { refusal } = &mut failure.original {
+            if failure.persistence.is_some() {
+                refusal.persistence = failure.persistence.take().map(Box::new);
+            }
+        }
+        failure
+    }
+
+    pub async fn prepare_direct_claim(
+        &self,
+        claim: crate::session_manager::GovernedTurnClaim,
+        owner: bridge_core::ids::AttemptIdentity,
+    ) -> Result<
+        (
+            crate::session_manager::GovernedTurnClaim,
+            bridge_core::translator::PreparedAccountingTurnV1,
+        ),
+        AccountingFailureV1,
+    > {
+        let (agent, config) = claim.selection();
+        match self
+            .prepare_usage_selection(
+                owner,
+                agent.as_str().into(),
+                Some(config.clone()),
+                "direct",
+                None,
+            )
+            .await
+        {
+            Ok(Some(usage)) => Ok((claim, usage)),
+            result => {
+                claim.rollback().await?;
+                Err(result
+                    .err()
+                    .unwrap_or(BridgeError::InvalidStateTransition)
+                    .into())
+            }
+        }
+    }
+
+    async fn collect_governed(
+        &self,
+        ctx: ContextId,
+        input: String,
+        mut attempt: Option<DirectAttemptHandle>,
+        claim: Result<crate::session_manager::GovernedTurnClaim, BridgeError>,
+    ) -> Result<TurnOutput, AccountingFailureV1> {
+        let prepared = async {
+            let owner = attempt
+                .as_ref()
+                .ok_or(BridgeError::InvalidRequest {
+                    field: "attempt identity",
+                })?
+                .identity
+                .clone();
+            let (claim, usage) = self.prepare_direct_claim(claim?, owner).await?;
+            let (claim, usage) = claim.admit(usage).await?;
+            claim.apply(usage).await
+        }
+        .await;
+        let dispatch = match prepared {
+            Ok(dispatch) => dispatch,
+            Err(failure) => {
+                let failure = Self::direct_preparation_failure(failure);
+                if let Some(attempt) = attempt.as_mut() {
+                    let outcome = if failure.preparation_exit
+                        == bridge_core::translator::AccountingPreparationExitV1::Canceled
+                    {
+                        "canceled"
+                    } else {
+                        "failed"
+                    };
+                    let persistence = attempt
+                        .finish(outcome, "pre_prompt_failure", true, "not_needed")
+                        .await
+                        .err();
+                    if let Some(error) = persistence {
+                        tracing::warn!(?error, "direct attempt finalization failed before prompt");
+                    }
+                }
+                return Err(failure);
+            }
+        };
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.usage = Some(dispatch.usage);
+        }
+        self.collect_turn_observed_with_attempt_and_turn_id(
+            ctx,
+            dispatch.turn,
+            input,
+            direct_diagnostic_observer(),
+            attempt,
+            Self::new_turn_id(),
+            Some(dispatch.completion),
+        )
+        .await
     }
 
     pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
@@ -1350,10 +1477,12 @@ impl Coordinator {
             diagnostic,
             attempt,
             Self::new_turn_id(),
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn collect_turn_observed_with_attempt_and_turn_id(
         &self,
         ctx: ContextId,
@@ -1362,18 +1491,21 @@ impl Coordinator {
         diagnostic: Arc<dyn DiagnosticObserver>,
         mut attempt: Option<DirectAttemptHandle>,
         turn_id: Result<bridge_core::ids::TurnId, BridgeError>,
+        completion: Option<WarmCompletionGuard>,
     ) -> Result<TurnOutput, AccountingFailureV1> {
         // The caller has already checked out this exact warm operation. Arm
         // completion before task/turn identity minting or any later fallible
         // setup so an early return cannot strand the handle in Running.
-        let completion = WarmCompletionGuard::finish_owner(
-            self.session_manager.clone(),
-            ctx.clone(),
-            turn.generation,
-            turn.op.clone(),
-            turn.expiry_intent.clone(),
-            diagnostic.clone(),
-        );
+        let completion = completion.unwrap_or_else(|| {
+            WarmCompletionGuard::finish_owner(
+                self.session_manager.clone(),
+                ctx.clone(),
+                turn.generation,
+                turn.op.clone(),
+                turn.expiry_intent.clone(),
+                diagnostic.clone(),
+            )
+        });
         let task = match attempt.as_ref() {
             Some(attempt) => TaskId::parse(attempt.identity.execution_id.as_str().to_string())?,
             None => self.mint_prompt_task_id(),
@@ -5139,6 +5271,7 @@ mod tests {
                 Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
                 None,
                 Err(BridgeError::IdentityUnavailable),
+                None,
             )
             .await;
         assert!(matches!(

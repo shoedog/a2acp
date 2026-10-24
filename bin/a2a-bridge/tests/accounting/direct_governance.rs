@@ -143,7 +143,7 @@ async fn mcp(f: &Fixture, tool: &str, identity: &AttemptIdentity, context: &str)
     write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
     lines.next_line().await.unwrap();
     let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":{
-        "text":"injected marker","input":if tool == "run_workflow" { workflow_input() } else { "go" },"model":if tool == "run_workflow" { None } else { Some("model") },"workflow":(tool == "run_workflow").then_some("fixture-workflow"),"context":context,"execution_id":identity.execution_id.as_str(),"attempt_id":identity.attempt_id.as_str()}}});
+        "text":"injected marker","input":if tool == "run_workflow" { workflow_input() } else { "go" },"model":if tool == "run_workflow" { None } else { Some("model") },"workflow":(tool == "run_workflow").then_some("fixture-workflow"),"context":(context != "mcp").then_some(context),"execution_id":identity.execution_id.as_str(),"attempt_id":identity.attempt_id.as_str()}}});
     write
         .write_all(format!("{call}\n").as_bytes())
         .await
@@ -314,8 +314,9 @@ fn timed_fixture(turns: u64) -> (Fixture, Arc<std::sync::atomic::AtomicI64>) {
 }
 
 #[tokio::test]
-async fn governed_warm_model_change_accounts_intended_candidate() {
-    for method in ["SendMessage", "SendStreamingMessage"] {
+#[allow(non_snake_case)]
+async fn r3_missing_allowance_keeps_A_and_governed_model_change_admits_B() {
+    for method in ["SendMessage", "SendStreamingMessage", "Mcp"] {
         for mapped in ["model", "old"] {
             let f = fixture(vec![rule(EachRequest, None, Some(10))], Some(mapped));
             // Bypass prompting to establish the old conversation selection, not a budget liability.
@@ -331,14 +332,24 @@ async fn governed_warm_model_change_accounts_intended_candidate() {
                 .await
                 .unwrap();
             sm.finish_turn(&ctx, t.generation, &t.op).await;
+            let before = sm.compaction_snapshot(&ctx).await;
+            f.backend.effects.lock().unwrap().clear();
             let identity = owner();
-            let body = request(f.router(false), method, &identity, Some("change-model")).await;
+            let body = surface(&f, method, &identity, Some("change-model")).await;
             if mapped == "old" {
                 safe(&body, method);
                 assert!(prompts(&f) == 0);
                 assert!(reservations(&f).is_empty());
+                assert_eq!(sm.compaction_snapshot(&ctx).await, before);
+                assert!(f.backend.effects.lock().unwrap().is_empty());
+                f.coordinator
+                    .continue_turn_with_identity(op("change-model"), owner())
+                    .await
+                    .unwrap();
+                assert_eq!(reservations(&f)[0].candidate.model.as_deref(), Some("old"));
             } else {
                 assert!(body.contains("answer"), "{body}");
+                assert_eq!(*f.backend.effects.lock().unwrap(), ["reconcile", "prompt"]);
                 assert_eq!(prompts(&f), 1);
                 assert_eq!(
                     reservations(&f)[0].candidate.model.as_deref(),
@@ -379,7 +390,7 @@ fn count(f: &Fixture, usage: bool, table: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn sse_disconnect_lifecycle() {
+async fn closed_before_admission_and_sse_disconnect_lifecycle() {
     for after_admission in [false, true] {
         let f = governed(1);
         f.backend.stall.store(true, Ordering::SeqCst);
@@ -405,6 +416,9 @@ async fn sse_disconnect_lifecycle() {
         assert_eq!(count(&f, false, success), 0);
         assert_eq!(prompts(&f), usize::from(after_admission));
         assert_eq!(reservations(&f).len(), usize::from(after_admission));
+        if !after_admission {
+            assert!(f.backend.effects.lock().unwrap().is_empty());
+        }
         if after_admission {
             assert!(f.backend.stopped.load(Ordering::SeqCst));
             assert!(!f.rows()[0].finalized);
@@ -456,7 +470,7 @@ async fn compaction_and_inject_refused_under_caps() {
 }
 
 #[tokio::test]
-async fn refused_continuation_preserves_session() {
+async fn refused_turn_keeps_session_exact() {
     for method in ["SendMessage", "SendStreamingMessage", "Mcp"] {
         let (f, now) = timed_fixture(1);
         let identity = owner();
@@ -466,7 +480,14 @@ async fn refused_continuation_preserves_session() {
         let sm = &f.coordinator.session_manager;
         let ctx = ContextId::parse("warm").unwrap();
         let before = sm.compaction_snapshot(&ctx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let age = sm.status(&ctx).await.unwrap().idle_age_ms;
+        f.backend.effects.lock().unwrap().clear();
+        let configs = format!("{:?}", f.backend.configs.lock().unwrap());
         safe(&continuation(&f, method).await, method);
+        assert!(f.backend.effects.lock().unwrap().is_empty());
+        assert_eq!(format!("{:?}", f.backend.configs.lock().unwrap()), configs);
+        assert!(sm.status(&ctx).await.unwrap().idle_age_ms >= age);
         assert_eq!(prompts(&f), 1);
         assert_eq!(sm.compaction_snapshot(&ctx).await, before);
         now.store(172_800_000, Ordering::SeqCst);
@@ -523,7 +544,7 @@ fn fixed_router(f: &Fixture, target: RouteTarget, calls: Arc<AtomicUsize>) -> ax
 }
 
 #[tokio::test]
-async fn fanout_guard_precedes_both_legs_and_remote_only_defers_to_peer() {
+async fn r3_delegate_is_unsupported_and_fanout_is_guarded() {
     for method in ["SendMessage", "SendStreamingMessage"] {
         for capped in [false, true] {
             let f = if capped { governed(0) } else { Fixture::new() };
@@ -541,26 +562,31 @@ async fn fanout_guard_precedes_both_legs_and_remote_only_defers_to_peer() {
             assert_eq!(calls.load(Ordering::SeqCst), usize::from(!capped));
             assert_eq!(prompts(&f), usize::from(!capped));
         }
-        let f = governed(0);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let body = request(
-            fixed_router(&f, RouteTarget::Delegate, calls.clone()),
-            method,
-            &owner(),
-            None,
-        )
-        .await;
-        assert!(!body.contains("budget refused"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(prompts(&f) == 0);
-        assert!(f
-            .store
-            .usage_summary_v1(&Default::default())
-            .await
-            .unwrap()
-            .buckets
-            .is_empty());
-        assert!(reservations(&f).is_empty());
+        for capped in [false, true] {
+            let f = if capped { governed(0) } else { Fixture::new() };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let body = request(
+                fixed_router(&f, RouteTarget::Delegate, calls.clone()),
+                method,
+                &owner(),
+                None,
+            )
+            .await;
+            assert_eq!(body.contains("budget refused"), capped);
+            if capped {
+                assert_eq!(count(&f, false, "workflow_attempt_summaries"), 0);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!capped));
+            assert!(prompts(&f) == 0);
+            assert!(f
+                .store
+                .usage_summary_v1(&Default::default())
+                .await
+                .unwrap()
+                .buckets
+                .is_empty());
+            assert!(reservations(&f).is_empty());
+        }
     }
 }
 
@@ -657,4 +683,219 @@ async fn configured_workflow_and_batch_guards_have_executable_controls() {
             assert_eq!(prompts(&f), 5);
         }
     }
+}
+
+#[tokio::test]
+async fn route_matrix_exactly_once() {
+    for method in ["SendMessage", "SendStreamingMessage", "Mcp", "Continue"] {
+        for state in ["fresh", "warm", "bound", "omitted"] {
+            for turns in [0, 1] {
+                let f = governed(turns);
+                let sm = &f.coordinator.session_manager;
+                let ctx = ContextId::parse("matrix").unwrap();
+                let identity = owner();
+                if state == "warm" {
+                    let turn = sm
+                        .checkout_turn(&ctx, AgentId::parse("agent").unwrap(), None, None)
+                        .await
+                        .unwrap();
+                    sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+                }
+                if state == "bound" {
+                    let resolved = f
+                        .coordinator
+                        .registry()
+                        .resolve(&AgentId::parse("agent").unwrap())
+                        .await
+                        .unwrap();
+                    f.coordinator.bindings().lock().await.insert(
+                        TaskId::parse(identity.execution_id.as_str()).unwrap(),
+                        bridge_coordinator::dispatch::TaskBinding {
+                            agent: resolved.entry.id.clone(),
+                            backend: resolved.backend,
+                            eff: Default::default(),
+                            lease: Arc::from(resolved.lease),
+                        },
+                    );
+                }
+                let before = sm.compaction_snapshot(&ctx).await;
+                f.backend.effects.lock().unwrap().clear();
+                let body = if method == "Continue" {
+                    mcp(
+                        &f,
+                        "continue",
+                        &identity,
+                        if state == "omitted" { "mcp" } else { "matrix" },
+                    )
+                    .await
+                } else {
+                    surface(
+                        &f,
+                        method,
+                        &identity,
+                        (state != "bound" && state != "omitted").then_some("matrix"),
+                    )
+                    .await
+                };
+                let admitted = turns != 0 && (method != "Continue" || state == "warm");
+                assert_eq!(
+                    body.contains("answer"),
+                    admitted,
+                    "{method}/{state}: {body}"
+                );
+                assert_eq!(reservations(&f).len(), usize::from(admitted));
+                assert_eq!(prompts(&f), usize::from(admitted));
+                if !admitted {
+                    assert!(
+                        f.backend.effects.lock().unwrap().is_empty(),
+                        "{method}/{state}"
+                    );
+                    assert_eq!(sm.compaction_snapshot(&ctx).await, before);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn r3_policy_attach_rejects_live_context() {
+    for state in ["empty", "idle", "running", "claim", "seed", "inject"] {
+        for capped in [false, true] {
+            let f = Fixture::new();
+            let ctx = ContextId::parse("attach").unwrap();
+            let sm = &f.coordinator.session_manager;
+            if state != "empty" && state != "claim" {
+                prompt(&f, "attach").await.unwrap();
+            }
+            if state == "seed" {
+                rpc(&f, "SessionCompact", json!({"contextId":"attach"})).await;
+            }
+            if state == "inject" {
+                rpc(
+                    &f,
+                    "SessionInject",
+                    json!({"contextId":"attach","text":"queued"}),
+                )
+                .await;
+            }
+            let _running = if state == "running" {
+                Some(sm.checkout_existing_turn(&ctx).await.unwrap())
+            } else {
+                None
+            };
+            let _claim = if state == "claim" {
+                Some(
+                    sm.claim_turn_observed(
+                        &ctx,
+                        AgentId::parse("agent").unwrap(),
+                        None,
+                        None,
+                        Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut accounting = billing_accounting(f.store.clone());
+            accounting.budget_policy = capped.then(|| {
+                Arc::new(
+                    BudgetPolicyV1::new(vec![rule(EachRequest, Some(1), None)], vec![]).unwrap(),
+                )
+            });
+            let coordinator = Arc::try_unwrap(f.coordinator).ok().unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                coordinator.with_accounting(accounting)
+            }));
+            assert_eq!(result.is_err(), capped && state != "empty", "{state}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_reload_during_apply() {
+    use futures::FutureExt;
+    for method in ["SendMessage", "SendStreamingMessage", "Mcp"] {
+        for during_apply in [false, true] {
+            let f = governed(1);
+            let sm = &f.coordinator.session_manager;
+            let ctx = ContextId::parse("reload").unwrap();
+            let turn = sm
+                .checkout_turn(&ctx, AgentId::parse("agent").unwrap(), None, None)
+                .await
+                .unwrap();
+            sm.finish_turn(&ctx, turn.generation, &turn.op).await;
+            let registry = f.coordinator.registry();
+            let mut entry = (*registry.entry_snapshot(&registry.default_id()).unwrap()).clone();
+            entry.name = Some("replacement snapshot".into());
+            let snapshot = RegistrySnapshot {
+                default: entry.id.clone(),
+                entries: vec![entry],
+                allowed_cmds: vec!["test-cmd".into()],
+                billing_identities: vec![],
+            };
+            let mut reload: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                registry.apply(snapshot).now_or_never().unwrap().unwrap();
+            }));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if during_apply {
+                *f.backend.reconcile_gate.lock().unwrap() = Some(rx);
+            } else {
+                *f.backend.before_turn.lock().unwrap() = reload.take();
+            }
+            let router = f.router(false);
+            let coordinator = f.coordinator.clone();
+            let request = tokio::spawn(async move {
+                if method == "Mcp" {
+                    let mut p = op("reload");
+                    p.mode = None;
+                    coordinator
+                        .prompt_with_identity(p, owner())
+                        .await
+                        .map(|_| ())
+                        .is_ok()
+                } else {
+                    request(router, method, &owner(), Some("reload"))
+                        .await
+                        .contains("answer")
+                }
+            });
+            if during_apply {
+                wait_for(|| f.backend.effects.lock().unwrap().contains(&"reconcile")).await;
+                reload.take().unwrap()();
+                tx.send(()).unwrap();
+            }
+            assert!(!request.await.unwrap());
+            assert_eq!(reservations(&f).len(), 1);
+            assert_eq!(prompts(&f), 0);
+            assert_eq!(f.backend.releases.lock().unwrap().len(), 1);
+            assert!(sm.status(&ctx).await.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn r3_ready_failure_beats_disconnect() {
+    let f = governed(1);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *f.backend.prompt_gate.lock().unwrap() = Some(rx);
+    *f.backend.prompt_error.lock().unwrap() = Some(BridgeError::agent_failure(serde_json::from_value(json!({
+        "schema_version":1,"failed_phase":"prompt_start","class":"protocol","disposition":"fatal","code":"acp.protocol",
+        "summary":"fatal ACP result","stderr_observed":false,"stderr_line_count":0,"prompt_may_have_been_accepted":true
+    })).unwrap()));
+    let response = f.router(false).oneshot(axum::http::Request::builder()
+        .method("POST").uri("/").header("content-type", "application/json").header("A2A-Version", "1.0")
+        .body(axum::body::Body::from(json!({"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"text":"go","contextId":"fatal"}}}).to_string())).unwrap()).await.unwrap();
+    wait_for(|| prompts(&f) == 1).await;
+    drop(response);
+    tx.send(()).unwrap();
+    wait_for(|| !f.backend.releases.lock().unwrap().is_empty()).await;
+    assert_eq!(reservations(&f).len(), 1);
+    assert!(f
+        .coordinator
+        .session_manager
+        .status(&ContextId::parse("fatal").unwrap())
+        .await
+        .is_none());
 }

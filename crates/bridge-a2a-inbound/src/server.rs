@@ -592,7 +592,13 @@ async fn accounted_local_dispatch(
     routed: &RoutedCall,
     diagnostic: Arc<dyn DiagnosticObserver>,
     owner: bridge_core::ids::AttemptIdentity,
+    receiver: Option<&tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
 ) -> Result<LocalDispatch, bridge_core::translator::AccountingFailureV1> {
+    if srv.coordinator().has_budget_policy() {
+        return governed_local_dispatch(srv, agent, routed, diagnostic, owner, receiver)
+            .await
+            .map_err(bridge_coordinator::Coordinator::direct_preparation_failure);
+    }
     let bound_config = srv
         .bindings()
         .lock()
@@ -635,6 +641,163 @@ async fn accounted_local_dispatch(
     let (mut dispatch, usage) =
         bridge_core::translator::settle_usage_preparation_v1(result.map_err(Into::into), usage)
             .await?;
+    dispatch.usage = usage;
+    Ok(dispatch)
+}
+
+async fn governed_local_dispatch(
+    srv: &Arc<InboundServer>,
+    agent: &AgentId,
+    routed: &RoutedCall,
+    diagnostic: Arc<dyn DiagnosticObserver>,
+    owner: bridge_core::ids::AttemptIdentity,
+    receiver: Option<&tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
+) -> Result<LocalDispatch, bridge_core::translator::AccountingFailureV1> {
+    use bridge_core::translator::AccountingFailureV1;
+    let closed = || receiver.is_some_and(|tx| tx.is_closed());
+    if let Some(ctx) = &routed.context_id {
+        let claim = srv
+            .session_manager()
+            .claim_turn_observed(
+                ctx,
+                agent.clone(),
+                routed.overrides.clone(),
+                routed.session_cwd.clone(),
+                diagnostic.clone(),
+            )
+            .await?;
+        let (claim, usage) = srv.coordinator().prepare_direct_claim(claim, owner).await?;
+        if closed() {
+            claim.rollback().await?;
+            return Err(AccountingFailureV1::canceled_before_prompt()
+                .settle(Some(usage))
+                .await);
+        }
+        // Once first-polled, admission owns its outcome even if the receiver disappears.
+        let (claim, usage) = claim.admit(usage).await?;
+        if closed() {
+            claim.rollback().await?;
+            return Err(AccountingFailureV1::canceled_before_prompt()
+                .settle(Some(usage))
+                .await);
+        }
+        let dispatch = claim.apply(usage).await?;
+        let result = warm_local_dispatch_prepared(
+            srv,
+            agent,
+            routed,
+            diagnostic,
+            mint_turn_id,
+            Some((dispatch.turn, dispatch.completion)),
+        )
+        .await
+        .expect("governed warm dispatch has a context");
+        let (mut local, usage) = bridge_core::translator::settle_usage_preparation_v1(
+            result.map_err(Into::into),
+            Some(dispatch.usage),
+        )
+        .await?;
+        local.usage = usage;
+        return Ok(local);
+    }
+    // Retain the exact binding and lease across admission, including concurrent eviction.
+    let bound = srv.bindings().lock().await.get(&routed.task).map(|b| {
+        (
+            b.agent.clone(),
+            b.backend.clone(),
+            b.eff.clone(),
+            b.lease.clone(),
+        )
+    });
+    let fresh = bound.is_none();
+    let (agent, backend, eff, lease) = match bound {
+        Some(bound) => bound,
+        None => {
+            let resolved = srv.registry().resolve_observed(agent, diagnostic).await?;
+            let eff = effective_config(&resolved.entry, routed.overrides.as_ref());
+            (
+                resolved.entry.id.clone(),
+                resolved.backend,
+                eff,
+                Arc::from(resolved.lease),
+            )
+        }
+    };
+    let usage = srv
+        .coordinator()
+        .prepare_usage_selection(
+            owner,
+            agent.as_str().into(),
+            Some(eff.clone()),
+            "direct",
+            None,
+        )
+        .await?
+        .ok_or(BridgeError::InvalidStateTransition)?;
+    if closed() {
+        return Err(AccountingFailureV1::canceled_before_prompt()
+            .settle(Some(usage))
+            .await);
+    }
+    let usage = usage.admit_direct().await?;
+    if closed() {
+        return Err(AccountingFailureV1::canceled_before_prompt()
+            .settle(Some(usage))
+            .await);
+    }
+    let prepared = async {
+        backend
+            .configure_session(
+                &routed.session,
+                &SessionSpec {
+                    config: eff.clone(),
+                    cwd: routed.session_cwd.clone(),
+                },
+            )
+            .await?;
+        let obs_ctx = obs_ctx_for_dispatch(
+            routed,
+            &agent,
+            eff.model.clone(),
+            eff.effort.map(effort_to_string),
+            eff.mode.clone(),
+        )?;
+        let guard = if fresh {
+            srv.bindings().lock().await.insert(
+                routed.task.clone(),
+                TaskBinding {
+                    agent,
+                    backend: backend.clone(),
+                    eff,
+                    lease: lease.clone(),
+                },
+            );
+            Some(BindingGuard {
+                bindings: srv.bindings().clone(),
+                task: routed.task.clone(),
+                backend: backend.clone(),
+                session: routed.session.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(LocalDispatch {
+            usage: None,
+            backend,
+            session: routed.session.clone(),
+            seed: None,
+            injects: vec![],
+            turn_meta: None,
+            guard,
+            lease: Some(lease),
+            warm_guard: None,
+            abort: tokio_util::sync::CancellationToken::new(),
+            obs_ctx,
+        })
+    }
+    .await;
+    let (mut dispatch, usage) =
+        bridge_core::translator::settle_usage_preparation_v1(prepared, Some(usage)).await?;
     dispatch.usage = usage;
     Ok(dispatch)
 }
@@ -832,31 +995,58 @@ async fn warm_local_dispatch_with_turn_id_minter<F>(
 where
     F: FnOnce() -> Result<bridge_core::ids::TurnId, BridgeError>,
 {
+    warm_local_dispatch_prepared(srv, agent_id, routed, observer, turn_id_minter, None).await
+}
+
+async fn warm_local_dispatch_prepared<F>(
+    srv: &Arc<InboundServer>,
+    agent_id: &AgentId,
+    routed: &RoutedCall,
+    observer: Arc<dyn DiagnosticObserver>,
+    turn_id_minter: F,
+    prepared: Option<(
+        bridge_coordinator::session_manager::WarmTurn,
+        WarmCompletionGuard,
+    )>,
+) -> Option<Result<LocalDispatch, BridgeError>>
+where
+    F: FnOnce() -> Result<bridge_core::ids::TurnId, BridgeError>,
+{
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager().clone();
     let completion_observer = observer.clone();
-    match sm
-        .checkout_turn_observed(
-            &ctx,
-            agent_id.clone(),
-            routed.overrides.clone(),
-            routed.session_cwd.clone(),
-            observer,
-        )
-        .await
-    {
+    let mut completion = None;
+    let turn = match prepared {
+        Some((turn, guard)) => {
+            completion = Some(guard);
+            Ok(turn)
+        }
+        None => {
+            sm.checkout_turn_observed(
+                &ctx,
+                agent_id.clone(),
+                routed.overrides.clone(),
+                routed.session_cwd.clone(),
+                observer,
+            )
+            .await
+        }
+    };
+    match turn {
         Ok(turn) => {
             // Checkout has already transitioned this exact generation/operation
             // to Running. Arm its sole completion owner before identity minting
             // or any other fallible setup so every early return settles it.
-            let warm_guard = WarmCompletionGuard::finish_owner(
-                sm,
-                ctx.clone(),
-                turn.generation,
-                turn.op.clone(),
-                turn.expiry_intent.clone(),
-                completion_observer,
-            );
+            let warm_guard = completion.unwrap_or_else(|| {
+                WarmCompletionGuard::finish_owner(
+                    sm,
+                    ctx.clone(),
+                    turn.generation,
+                    turn.op.clone(),
+                    turn.expiry_intent.clone(),
+                    completion_observer,
+                )
+            });
             let turn_id = match turn_id_minter() {
                 Ok(turn_id) => turn_id,
                 Err(error) => return Some(Err(error)),
@@ -1808,6 +1998,11 @@ async fn stream_message(
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if matches!(routed.target, RouteTarget::Delegate) {
+        if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
     // Identity is mandatory for served workflow submission, but ordinary bridge-to-bridge
     // streaming delegation is not the direct-unary safety surface and remains wire-compatible.
     let supplied_identity = if matches!(&routed.target, RouteTarget::Workflow(_)) {
@@ -1936,31 +2131,40 @@ async fn stream_message(
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
             let diagnostic = direct_diagnostic_observer();
-            let dispatch = accounted_local_dispatch(
-                &srv,
-                &agent_id,
-                &routed,
-                diagnostic.clone(),
-                stream_owner.clone(),
-            )
-            .await;
-            match dispatch {
-                Ok(dispatch) => {
-                    let _ = srv.store.put(&routed.task, &dispatch.session).await;
-                    spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, history)
-                }
-                Err(e) => {
-                    tokio::spawn(async move {
-                        if let Some(history) = history.as_mut() {
-                            let _ = history
-                                .finish("failed", "preparation_failed", true, "not_needed")
-                                .await;
-                        }
-                        let _ = tx.send(Err(e.surfaced_error())).await;
-                        let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-                    });
-                }
+            let srv = srv.clone();
+            let prepare = async move {
+                let dispatch = accounted_local_dispatch(
+                    &srv,
+                    &agent_id,
+                    &routed,
+                    diagnostic.clone(),
+                    stream_owner.clone(),
+                    governed.then_some(&tx),
+                )
+                .await;
+                match dispatch {
+                    Ok(dispatch) => {
+                        let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                        spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, history)
+                    }
+                    Err(e) => {
+                        tokio::spawn(async move {
+                            if let Some(history) = history.as_mut() {
+                                let _ = history
+                                    .finish(if e.preparation_exit == bridge_core::translator::AccountingPreparationExitV1::Canceled { "canceled" } else { "failed" }, "preparation_failed", true, "not_needed")
+                                    .await;
+                            }
+                            let _ = tx.send(Err(e.surfaced_error())).await;
+                            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                        });
+                    }
+                };
             };
+            if governed {
+                tokio::spawn(prepare);
+            } else {
+                prepare.await;
+            }
         }
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
         RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx, stream_owner),
@@ -2939,6 +3143,14 @@ fn spawn_local_producer(
                 return;
             }
         }
+        if tx.is_closed() && history.is_some() {
+            if let Some(history) = history.as_mut() {
+                let _ = history
+                    .finish("canceled", "disconnected", false, "not_needed")
+                    .await;
+            }
+            return;
+        }
         let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
@@ -2999,11 +3211,6 @@ fn spawn_local_producer(
                 // cleanup; a merely pending backend still loses immediately to
                 // `tx.closed()`. The force-reset abort remains first because it
                 // must never poll a session that has already been released.
-                // Governed admission must never be polled for an already-gone client.
-                _ = tx.closed(), if history.is_some() => {
-                    disconnected = true;
-                    break;
-                }
                 maybe = events.next() => match maybe {
                     Some(ev) => ev,
                     None => break,
@@ -4144,7 +4351,17 @@ async fn unary_message(
         );
     }
 
-    if matches!(routed.target, RouteTarget::Fanout) {
+    if srv.coordinator().has_budget_policy() && routed.default_route_deferred {
+        let target = task_meta_from_params(&params).and_then(|meta| srv.route.route(&meta));
+        match target {
+            Ok(target) => {
+                routed.target = target;
+                routed.default_route_deferred = false;
+            }
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        }
+    }
+    if matches!(routed.target, RouteTarget::Fanout | RouteTarget::Delegate) {
         if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
             return bridge_err_to_jsonrpc(id, &error);
         }
@@ -4230,6 +4447,7 @@ async fn unary_message(
                 &routed,
                 diagnostic.clone(),
                 supplied_identity.clone(),
+                None,
             )
             .await;
             let dispatch = match dispatch {
@@ -4240,7 +4458,9 @@ async fn unary_message(
                             .finish("failed", "prompt_failed", true, "not_needed")
                             .await
                         {
-                            return bridge_err_to_jsonrpc(id, &store_error);
+                            if !matches!(e.original, BridgeError::BudgetRefused { .. }) {
+                                return bridge_err_to_jsonrpc(id, &store_error);
+                            }
                         }
                     }
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
