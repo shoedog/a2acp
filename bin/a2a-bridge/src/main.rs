@@ -58,6 +58,7 @@ mod containers;
 mod doctor;
 mod fallback_plan;
 mod governance_config;
+mod governance_output;
 mod heartbeat;
 mod local_file;
 mod local_workflow_accounting;
@@ -5502,8 +5503,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // Build the registry + executor using the same SpawnFn the server uses.
     let admission_cfg = RegistryConfig::parse(&raw)
         .map_err(|e| format!("run-workflow: config reparse for admission failed: {e}"))?;
-    let mut snapshot = cfg
-        .into_snapshot()
+    let mut snapshot = governance_config::local_workflow_snapshot(cfg)
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
     preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't up (verify is implement-only)
                                          // Warm ONLY container_rw agents the SELECTED workflow actually resolves (its graph nodes), not every
@@ -5939,6 +5939,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut terminal_seen = false;
     let mut structured_terminals = std::collections::BTreeMap::new();
     let mut structured_evidence_invalid = false;
+    let mut completed_output = std::collections::BTreeMap::new();
+    let mut budget_refusal = None;
     let mut policy_trigger_json: Option<String> = None;
     while let Some(item) = stream.next().await {
         match item {
@@ -5964,9 +5966,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 terminal_json,
                 policy_trigger_json: node_policy_trigger_json,
                 policy_trigger_barrier_result: _,
-                output: _,
+                output: node_output,
             }) => {
                 if node_ok {
+                    completed_output.insert(node.as_str().to_owned(), node_output);
                     completed_nodes = completed_nodes.saturating_add(1);
                 } else {
                     failed_nodes = failed_nodes.saturating_add(1);
@@ -6081,7 +6084,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 };
             }
             Err(e) => {
-                eprintln!("[workflow] error: {e:?}");
+                if matches!(e, BridgeError::BudgetRefused { .. }) {
+                    eprintln!("[workflow] error: {}", e.client_message());
+                    budget_refusal = Some(e);
+                } else {
+                    eprintln!("[workflow] error: {e:?}");
+                }
                 ok = false;
             }
         }
@@ -6241,6 +6249,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         strict_brief,
     );
 
+    // Preserve completed bytes before publishing the failed terminal result.
+    let preservation_error = if budget_refusal.is_some() {
+        match governance_output::preserve(&completed_output) {
+            Ok(path) => {
+                eprintln!("[workflow] completed output retained at {}", path.display());
+                None
+            }
+            Err(error) => Some(format!(
+                "run-workflow: cannot preserve completed output: {error}"
+            )),
+        }
+    } else {
+        None
+    };
     // Write output.
     let output_error = if let Some(out) = out_path {
         std::fs::write(&out, &output)
@@ -6250,6 +6272,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         print!("{output}");
         None
     };
+    let output_error = output_error.or(preservation_error);
     if output_error.is_some() {
         ok = false;
         terminal_outcome = "failed";
@@ -6367,7 +6390,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         match (output_error, ok) {
             (Some(error), _) => Err(error.into()),
             (None, true) => Ok(()),
-            (None, false) => Err("run-workflow: workflow did not complete successfully".into()),
+            (None, false) => Err(budget_refusal.map_or_else(
+                || BoxError::from("run-workflow: workflow did not complete successfully"),
+                |error| BoxError::from(error.client_message()),
+            )),
         },
     )
 }

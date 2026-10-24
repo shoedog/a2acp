@@ -1304,7 +1304,16 @@ async fn allowance_overrun_preserves_output_and_final_actuals() {
 #[tokio::test]
 async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() {
     let f = Fixture::new();
-    let owner = AttemptIdentity::initial().unwrap();
+    let owner = AttemptIdentity {
+        execution_id: bridge_core::ids::ExecutionId::parse("exec-11111111111111111111111111111111")
+            .unwrap(),
+        attempt_id: bridge_core::ids::AttemptId::parse("attempt-22222222222222222222222222222222")
+            .unwrap(),
+        ordinal: 0,
+        parent_attempt_id: None,
+    };
+    let concrete =
+        bridge_core::ids::AttemptId::parse("attempt-33333333333333333333333333333333").unwrap();
     let accounting = AccountingV1 {
         clock: Arc::new(|| 123),
         ..AccountingV1::new(f.store.clone())
@@ -1312,7 +1321,7 @@ async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() 
     let turn = accounting
         .start(
             &owner,
-            bridge_core::ids::AttemptId::mint().unwrap(),
+            concrete.clone(),
             bridge_core::accounting::UsageAttributionV1 {
                 agent: String::new(), // Legacy rows may lack attribution.
                 ..Default::default()
@@ -1320,7 +1329,21 @@ async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() 
         )
         .await
         .unwrap();
-    let mut expected = f.rows()[0].clone();
+    // Independent G-min.3 contract fixture: no candidate-produced row is used as expected data.
+    let expected = bridge_core::accounting::UsageAttemptV1 {
+        id: concrete.as_str().into(),
+        attribution: bridge_core::accounting::UsageAttributionV1 {
+            execution: Some(owner.execution_id.as_str().into()),
+            run_attempt: Some(owner.attempt_id.as_str().into()),
+            ..Default::default()
+        },
+        started_ms: 123,
+        utc_day: 0,
+        dispatched: true,
+        finalized: true,
+        usage: support::usage(),
+        cost_invalid: false,
+    };
     let backend = Arc::new(WorkflowRecording::default());
     let output = bridge_core::accounting_backend::AccountingBackendV1::new(backend.clone())
         .prompt_accounted_v1(&SessionId::parse("uncapped").unwrap(), vec![], turn, None)
@@ -1329,9 +1352,10 @@ async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() 
         .collect::<Vec<_>>()
         .await;
     assert!(output.iter().all(Result::is_ok));
-    expected.dispatched = true;
-    expected.finalized = true;
-    expected.observe(support::usage());
+    assert!(
+        matches!(&output[..], [Ok(Update::Usage(usage)), Ok(Update::Text(text)), Ok(Update::Done { .. })]
+        if usage == &support::usage() && text == "answer")
+    );
     assert_eq!(
         serde_json::to_vec(&f.rows()[0]).unwrap(),
         serde_json::to_vec(&expected).unwrap()
@@ -1630,7 +1654,11 @@ async fn budget_refusal_workflow_outputs_are_public_with_and_without_preflight()
             WorkflowDiagnosticContext::in_memory(Default::default()).with_accounting(invocation);
         let events = regression_events(backend.clone(), preflight, ctx).await;
         let mut outputs = 0;
-        for event in events.into_iter().map(Result::unwrap) {
+        assert!(matches!(
+            events.last(),
+            Some(Err(BridgeError::BudgetRefused { .. }))
+        ));
+        for event in events.into_iter().filter_map(Result::ok) {
             if let WorkflowEvent::NodeFinished { output, .. }
             | WorkflowEvent::Terminal { output, .. } = event
             {
@@ -1658,4 +1686,223 @@ async fn non_budget_prompt_error_keeps_debug_node_output() {
         |e| matches!(e, Ok(WorkflowEvent::NodeFinished { output, .. })
         if output == r#"[node draft failed: AgentCrashed { reason: "permitted cold retry" }]"#)
     ));
+}
+
+#[derive(Default)]
+struct DrainingBackend {
+    recording: WorkflowRecording,
+    release: Arc<tokio::sync::Notify>,
+    cancels: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl AgentBackend for DrainingBackend {
+    async fn configure_bound_session(
+        &self,
+        _: &SessionId,
+        _: &bridge_core::execution_policy::BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let stream = self.recording.prompt(session, parts).await?;
+        let release = self.release.clone();
+        Ok(Box::pin(
+            futures::stream::once(async move {
+                release.notified().await;
+                stream
+            })
+            .flatten(),
+        ))
+    }
+    async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn budget_stop_drains_siblings_terminalizes_queue_and_preserves_external_cancel() {
+    use bridge_core::execution_policy::*;
+    use bridge_workflow::executor::WorkflowEvent;
+    for (bound, fail_fast, external_cancel) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let f = Fixture::new();
+        let owner = AttemptIdentity::initial().unwrap();
+        let invocation = governed(&f, &owner, budget(1, None)).await;
+        let backend = Arc::new(DrainingBackend::default());
+        let entry = common::single_agent_registry("agent", backend.clone())
+            .entry_snapshot(&AgentId::parse("agent").unwrap())
+            .unwrap();
+        let provider = backend.clone();
+        let spawn: bridge_registry::registry::BoundObservedSpawnFn = Arc::new(move |_, _, _| {
+            let provider = provider.clone();
+            Box::pin(async move { Ok(provider as Arc<dyn AgentBackend>) })
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(
+            bridge_registry::registry::Registry::new_bound_observed(
+                snapshot((*entry).clone()),
+                spawn,
+            )
+            .unwrap(),
+        );
+        let mut g: WorkflowGraph = serde_json::from_value(serde_json::json!({
+            "id":"accounted", "nodes":[
+                {"id":"sibling", "agent":"agent", "prompt_template":"{{input}}", "inputs":[]},
+                {"id":"refused", "agent":"agent", "prompt_template":"{{input}}", "inputs":[]},
+                {"id":"queued", "agent":"agent", "prompt_template":"{{sibling}}{{refused}}", "inputs":["sibling","refused"]}
+            ]
+        })).unwrap();
+        let cwd = bridge_core::SessionCwd::parse(f.dir.path().to_str().unwrap()).unwrap();
+        let mut ctx = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+            session_cwd: Some(cwd.clone()),
+            ..Default::default()
+        })
+        .with_accounting(invocation);
+        if bound {
+            g.controls = Some(WorkflowControlDefaultsV1 {
+                fan_out: Some(if fail_fast {
+                    FanOutPolicyV1::FailFast
+                } else {
+                    FanOutPolicyV1::BoundedIndependent
+                }),
+                ..Default::default()
+            });
+            let controls = resolve_execution_policy_v1(
+                g.controls.as_ref().unwrap(),
+                &Default::default(),
+                false,
+                PolicyActivationV1::Production,
+            )
+            .unwrap();
+
+            let entry = registry
+                .entry_snapshot(&AgentId::parse("agent").unwrap())
+                .unwrap();
+            let mut sorted_nodes = g.nodes.iter().collect::<Vec<_>>();
+            sorted_nodes.sort_by_key(|node| &node.id);
+            let identities = sorted_nodes
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let node = PolicyNodeRefV1::from_node_id(i as u32, n.id.as_str());
+                    let provider = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                        entry: &entry,
+                        overrides: None,
+                        node: node.clone(),
+                        logical_session: FrozenProviderLogicalSessionV1::Execute {
+                            candidate_ordinal: 0,
+                        },
+                        checkout: freeze_direct_checkout_v1(cwd.clone()),
+                        provider_effect_key: None,
+                    })
+                    .unwrap();
+                    freeze_node_execution_identity_v1(node, vec![provider]).unwrap()
+                })
+                .collect();
+            let spec = bridge_workflow::run_spec::WorkflowRunSpecV1::build(
+                owner.attempt_id.clone(),
+                g.clone(),
+                controls,
+                Some(cwd),
+                identities,
+                LedgerAdmissionV1::DurablePrimaryTaskStore,
+            )
+            .unwrap();
+            ctx = ctx.with_frozen_run_spec(Arc::new(spec), None).unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let executor = WorkflowExecutor::new(registry);
+        let mut stream = executor.run_with_diagnostic_context(
+            Arc::new(g),
+            String::new(),
+            "drain".into(),
+            cancel.clone(),
+            ctx,
+        );
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let refused = matches!(&event, Ok(WorkflowEvent::NodeFinished { node, .. }) if node.as_str() == "refused");
+            events.push(event);
+            if refused {
+                break;
+            }
+        }
+        assert_eq!(
+            backend.recording.prompts.lock().unwrap().len(),
+            1,
+            "bound={bound} fail_fast={fail_fast}: {events:?}"
+        );
+        assert_eq!(backend.cancels.load(Ordering::SeqCst), 0);
+        if external_cancel {
+            cancel.cancel();
+        } else {
+            backend.release.notify_one();
+        }
+        events.extend(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                stream.collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.is_err()).count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(BridgeError::BudgetRefused { refusal })) if refusal.reason == BudgetRefusalReasonV1::LimitExceeded)
+        );
+        let terminals: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(WorkflowEvent::NodeFinished {
+                    node,
+                    ok,
+                    output,
+                    terminal_json,
+                    ..
+                }) => Some((node, ok, output, terminal_json)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals.len(), 3);
+        let sibling = terminals
+            .iter()
+            .find(|t| t.0.as_str() == "sibling")
+            .unwrap();
+        assert_eq!(*sibling.1, !external_cancel);
+        if !external_cancel {
+            assert_eq!(sibling.2, "answer");
+        }
+        if bound {
+            for terminal in &terminals {
+                NodeTerminalV1::decode_canonical(terminal.3.as_ref().unwrap().as_bytes()).unwrap();
+            }
+        }
+        assert_eq!(
+            backend.cancels.load(Ordering::SeqCst),
+            usize::from(external_cancel)
+        );
+        assert_eq!(backend.recording.prompts.lock().unwrap().len(), 1);
+        assert_eq!(f.rows().len(), 2); // queued node has no attempt at all
+        assert_eq!(f.rows().iter().filter(|r| r.dispatched).count(), 1);
+        assert_eq!(
+            f.rows().iter().filter(|r| r.finalized).count(),
+            if external_cancel { 1 } else { 2 }
+        );
+    }
 }

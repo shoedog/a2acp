@@ -464,3 +464,107 @@ async fn serve_client_leaves_accounting_and_prompt_ownership_to_executing_servic
     support::assert_usage(&f.reopened(Some(&owner)).await, 1, 0);
     assert_eq!(f.rows().len(), 1, "only the executing service may account");
 }
+
+fn caps(cli: &Cli, request: u64, workflow: u64, tokens: bool) {
+    use std::io::Write;
+    let mut cfg = fs::OpenOptions::new()
+        .append(true)
+        .open(&cli.config)
+        .unwrap();
+    for (id, selector, cap) in [
+        ("request", "each_request", request),
+        ("workflow", "each_workflow_run", workflow),
+    ] {
+        writeln!(
+            cfg,
+            "\n[[governance.rules]]\nid='{id}'\nselector='{selector}'\nlimits={{turns={cap}}}"
+        )
+        .unwrap();
+    }
+    if tokens {
+        writeln!(cfg, "\n[[governance.rules]]\nid='tokens'\nselector={{utc_day_agent='agent'}}\nlimits={{terminal_tokens=100}}\n[[governance.allowances]]\ntarget={{agent='agent',model='good'}}\nterminal_tokens=1").unwrap();
+        // Agent/day admission needs independent coverage from before today's start.
+        let conn =
+            rusqlite::Connection::open(cli.store.with_extension("sqlite.usage-v1.sqlite")).unwrap();
+        conn.execute("UPDATE usage_coverage_v1 SET started_ms=0", [])
+            .unwrap();
+    }
+}
+
+#[test]
+fn governed_cli_enforces_both_owners_and_retains_completed_bytes() {
+    for (request, workflow) in [(1, 2), (2, 1), (0, 2)] {
+        let cli = Cli::new(true, false, "good");
+        let mut raw = fs::read_to_string(&cli.config).unwrap();
+        raw.push_str("\n[[workflows.nodes]]\nid='synth'\nagent='agent'\nmodel='good'\nprompt_text='{{review}}'\ninputs=['review']\n");
+        fs::write(&cli.config, raw).unwrap();
+        caps(&cli, request, workflow, false);
+        let result = cli.command().output().unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{stderr}");
+        assert!(stderr.contains("budget refused"), "{stderr}");
+        assert!(!stderr.contains("InvalidStateTransition"), "{stderr}");
+        assert!(!stderr.contains("LimitExceeded"), "{stderr}");
+        assert_eq!(cli.prompts().len(), usize::from(request > 0));
+        let path = stderr
+            .lines()
+            .find_map(|s| s.strip_prefix("[workflow] completed output retained at "))
+            .unwrap();
+        let manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&fs::read(PathBuf::from(path).join("completed.json")).unwrap())
+                .unwrap();
+        if request > 0 {
+            assert_eq!(
+                fs::read(PathBuf::from(path).join(&manifest["review"])).unwrap(),
+                b"answer"
+            );
+        } else {
+            assert!(manifest.is_empty());
+        }
+        assert!(cli.rows().iter().all(|r| r.finalized));
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn governed_cli_overrun_succeeds_once_and_other_routes_refuse_before_prompt() {
+    let cli = Cli::new(true, false, "good");
+    // Establish coverage without a provider turn.
+    let store = SqliteStore::open_shared_history(&cli.store).unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(store.usage_summary_v1(&Default::default()))
+        .unwrap();
+    drop(store);
+    caps(&cli, 1, 1, true);
+    let result = cli.command().output().unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("governed turn completed above its token allowance")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        cli.rows()[0].usage.terminal.as_ref().unwrap().total_tokens,
+        15
+    );
+    assert_eq!(cli.prompts().len(), 1);
+    for route in ["serve", "mcp", "models"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+            .args([route, "--config"])
+            .arg(&cli.config)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("only local run-workflow supports caps"),
+            "{route}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(cli.prompts().len(), 1);
+    }
+}

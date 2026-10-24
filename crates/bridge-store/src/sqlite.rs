@@ -4540,7 +4540,11 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             }
             tx.commit().map_err(|_| BridgeError::StoreFailure)?;
             if overrun {
-                tracing::warn!("governed turn completed above its token allowance");
+                if tracing::enabled!(tracing::Level::WARN) {
+                    tracing::warn!("governed turn completed above its token allowance");
+                } else {
+                    eprintln!("governed turn completed above its token allowance");
+                }
             }
             Ok(())
         })

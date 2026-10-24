@@ -2051,7 +2051,9 @@ async fn settle_accounting_preparation(
     let failure = AccountingFailureV1::from(original)
         .settle(prepared.take())
         .await;
-    if failure.persistence.is_some() {
+    if failure.persistence.is_some()
+        || matches!(failure.original, BridgeError::BudgetRefused { .. })
+    {
         Err(failure)
     } else {
         Ok(())
@@ -5760,7 +5762,8 @@ impl WorkflowExecutor {
             let mut inflight: FuturesUnordered<NodeFut> = FuturesUnordered::new();
             let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let mut scheduled: HashSet<String> = HashSet::new();
-            let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
+            let mut stop_scheduling = false; // drain in-flight, schedule nothing new
+            let mut budget_failure: Option<AccountingFailureV1> = None;
             let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
             let mut post_transfer_terminalizers = BTreeMap::<NodeId, CancellationToken>::new();
             use NodePrimaryDispositionV1::{CanceledPolicy, CanceledWorkflow};
@@ -6123,6 +6126,8 @@ impl WorkflowExecutor {
                 {
                     break;
                 }
+                // Budget draining must not manufacture a policy impossibility/cancellation.
+                let scheduler_active = scheduler_active && budget_failure.is_none();
                 let workflow_cancel_observable_before_wait = cancel.is_cancelled();
                 let mut impossibility_proof = scheduler_active
                     .then(|| scheduler_impossibility_proof_v1(
@@ -6458,10 +6463,30 @@ impl WorkflowExecutor {
                     post_transfer_terminalizers.remove(&node_id);
                     let raw_output = match raw_output {
                         Ok(output) => output,
+                        Err(error) if matches!(error.original, BridgeError::BudgetRefused { .. }) => {
+                            let node = graph.nodes.iter().find(|node| node.id == node_id)
+                                .expect("a completion belongs to the workflow");
+                            let mut output = match node_run_output(
+                                graph.id.as_str(), node, &run_id, &ctx,
+                                format!("[node {} failed: {}]", node_id.as_str(), error.original.client_message()),
+                                false, None, NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
+                            ) {
+                                Ok(output) => output,
+                                Err(error) => { settle_error_before_yield!(error); }
+                            };
+                            output.primary_error = Some(error.original.clone());
+                            budget_failure.get_or_insert(error);
+                            output
+                        }
                         Err(error) => {
                             settle_error_before_yield!(error);
                         }
                     };
+                    if let Some(error @ BridgeError::BudgetRefused { .. }) = &raw_output.primary_error {
+                        budget_failure.get_or_insert_with(|| error.clone().into());
+                    }
+                    stop_scheduling |= budget_failure.is_some();
                     let NodeRunOutput {
                         text: raw_text,
                         ok,
@@ -6589,7 +6614,7 @@ impl WorkflowExecutor {
                 let mut action = PolicyActionV1::None;
                 if ready_terminals.is_empty() {
                 } else if let (Some(controller), Some(authority)) =
-                    (fanout_controller.as_mut(), frozen_authority.as_ref())
+                    (fanout_controller.as_mut().filter(|_| budget_failure.is_none()), frozen_authority.as_ref())
                 {
                     #[cfg(test)]
                     if ctx.post_recording_exit_fault
@@ -6712,6 +6737,13 @@ impl WorkflowExecutor {
                     stop_scheduling |= controller.admission_stopped();
                 } else {
                     for ready in ready_terminals {
+                        if frozen_authority.is_some() {
+                            let encoded = match canonical_terminal_json_v1(&ready.terminal) {
+                                Ok(encoded) => encoded,
+                                Err(error) => { settle_error_before_yield!(error); }
+                            };
+                            ready_event_evidence.insert(ready.node.clone(), (encoded, None, None));
+                        }
                         node_terminals.insert(ready.node, ready.terminal);
                     }
                 }
@@ -6790,7 +6822,7 @@ impl WorkflowExecutor {
                 }
             }
             observe_external_root_cancellation!();
-            if frozen_authority.is_some() {
+            if frozen_authority.is_some() || budget_failure.is_some() {
                 let mut missing = graph
                     .nodes
                     .iter()
@@ -6805,7 +6837,8 @@ impl WorkflowExecutor {
                             NodeDisposition::Canceled,
                             format!("[node {} canceled: workflow]", node.as_str()),
                         )
-                    } else if observed_arms.contains(&Arm::AbsoluteCutoff)
+                    } else if budget_failure.is_some()
+                        || observed_arms.contains(&Arm::AbsoluteCutoff)
                         || observed_arms.contains(&Arm::MechanicallyProvedImpossibility)
                         || fanout_controller.as_ref().is_some_and(|controller| {
                             controller.admission_stopped() && controller.trigger().is_some()
@@ -6861,7 +6894,9 @@ impl WorkflowExecutor {
                 }
             }
             let (term_text, _, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
-            let outcome = dispositions
+            let outcome = if budget_failure.is_some() {
+                WorkflowOutcome::Failed
+            } else { dispositions
                 .get(&terminal_id)
                 .copied()
                 .map(NodeDisposition::workflow_outcome)
@@ -6884,7 +6919,7 @@ impl WorkflowExecutor {
                     } else {
                         WorkflowOutcome::Failed
                     }
-                });
+                }) };
             let (cleanup_disposition, cleanup_ms) = cleanup_tracker.observation();
             // ---- R2f1b §5.1 WORKFLOW-LEVEL CHECKOUT DISPOSITION (slice 2c2) ------------------
             // "After every node is terminal, an all-healthy global workflow outcome may mint
@@ -6923,6 +6958,9 @@ impl WorkflowExecutor {
                 duration_ms: cleanup_ms,
             });
             yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
+            if let Some(failure) = budget_failure {
+                yield Err(failure);
+            }
         })
     }
 }
