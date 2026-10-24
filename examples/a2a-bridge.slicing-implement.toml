@@ -132,6 +132,8 @@ kind   = "container_rw"
 cmd    = "codex-acp"
 pre_authenticated = true
 effort = "high"
+# #188: the container is the sandbox, so Codex needs full access inside it.
+mode   = "agent-full-access"
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 [agents.sandbox]
 image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo

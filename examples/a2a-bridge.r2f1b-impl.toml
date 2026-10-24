@@ -262,6 +262,8 @@ cmd    = "codex-acp"
 pre_authenticated = true  # 2026-08-16: post-refresh auth.json → codex-acp advertises NO auth methods (already-authed); any authenticate call now gets -32602. Was: auth_method = "chat-gpt". Single-token-family ledger class.
 model  = "gpt-5.6-sol"                         # slice 4A — sol xhigh (owner directive 2026-08-23; OpenAI usage resets tomorrow)
 effort = "xhigh"
+# #188: the container is the sandbox, so Codex needs full access inside it.
+mode   = "agent-full-access"
 args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 [agents.sandbox]
 image   = "a2a-toolchain:latest"               # B2b-2: toolchain so the agent (and verify) has cargo

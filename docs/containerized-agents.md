@@ -294,6 +294,7 @@ validation requires `cmd` + `[sandbox]` and PERMITS `access=rw` (the `acp` kind 
 `:rw` mount is the **per-request session cwd** (a scratch dir; in B2b a per-task git clone), gated
 `is_under` the **canonicalized** mount root — symlinks are resolved, so a `:rw` target can't escape the
 root via a symlink.
+For Codex writers, set `mode="agent-full-access"`: the `container_rw` container is the sandbox.
 
 > **Per-turn memory asymmetry.** Unlike the warm `:ro` reader (one long-lived container, conversational
 > memory across turns), a `container_rw` agent mints a fresh container + ACP session **each turn**, so it
