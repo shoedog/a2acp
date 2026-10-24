@@ -1498,6 +1498,7 @@ fn turn_log_observer_enabled(
 /// policy / batch plus the interactive-permission registry.
 #[allow(clippy::too_many_arguments)]
 fn build_coordinator(
+    budget_policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
     billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
     session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
     executor: Arc<bridge_workflow::executor::WorkflowExecutor>,
@@ -1525,6 +1526,7 @@ fn build_coordinator(
 ) -> Arc<bridge_coordinator::Coordinator> {
     let accounting = bridge_core::accounting::AccountingV1 {
         billing: Some(billing),
+        budget_policy,
         ..bridge_core::accounting::AccountingV1::new(task_store.clone())
     };
     Arc::new(
@@ -9491,8 +9493,8 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
     );
 
-    let source = FileConfigSource::new(config_path.clone());
-    let snapshot = source.load().await?;
+    let budget_policy = governance_config::policy(&cfg)?;
+    let snapshot = governance_config::served_direct_snapshot(&cfg)?;
     // mcp never runs [verify] (implement-only) — nothing to include here.
     recover_orphans(&snapshot, &config_path, &host, None);
     if let Some(wc) = &worktree_cfg {
@@ -9615,6 +9617,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     )?;
 
     let coordinator = build_coordinator(
+        budget_policy.clone(),
         cfg.billing_provider_v1()?,
         session_manager,
         executor,
@@ -9635,7 +9638,11 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&perm_registry),
     );
 
-    coordinator.resume().await?;
+    if budget_policy.is_some() {
+        eprintln!("a2a-bridge: recovery disabled under caps; outstanding records preserved");
+    } else {
+        coordinator.resume().await?;
+    }
     bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
     Ok(())
 }
@@ -11145,10 +11152,7 @@ async fn main() -> Result<(), BoxError> {
         start: epoch_secs(),
     };
 
-    // Read the non-registry config sections (server addr, delegation) directly:
-    // the FileConfigSource snapshot carries registry and billing mappings. Re-parsing the same
-    // file is cheap and keeps the [server]/[delegation] parsing (incl. env-expansion)
-    // working on the RegistryConfig path.
+    // Parse once: runtime settings, registry/billing and governance share this value.
     let raw = std::fs::read_to_string(&config_path)?;
     let cfg = RegistryConfig::parse(&raw)?;
     let worktree_cfg = resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("serve: {e}"))?;
@@ -11180,11 +11184,13 @@ async fn main() -> Result<(), BoxError> {
         Some(Arc::clone(&liveness_board)),
     );
 
-    // 5. Config source + registry. `load()` is the initial desired state; the
-    //    delegation `[delegation]` env-expansion + `[server] addr` ride along on
-    //    the RegistryConfig we re-read below for the non-registry fields.
-    let source = FileConfigSource::new(config_path.clone());
-    let snapshot = source.load().await?; // initial desired state
+    // 5. Derive startup from the same parse; the watcher freezes even an absent policy.
+    let budget_policy = governance_config::policy(&cfg)?;
+    let source = FileConfigSource::served(
+        config_path.clone(),
+        budget_policy.as_ref().map(|p| p.digest()),
+    );
+    let snapshot = governance_config::served_direct_snapshot(&cfg)?;
     preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't responding at serve boot
                                          // Increment A before-first-use crash recovery: reap only DEAD
                                          // (same host + free lease) orphans of this instance's owners
@@ -11451,6 +11457,7 @@ async fn main() -> Result<(), BoxError> {
         &[],
     )?;
     let coordinator = build_coordinator(
+        budget_policy.clone(),
         billing,
         session_manager,
         executor,
@@ -11530,7 +11537,11 @@ async fn main() -> Result<(), BoxError> {
     //     batch::resume_all / detached::resume_non_batch_tasks over the SHARED store +
     //     BatchRuntime as the adapter's resume_working_tasks). This REPLACES the adapter
     //     call — NEVER both, or a working task double-spawns two runners (Fable M4).
-    coordinator.resume().await?;
+    if budget_policy.is_some() {
+        eprintln!("a2a-bridge: recovery disabled under caps; outstanding records preserved");
+    } else {
+        coordinator.resume().await?;
+    }
     if let Some(prometheus) = &prometheus_observer {
         match &workflow_history_for_metrics {
             Ok(history) => match history.completed_between(0, i64::MAX).await {
