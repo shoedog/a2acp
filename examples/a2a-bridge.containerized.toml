@@ -89,7 +89,14 @@ name = "test"
 #   --skip process::tests::{terminate_reaps_child_no_zombie,term_ignoring_loop_forces_group_sigkill,drop_group_kills_descendants}:
 #     the supervisor's zombie-reaping + process-group-SIGKILL/drop tests need host PID-1/signal semantics
 #     and a host-visible process table (container PID namespace breaks the grandchild-visibility precondition).
-cmd  = "cargo test --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
+# nextest (pinned 0.9.146 in deploy/containers/toolchain.Containerfile) prints a final failure summary, so a
+# truncated verify log still names every failing test (#223). Keep the filters as libtest-style `--skip`
+# words after a bare `--`: a quoted `-E '...'` filterset makes the command non-plain and forces an isolated
+# (cold) verify cache. nextest does not run doctests, hence the separate step below.
+cmd  = "cargo nextest run --workspace --locked --no-fail-fast --exclude bridge-container -- --skip process::tests::terminate_reaps_child_no_zombie --skip process::tests::term_ignoring_loop_forces_group_sigkill --skip process::tests::drop_group_kills_descendants"
+[[languages.verify]]
+name = "doctest"
+cmd  = "cargo test --workspace --locked --doc --exclude bridge-container"
 # opt-in coverage (instrumented recompile; reported, never gates):
 # [[languages.verify]]
 # name = "coverage"
