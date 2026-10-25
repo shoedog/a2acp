@@ -1,4 +1,4 @@
-//! Pure route admission; caps are active only for local workflows.
+//! Pure route admission; caps are active for local workflows and served direct turns.
 use crate::config::{ConfigError, RegistryConfig};
 use bridge_core::{governance::*, ids::AgentId};
 
@@ -28,18 +28,66 @@ pub fn validate(cfg: &RegistryConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 /// All general snapshot entrances fail before resolution or storage.
-/// Only the local workflow command may use the validated snapshot below.
+/// Activated commands use a dedicated validated entrance.
 pub fn local_workflow_snapshot(
     cfg: RegistryConfig,
 ) -> Result<bridge_core::domain::RegistrySnapshot, ConfigError> {
     validate(&cfg)?;
     cfg.into_validation_snapshot()
 }
+/// Only serve and MCP direct construction may use this entrance.
+pub fn served_direct_snapshot(
+    cfg: &RegistryConfig,
+) -> Result<bridge_core::domain::RegistrySnapshot, ConfigError> {
+    cfg.validation_snapshot()
+}
+
+pub struct ServedStartup {
+    pub config: RegistryConfig,
+    pub snapshot: bridge_core::domain::RegistrySnapshot,
+    pub policy: Option<std::sync::Arc<BudgetPolicyV1>>,
+}
+
+/// Both long-lived commands construct all startup state from this single parse.
+pub fn served_startup(raw: &str) -> Result<ServedStartup, ConfigError> {
+    let config = RegistryConfig::parse(raw)?;
+    let policy = policy(&config)?;
+    let snapshot = served_direct_snapshot(&config)?;
+    Ok(ServedStartup {
+        config,
+        snapshot,
+        policy,
+    })
+}
+
+pub fn policy(cfg: &RegistryConfig) -> Result<Option<std::sync::Arc<BudgetPolicyV1>>, ConfigError> {
+    validate(cfg)?;
+    cfg.governance
+        .as_ref()
+        .map(|caps| {
+            BudgetPolicyV1::new(caps.rules.clone(), caps.allowances.clone())
+                .map(std::sync::Arc::new)
+                .map_err(|e| ConfigError::Registry(e.into()))
+        })
+        .transpose()
+}
+
+/// Process-lifetime freeze, including an initially absent policy. Runs before
+/// emitting a snapshot, hence before recovery or registry/billing application.
+pub fn admit_reload(cfg: &RegistryConfig, frozen: Option<[u8; 32]>) -> Result<(), ConfigError> {
+    if policy(cfg)?.as_ref().map(|p| p.digest()) != frozen {
+        return Err(ConfigError::Registry(
+            "governance reload refused; retaining last-good configuration; changing caps requires restart".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn refuse_staged_execution(cfg: &RegistryConfig) -> Result<(), ConfigError> {
     validate(cfg)?;
     if cfg.governance.is_some() {
         return Err(ConfigError::Registry(
-            "budget execution is unavailable during governance staging for this route; only local run-workflow supports caps".into(),
+            "budget execution is unavailable during governance staging for this route; only local run-workflow, serve and mcp direct support caps".into(),
         ));
     }
     Ok(())
@@ -53,6 +101,40 @@ mod tests {
         "\n[[governance.rules]]\nid='request'\nselector='each_request'\nlimits={turns=0}\n";
     fn parse(extra: &str) -> Result<RegistryConfig, ConfigError> {
         RegistryConfig::parse(&format!("{BASE}{extra}"))
+    }
+    #[test]
+    fn startup_single_parse_and_policy_reload_controls() {
+        let raw = format!("{BASE}{RULE}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &raw).unwrap();
+        let captured = std::fs::read_to_string(&path).unwrap();
+        // An edit after the one startup read cannot mix runtime settings, policy or registry.
+        std::fs::write(
+            &path,
+            raw.replace("turns=0", "turns=1").replace("'a'", "'b'"),
+        )
+        .unwrap();
+        let startup = served_startup(&captured).unwrap();
+        let frozen = startup.policy.as_ref().unwrap().digest();
+        assert_eq!(startup.config.default, "a");
+        assert_eq!(startup.snapshot.default.as_str(), "a");
+        let edited = served_startup(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(edited.config.default, "b");
+        assert_eq!(edited.snapshot.default.as_str(), "b");
+        assert_ne!(edited.policy.unwrap().digest(), frozen);
+        assert!(startup.config.into_snapshot().is_err()); // generic consumers stay staged
+        for changed in [BASE.to_owned(), raw.replace("turns=0", "turns=1")] {
+            assert!(admit_reload(&RegistryConfig::parse(&changed).unwrap(), Some(frozen)).is_err());
+        }
+        assert!(admit_reload(&RegistryConfig::parse(&raw).unwrap(), None).is_err());
+        assert!(admit_reload(&RegistryConfig::parse(BASE).unwrap(), None).is_ok());
+        let second = RULE
+            .replace("id='request'", "id='daily'")
+            .replace("selector='each_request'", "selector={utc_day_agent='a'}");
+        let p = RegistryConfig::parse(&format!("{BASE}{RULE}{second}")).unwrap();
+        let reordered = RegistryConfig::parse(&format!("{BASE}{second}{RULE}")).unwrap();
+        assert!(admit_reload(&reordered, Some(policy(&p).unwrap().unwrap().digest())).is_ok());
     }
     #[tokio::test]
     async fn disabled_and_staged_zero() {
