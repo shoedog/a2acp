@@ -2527,7 +2527,11 @@ impl RegistryConfig {
 
     /// Pure snapshot for validators only; provider-capable entrances use `into_snapshot`.
     pub(crate) fn into_validation_snapshot(self) -> Result<RegistrySnapshot, ConfigError> {
-        crate::governance_config::validate(&self)?;
+        self.validation_snapshot()
+    }
+
+    pub(crate) fn validation_snapshot(&self) -> Result<RegistrySnapshot, ConfigError> {
+        crate::governance_config::validate(self)?;
         if self.agents.iter().any(|agent| !agent.skills.is_empty()) {
             return Err(ConfigError::Registry(
                 "skills are unsupported by this registry entrance until frozen delivery is wired"
@@ -2553,8 +2557,8 @@ impl RegistryConfig {
         // (`sb.runtime()`), not `cmd` (the inner cli) — so default on the runtime, else the entry would
         // self-reject at the snapshot-layer S3 allowlist.
         let allowed_cmds =
-            match self.registry {
-                Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds,
+            match &self.registry {
+                Some(r) if !r.allowed_cmds.is_empty() => r.allowed_cmds.clone(),
                 _ => {
                     let mut v: Vec<String> =
                         self.agents
@@ -2573,8 +2577,9 @@ impl RegistryConfig {
             };
 
         let mut entries = Vec::with_capacity(self.agents.len());
-        for a in self.agents {
-            let id = AgentId::parse(a.id).map_err(|e| ConfigError::Registry(e.to_string()))?;
+        for a in &self.agents {
+            let id =
+                AgentId::parse(a.id.clone()).map_err(|e| ConfigError::Registry(e.to_string()))?;
             if a.pre_authenticated && a.auth_method.is_some() {
                 return Err(ConfigError::Registry(format!(
                     "agent {:?}: pre_authenticated=true cannot be combined with auth_method",
@@ -2745,38 +2750,38 @@ impl RegistryConfig {
             };
             entries.push(AgentEntry {
                 id,
-                cmd: a.cmd,
-                base_url: a.base_url,
-                api_key_env: a.api_key_env,
-                args: a.args,
+                cmd: a.cmd.clone(),
+                base_url: a.base_url.clone(),
+                api_key_env: a.api_key_env.clone(),
+                args: a.args.clone(),
                 kind,
-                model_provider: a.model_provider,
-                model: a.model,
+                model_provider: a.model_provider.clone(),
+                model: a.model.clone(),
                 effort,
-                mode: a.mode,
+                mode: a.mode.clone(),
                 preflight: a.preflight,
-                fallback_models: a.fallback_models,
-                cwd: a.cwd,
-                session_cwd: a.session_cwd,
+                fallback_models: a.fallback_models.clone(),
+                cwd: a.cwd.clone(),
+                session_cwd: a.session_cwd.clone(),
                 sandbox,
                 watchdog,
                 liveness,
                 mcp,
                 mcp_delivery,
-                auth_method: a.auth_method,
+                auth_method: a.auth_method.clone(),
                 pre_authenticated: a.pre_authenticated,
                 host_fallback_eligible: a.host_fallback_eligible,
                 rename_new_sessions: a.rename_new_sessions,
-                name: a.name,
-                description: a.description,
-                tags: a.tags,
-                version: a.version,
-                extensions: a.extensions,
+                name: a.name.clone(),
+                description: a.description.clone(),
+                tags: a.tags.clone(),
+                version: a.version.clone(),
+                extensions: a.extensions.clone(),
             });
         }
 
-        let default =
-            AgentId::parse(self.default).map_err(|e| ConfigError::Registry(e.to_string()))?;
+        let default = AgentId::parse(self.default.clone())
+            .map_err(|e| ConfigError::Registry(e.to_string()))?;
 
         Ok(RegistrySnapshot {
             billing_identities,
@@ -2919,22 +2924,81 @@ fn parse_kind(s: &str) -> Result<AgentKind, ConfigError> {
 /// `RegistrySnapshot` from a TOML file and watches its parent directory for edits.
 pub struct FileConfigSource {
     path: std::path::PathBuf,
+    // Outer None is the generic, staged entrance; Some(None) freezes uncapped serve.
+    served_policy: Option<Option<[u8; 32]>>,
+}
+
+enum ReloadSnapshot {
+    Ready(RegistrySnapshot),
+    GovernanceRefused,
+    Failed,
 }
 
 impl FileConfigSource {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            served_policy: None,
+        }
+    }
+
+    pub fn served(path: impl Into<std::path::PathBuf>, policy: Option<[u8; 32]>) -> Self {
+        let mut source = Self::new(path);
+        source.served_policy = Some(policy);
+        source
+    }
+
+    fn admit_snapshot(
+        cfg: RegistryConfig,
+        frozen: Option<Option<[u8; 32]>>,
+    ) -> Result<RegistrySnapshot, ConfigError> {
+        match frozen {
+            None => cfg.into_snapshot(),
+            Some(digest) => {
+                crate::governance_config::admit_reload(&cfg, digest)?;
+                crate::governance_config::served_direct_snapshot(&cfg)
+            }
+        }
     }
 
     /// Read + parse the TOML at `path` into a `RegistrySnapshot`. Shared by `load()`
     /// and the watch task's re-load. `None` on read/parse failure (so the watch task
     /// can keep-last-good); `load()` maps the failure to a `BridgeError` instead.
+    #[cfg(test)]
     async fn try_load(path: &std::path::Path) -> Option<RegistrySnapshot> {
-        let s = tokio::fs::read_to_string(path).await.ok()?;
-        RegistryConfig::parse(&s)
-            .and_then(|c| c.into_snapshot())
-            .map_err(|error| tracing::error!(%error, "config reload refused; retaining last-good configuration"))
-            .ok()
+        match Self::try_load_policy(path, None).await {
+            ReloadSnapshot::Ready(snapshot) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    async fn try_load_policy(
+        path: &std::path::Path,
+        frozen: Option<Option<[u8; 32]>>,
+    ) -> ReloadSnapshot {
+        let Ok(raw) = tokio::fs::read_to_string(path).await else {
+            return ReloadSnapshot::Failed;
+        };
+        let cfg = match RegistryConfig::parse(&raw) {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                tracing::error!(%error, "config reload refused; retaining last-good configuration");
+                return ReloadSnapshot::Failed;
+            }
+        };
+        if let Some(digest) = frozen {
+            if let Err(error) = crate::governance_config::admit_reload(&cfg, digest) {
+                eprintln!("a2a-bridge: {error}");
+                return ReloadSnapshot::GovernanceRefused;
+            }
+        }
+        match Self::admit_snapshot(cfg, frozen) {
+            Ok(snapshot) => ReloadSnapshot::Ready(snapshot),
+            Err(error) => {
+                tracing::error!(%error, "config reload refused; retaining last-good configuration");
+                ReloadSnapshot::Failed
+            }
+        }
     }
 }
 
@@ -2947,7 +3011,7 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
             }
         })?;
         RegistryConfig::parse(&s)
-            .and_then(|c| c.into_snapshot())
+            .and_then(|c| Self::admit_snapshot(c, self.served_policy))
             .map_err(|e| bridge_core::error::BridgeError::ConfigInvalid {
                 reason: e.to_string(),
             })
@@ -2955,6 +3019,7 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
 
     fn watch(&self) -> futures::stream::BoxStream<'static, RegistrySnapshot> {
         let path = self.path.clone();
+        let frozen = self.served_policy;
         // (a) Watch the PARENT directory, not the file inode — atomic-rename saves
         // replace the inode, which a file-watch would miss after the first event.
         let parent = path
@@ -3031,18 +3096,16 @@ impl bridge_core::ports::ConfigSource for FileConfigSource {
                 while raw_rx.try_recv().is_ok() {}
 
                 // Re-load by PATH (not inode) so we pick up the freshly-renamed file.
-                match Self::try_load(&path).await {
+                match Self::try_load_policy(&path, frozen).await {
                     // (d) Keep-last-good: only emit on a successful parse.
-                    Some(snap) => {
+                    ReloadSnapshot::Ready(snap) => {
                         if tx.send(snap).await.is_err() {
                             break; // (e) receiver dropped → stop the task.
                         }
                     }
-                    None => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            "config reload failed; keeping last-good"
-                        );
+                    ReloadSnapshot::GovernanceRefused => {}
+                    ReloadSnapshot::Failed => {
+                        tracing::warn!(path = %path.display(), "config reload failed; keeping last-good");
                     }
                 }
             }

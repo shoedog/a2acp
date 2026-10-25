@@ -207,3 +207,8 @@ fn uncapped_cli_bytes_match_independent_success_and_failure_baselines() {
         }
     }
 }
+
+// The same executable direct fixture and independent pre-5a byte comparison are
+// exercised by this aggregate accounting target as well as governance_served.
+#[path = "../governance_served.rs"]
+mod served;

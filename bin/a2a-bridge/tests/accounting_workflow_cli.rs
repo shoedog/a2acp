@@ -567,16 +567,33 @@ fn governed_cli_overrun_succeeds_once_and_other_routes_refuse_before_prompt() {
         15
     );
     assert_eq!(cli.prompts().len(), 1);
-    for route in ["serve", "mcp", "models"] {
-        let result = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+    // Serve and MCP direct are activated; their bounded startup controls live in governance_served.
+    for route in ["models", "doctor"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
             .args([route, "--config"])
             .arg(&cli.config)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("{route} did not refuse within 10 seconds: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = child.wait_with_output().unwrap();
         assert!(!result.status.success());
         assert!(
-            String::from_utf8_lossy(&result.stderr)
-                .contains("only local run-workflow supports caps"),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            )
+            .contains("unavailable during governance staging"),
             "{route}: {}",
             String::from_utf8_lossy(&result.stderr)
         );

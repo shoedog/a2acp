@@ -2275,8 +2275,11 @@ async fn stream_message(
         Ok(())
     };
 
-    // Persist task->session before driving the backend.
-    let _ = srv.store.put(&routed.task, &routed.session).await;
+    // Preserve the uncapped entrance. Governed local dispatch publishes its mapping
+    // only after admission; refused fan-out must leave no mapping at all.
+    if !governed {
+        let _ = srv.store.put(&routed.task, &routed.session).await;
+    }
 
     // The SSE producer feeds events into an mpsc channel; the response stream
     // owns no borrowed references. Both the local and delegate paths reuse this
@@ -4650,7 +4653,11 @@ async fn unary_message(
     let mut detached_cleanup: Option<bridge_coordinator::dispatch::DetachedWarmCleanup> = None;
     let mut child_liveness = bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
 
-    let _ = srv.store.put(&routed.task, &routed.session).await;
+    // Governed local dispatch publishes only after admission. Unsupported workflows
+    // and preparation refusals must not leave a synthetic WORKING task behind.
+    if !srv.coordinator().has_budget_policy() {
+        let _ = srv.store.put(&routed.task, &routed.session).await;
+    }
 
     // Fan-out unary: collect all fanout::run events and build an a2a::Task
     // response with both labeled artifacts.
