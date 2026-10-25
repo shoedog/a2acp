@@ -7,6 +7,7 @@ name = "a2a-bridge"
 version = "0.3.1"
 dependencies = [
  "a2a-lf",
+ "agent-client-protocol",
  "arc-swap",
  "async-trait",
  "axum",

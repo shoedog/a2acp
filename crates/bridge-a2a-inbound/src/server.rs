@@ -64,7 +64,8 @@ use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::coordinator::StatusDto;
 use bridge_coordinator::dispatch::{
-    BindingGuard, LocalDispatch, TaskBinding, WarmCompletionExit, WarmCompletionGuard,
+    BindingGuard, ColdBindingLease, LocalDispatch, TaskBinding, WarmCompletionExit,
+    WarmCompletionGuard,
 };
 use bridge_coordinator::params::{
     validate_cwd_str, InjectParams, PermitParams, RequestLivenessParams,
@@ -142,6 +143,7 @@ pub struct InboundServer {
     /// supervisor covers disconnect/latch during the stream — so this is a GUARD,
     /// not a removed path.
     cancelled_peers: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    pending_cold: Arc<std::sync::Mutex<HashMap<TaskId, PendingCold>>>,
     /// Global root path that gates which per-request session cwds are permitted
     /// (session_cwd increment). `None` → no global root restriction.
     /// Wired from `allowed_cwd_root` in the top-level config via
@@ -193,6 +195,7 @@ impl InboundServer {
             delegation,
             local_source_label: local_source_label.into(),
             cancelled_peers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_cold: Default::default(),
             allowed_cwd_root: None,
             model_catalog: Arc::new(arc_swap::ArcSwap::from_pointee(
                 bridge_core::catalog::ModelCatalog::new(),
@@ -861,18 +864,17 @@ async fn governed_local_dispatch(
     let agent = resolved.entry.id.clone();
     let backend = resolved.backend;
     let lease: Arc<dyn Lease> = Arc::from(resolved.lease);
-    let claim = Arc::new(ColdTurnClaim {
+    let claim = |session| ColdTurnClaim {
         registry: srv.registry().clone(),
         entry: resolved.entry,
         backend: backend.clone(),
         lease: lease.clone(),
         bindings: srv.bindings().clone(),
         task: routed.task.clone(),
-        session: routed.session.clone(),
+        session,
         cleaned: Default::default(),
         applying: Default::default(),
-    });
-    claim.validate()?;
+    };
     let usage = srv
         .coordinator()
         .prepare_usage_selection(
@@ -895,9 +897,20 @@ async fn governed_local_dispatch(
             .settle(Some(usage))
             .await);
     }
+    // Mint only after admission and under publication exclusion. Configure is the
+    // sole subsequent preparation await; cancel snapshots the published key.
+    let mut bindings = srv.bindings().lock().await;
+    let claim = match mint_cold_session() {
+        Ok(session) => Arc::new(claim(session)),
+        Err(error) => {
+            drop(bindings);
+            return Err(AccountingFailureV1::before_prompt(error)
+                .settle(Some(usage))
+                .await);
+        }
+    };
     let mut applying = false;
     let prepared = async {
-        let mut bindings = srv.bindings().lock().await;
         if bindings.contains_key(&routed.task) {
             return Err(BridgeError::ConfigMismatch {
                 field: "cold binding identity",
@@ -910,7 +923,7 @@ async fn governed_local_dispatch(
             .store(true, std::sync::atomic::Ordering::SeqCst);
         backend
             .configure_session(
-                &routed.session,
+                &claim.session,
                 &SessionSpec {
                     config: eff.clone(),
                     cwd: routed.session_cwd.clone(),
@@ -928,19 +941,21 @@ async fn governed_local_dispatch(
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
+                session: claim.session.clone(),
                 agent,
                 backend: backend.clone(),
                 eff,
                 lease: lease.clone(),
             },
         );
+        let _ = srv.store.put(&routed.task, &claim.session).await;
         claim
             .applying
             .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(LocalDispatch {
             usage: None,
             backend,
-            session: routed.session.clone(),
+            session: claim.session.clone(),
             seed: None,
             injects: vec![],
             turn_meta: None,
@@ -952,6 +967,7 @@ async fn governed_local_dispatch(
         })
     }
     .await;
+    drop(bindings);
     let prepared = match prepared {
         Ok(dispatch) => Ok(dispatch),
         Err(error) => {
@@ -972,6 +988,33 @@ async fn governed_local_dispatch(
     Ok(dispatch)
 }
 
+// Registration/publication and cancel take bindings before pending_cold. Drop only
+// removes its own pending incarnation, including configure errors and dropped futures.
+struct PendingCold {
+    backend: Arc<dyn AgentBackend>,
+    lease: Arc<dyn Lease>,
+    session: SessionId,
+    abort: tokio_util::sync::CancellationToken,
+}
+
+struct PendingColdGuard {
+    pending: Arc<std::sync::Mutex<HashMap<TaskId, PendingCold>>>,
+    task: TaskId,
+    session: SessionId,
+}
+
+impl Drop for PendingColdGuard {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock().unwrap();
+        if pending
+            .get(&self.task)
+            .is_some_and(|p| p.session == self.session)
+        {
+            pending.remove(&self.task);
+        }
+    }
+}
+
 async fn resolve_configure_bind(
     srv: &InboundServer,
     agent_id: &AgentId,
@@ -980,7 +1023,6 @@ async fn resolve_configure_bind(
     session_cwd: Option<SessionCwd>,
     observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<LocalDispatch, BridgeError> {
-    let session = &routed.session;
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
     // route/resolve/recompute. Re-stash the bound effective config with the per-request
     // cwd (harmless idempotent overwrite; it only affects a not-yet-minted session,
@@ -988,6 +1030,7 @@ async fn resolve_configure_bind(
     {
         let bindings = srv.bindings().lock().await;
         if let Some(binding) = bindings.get(&routed.task) {
+            let session = binding.session.clone();
             let backend = binding.backend.clone();
             let bound_agent = binding.agent.clone();
             let eff = binding.eff.clone();
@@ -996,7 +1039,7 @@ async fn resolve_configure_bind(
             drop(bindings);
             backend
                 .configure_session(
-                    session,
+                    &session,
                     &SessionSpec {
                         config: eff.clone(),
                         cwd: session_cwd,
@@ -1031,33 +1074,74 @@ async fn resolve_configure_bind(
     let obs_model = eff.model.clone();
     let obs_effort = eff.effort;
     let obs_mode = eff.mode.clone();
-    resolved
-        .backend
+    let backend = resolved.backend.clone();
+    let bindings = srv.bindings().lock().await;
+    let session = mint_cold_session()?;
+    let lease = Arc::new(ColdBindingLease::new(
+        backend.clone(),
+        session.clone(),
+        Arc::from(resolved.lease),
+    ));
+    let canceled = tokio_util::sync::CancellationToken::new();
+    {
+        let mut pending = srv.pending_cold.lock().unwrap();
+        if bindings.contains_key(&routed.task) || pending.contains_key(&routed.task) {
+            return Err(BridgeError::ConfigMismatch {
+                field: "cold binding identity",
+            });
+        }
+        pending.insert(
+            routed.task.clone(),
+            PendingCold {
+                backend: backend.clone(),
+                lease: lease.clone(),
+                session: session.clone(),
+                abort: canceled.clone(),
+            },
+        );
+    }
+    let pending = PendingColdGuard {
+        pending: srv.pending_cold.clone(),
+        task: routed.task.clone(),
+        session: session.clone(),
+    };
+    drop(bindings);
+    backend
         .configure_session(
-            session,
+            &session,
             &SessionSpec {
                 config: eff.clone(),
                 cwd: session_cwd,
             },
         )
         .await?;
-    let backend = resolved.backend.clone();
-    let lease: Arc<dyn Lease> = Arc::from(resolved.lease);
-    srv.bindings().lock().await.insert(
-        routed.task.clone(),
-        TaskBinding {
-            agent: resolved.entry.id.clone(),
-            backend: backend.clone(),
-            eff,
-            lease: lease.clone(),
-        },
-    );
+    let mut bindings = srv.bindings().lock().await;
+    // Atomic with cancel_backend_for: cancel either latches preparation or sees
+    // the published tuple. A latched turn uses the ordinary abort projection.
+    drop(pending);
+    let abort = tokio_util::sync::CancellationToken::new();
+    if canceled.is_cancelled() {
+        abort.cancel();
+    } else {
+        bindings.insert(
+            routed.task.clone(),
+            TaskBinding {
+                session: session.clone(),
+                agent: resolved.entry.id.clone(),
+                backend: backend.clone(),
+                eff,
+                lease: lease.clone(),
+            },
+        );
+    }
     let guard = BindingGuard {
         bindings: srv.bindings().clone(),
         task: routed.task.clone(),
-        backend: backend.clone(),
+        backend: lease.clone(),
         session: session.clone(),
     };
+    let _ = srv.store.put(&routed.task, &session).await;
+    drop(bindings);
     Ok(LocalDispatch {
         usage: None,
         backend,
@@ -1075,9 +1159,12 @@ async fn resolve_configure_bind(
             obs_effort.map(effort_to_string),
             obs_mode,
         )?,
-        // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
-        abort: tokio_util::sync::CancellationToken::new(),
+        abort,
     })
+}
+
+fn mint_cold_session() -> Result<SessionId, BridgeError> {
+    SessionId::parse(format!("cold-{}", mint_turn_id()?.as_str()))
 }
 
 fn mint_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
@@ -1501,15 +1588,29 @@ async fn resolve_for_fanout(
 async fn cancel_backend_for(
     srv: &InboundServer,
     task: &TaskId,
-) -> Result<(Arc<dyn AgentBackend>, Arc<dyn Lease>), BridgeError> {
-    if let Some(binding) = srv.bindings().lock().await.get(task) {
-        return Ok((binding.backend.clone(), binding.lease.clone()));
+) -> Result<(Arc<dyn AgentBackend>, Arc<dyn Lease>, Option<SessionId>), BridgeError> {
+    let bindings = srv.bindings().lock().await;
+    if let Some(pending) = srv.pending_cold.lock().unwrap().get(task) {
+        pending.abort.cancel();
+        return Ok((
+            pending.backend.clone(),
+            pending.lease.clone(),
+            Some(pending.session.clone()),
+        ));
     }
+    if let Some(binding) = bindings.get(task) {
+        return Ok((
+            binding.backend.clone(),
+            binding.lease.clone(),
+            Some(binding.session.clone()),
+        ));
+    }
+    drop(bindings);
     // Fallback: no binding exists — resolve the registry default agent.
     // See function doc for the two legitimate no-binding cases this covers.
     let default = srv.registry().default_id();
     let resolved = srv.registry().resolve(&default).await?;
-    Ok((resolved.backend, Arc::from(resolved.lease)))
+    Ok((resolved.backend, Arc::from(resolved.lease), None))
 }
 
 // ---- axum handlers ----
@@ -2275,9 +2376,11 @@ async fn stream_message(
         Ok(())
     };
 
-    // Preserve the uncapped entrance. Governed local dispatch publishes its mapping
-    // only after admission; refused fan-out must leave no mapping at all.
-    if !governed {
+    // Governed local dispatch publishes its mapping only after admission; refused
+    // fan-out must leave no mapping at all. Cold local dispatch publishes its actual
+    // key under the binding lock.
+    if !governed && (!matches!(routed.target, RouteTarget::Local(_)) || routed.context_id.is_some())
+    {
         let _ = srv.store.put(&routed.task, &routed.session).await;
     }
 
@@ -2322,7 +2425,9 @@ async fn stream_message(
                 .await;
                 match dispatch {
                     Ok(dispatch) => {
-                        let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                        if routed.context_id.is_some() {
+                            let _ = srv.store.put(&routed.task, &dispatch.session).await;
+                        }
                         spawn_local_producer(&srv, routed, dispatch, diagnostic, tx, history)
                     }
                     Err(e) => {
@@ -4654,8 +4759,11 @@ async fn unary_message(
     let mut child_liveness = bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
 
     // Governed local dispatch publishes only after admission. Unsupported workflows
-    // and preparation refusals must not leave a synthetic WORKING task behind.
-    if !srv.coordinator().has_budget_policy() {
+    // and preparation refusals must not leave a synthetic WORKING task behind. Cold
+    // local dispatch publishes its actual key under the binding lock.
+    if !srv.coordinator().has_budget_policy()
+        && (!matches!(routed.target, RouteTarget::Local(_)) || routed.context_id.is_some())
+    {
         let _ = srv.store.put(&routed.task, &routed.session).await;
     }
 
@@ -4701,7 +4809,9 @@ async fn unary_message(
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
-            let _ = srv.store.put(&routed.task, &dispatch.session).await;
+            if routed.context_id.is_some() {
+                let _ = srv.store.put(&routed.task, &dispatch.session).await;
+            }
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
@@ -5508,8 +5618,11 @@ async fn cancel_task(
             // Prefer the task's bound instance; fall back to the default agent if no
             // binding exists yet (binding-or-fallback; T11 makes this binding-only).
             match cancel_backend_for(&srv, &task).await {
-                Ok((backend, _lease)) => {
-                    if let Err(e) = backend.cancel(&session).await {
+                Ok((backend, _lease, bound_session)) => {
+                    if let Err(e) = backend
+                        .cancel(bound_session.as_ref().unwrap_or(&session))
+                        .await
+                    {
                         first_err.get_or_insert(e);
                     }
                 }
@@ -5554,11 +5667,14 @@ async fn cancel_task(
                         .unwrap_or_else(|_| SessionId::parse("session-default").unwrap()),
                 };
                 // `_lease` keeps the backend leased until its cancel completes.
-                let (backend, _lease) = match cancel_backend_for(&srv, &task).await {
+                let (backend, _lease, bound_session) = match cancel_backend_for(&srv, &task).await {
                     Ok(target) => target,
                     Err(e) => return bridge_err_to_jsonrpc(id, &e),
                 };
-                if let Err(e) = backend.cancel(&session).await {
+                if let Err(e) = backend
+                    .cancel(bound_session.as_ref().unwrap_or(&session))
+                    .await
+                {
                     return bridge_err_to_jsonrpc(id, &e);
                 }
             }
@@ -13097,6 +13213,8 @@ mod tests {
         forgotten: Arc<Mutex<Vec<String>>>,
         cancels: Arc<Mutex<Vec<String>>>,
         configured: ConfiguredSessions,
+        configure_gate: Mutex<Option<oneshot::Receiver<()>>>,
+        configure_entered: tokio::sync::Notify,
         prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
         release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         release_started: Arc<tokio::sync::Notify>,
@@ -13111,6 +13229,8 @@ mod tests {
                 forgotten: Arc::new(Mutex::new(Vec::new())),
                 cancels: Arc::new(Mutex::new(Vec::new())),
                 configured: Arc::new(Mutex::new(Vec::new())),
+                configure_gate: Mutex::new(None),
+                configure_entered: tokio::sync::Notify::new(),
                 prompted_parts: Arc::new(Mutex::new(Vec::new())),
                 release_gate: Arc::new(Mutex::new(None)),
                 release_started: Arc::new(tokio::sync::Notify::new()),
@@ -13218,6 +13338,11 @@ mod tests {
                 session.as_str().to_owned(),
                 spec.cwd.as_ref().map(|cwd| cwd.as_str().to_owned()),
             ));
+            let gate = self.configure_gate.lock().unwrap().take();
+            self.configure_entered.notify_one();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             Ok(())
         }
 
@@ -17350,6 +17475,112 @@ mod tests {
             0,
             "the RAII guard must release the lease on early disconnect"
         );
+    }
+
+    fn cold_configure_server(backend: Arc<WarmRecordingBackend>) -> Arc<InboundServer> {
+        let registry = CountingRegistry::new(
+            "a",
+            vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)],
+        );
+        build_registry_store(registry, Arc::new(FakeStore::default()), "a")
+    }
+
+    async fn cold_configure_case(method: &'static str, cancel: bool, successor: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let backend = WarmRecordingBackend::new();
+            let srv = cold_configure_server(backend.clone());
+            let mut identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let task = identity.execution_id.as_str().to_owned();
+            for round in 0..=usize::from(successor) {
+                let (release, gate) = oneshot::channel();
+                *backend.configure_gate.lock().unwrap() = Some(gate);
+                let request = tokio::spawn(router(srv.clone()).oneshot(post_request(
+                    method,
+                    liveness_unary_msg(&identity, json!({})),
+                    "1.0",
+                )));
+                backend.configure_entered.notified().await;
+                let session = backend.configured()[round].0.clone();
+                if round == 0 && cancel {
+                    let response = spawn_cancel(&srv, &task).await.unwrap().unwrap();
+                    assert!(body_string(response).await.contains("TASK_STATE_CANCELED"));
+                    assert_eq!(backend.cancels(), vec![session.clone()]);
+                }
+                release.send(()).unwrap();
+                let response = request.await.unwrap().unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = body_string(response).await;
+                let expected = if round == 0 && cancel {
+                    "TASK_STATE_CANCELED"
+                } else {
+                    "TASK_STATE_COMPLETED"
+                };
+                assert!(body.contains(expected), "{body}");
+                assert_eq!(
+                    backend.sessions.lock().unwrap().len(),
+                    round + usize::from(!cancel)
+                );
+                await_binding(&srv, &task, false).await;
+                assert!(srv.pending_cold.lock().unwrap().is_empty());
+                wait_until(|| backend.forgotten().contains(&session)).await;
+                identity.attempt_id = bridge_core::ids::AttemptId::mint().unwrap();
+            }
+            if successor {
+                let sessions = backend.configured.lock().unwrap();
+                assert_ne!(sessions[0].0, sessions[1].0);
+            }
+        })
+        .await
+        .expect("cold configure test must finish");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_cold_configure() {
+        for method in [methods::SEND_STREAMING_MESSAGE, methods::SEND_MESSAGE] {
+            cold_configure_case(method, true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn no_cancel_control() {
+        for method in [methods::SEND_STREAMING_MESSAGE, methods::SEND_MESSAGE] {
+            cold_configure_case(method, false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_does_not_poison_successor() {
+        cold_configure_case(methods::SEND_STREAMING_MESSAGE, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_after_publication() {
+        let backend = WarmRecordingBackend::new();
+        let srv = cold_configure_server(backend.clone());
+        let routed = srv
+            .gate(
+                &HeaderMap::new(),
+                &json!({"taskId": "t-published", "message": {"text": "go"}}),
+            )
+            .unwrap();
+        let dispatch = resolve_configure_bind(
+            &srv,
+            &AgentId::parse("a").unwrap(),
+            &routed,
+            None,
+            None,
+            direct_diagnostic_observer(),
+        )
+        .await
+        .unwrap();
+        assert!(srv.pending_cold.lock().unwrap().is_empty());
+        let response = spawn_cancel(&srv, "t-published").await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            backend.cancels(),
+            vec![dispatch.session.as_str().to_owned()]
+        );
+        drop(dispatch);
     }
 
     // ---- Idle adapter retirement: served operations keep their backend leased ----
