@@ -701,24 +701,23 @@ impl ColdTurnClaim {
         );
         tokio::spawn(async move {
             let mut bindings = bindings.lock().await;
-            if bindings
+            let owns_binding = bindings
                 .get(&task)
-                .is_some_and(|b| !Arc::ptr_eq(&b.lease, &lease))
-            {
-                return Ok(bridge_core::ports::BackendCleanupDispositionV1::Preserved);
-            }
-            // Hold publication exclusion through cleanup; a successor must never be released.
+                .is_some_and(|b| Arc::ptr_eq(&b.lease, &lease) && b.session == session);
+            // Session keys identify incarnations independently of the task's current binding.
             let result = backend.release_session_checked(&session).await;
-            if let Some(binding) = bindings.get_mut(&task) {
+            if let Some(binding) = bindings.get_mut(&task).filter(|_| owns_binding) {
                 // Retain uncertain resources and refuse their reuse without forgetting their stash.
                 binding.lease = Arc::new(FailedColdLease {
                     _lease: binding.lease.clone(),
                 });
             }
-            if matches!(
-                result,
-                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
-            ) {
+            if owns_binding
+                && matches!(
+                    result,
+                    Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+                )
+            {
                 bindings.remove(&task);
             }
             result
@@ -897,9 +896,9 @@ async fn governed_local_dispatch(
             .settle(Some(usage))
             .await);
     }
-    // Mint only after admission and under publication exclusion. Configure is the
-    // sole subsequent preparation await; cancel snapshots the published key.
-    let mut bindings = srv.bindings().lock().await;
+    // Mint/register only after admission and under publication exclusion. Cancel
+    // latches this incarnation while configure runs without the global lock.
+    let bindings = srv.bindings().lock().await;
     let claim = match mint_cold_session() {
         Ok(session) => Arc::new(claim(session)),
         Err(error) => {
@@ -911,17 +910,40 @@ async fn governed_local_dispatch(
     };
     let mut applying = false;
     let prepared = async {
-        if bindings.contains_key(&routed.task) {
-            return Err(BridgeError::ConfigMismatch {
-                field: "cold binding identity",
-            });
+        let canceled = tokio_util::sync::CancellationToken::new();
+        {
+            let mut pending = srv.pending_cold.lock().unwrap();
+            if bindings.contains_key(&routed.task) || pending.contains_key(&routed.task) {
+                return Err(AccountingFailureV1::before_prompt(
+                    BridgeError::ConfigMismatch {
+                        field: "cold binding identity",
+                    },
+                ));
+            }
+            claim
+                .validate()
+                .map_err(AccountingFailureV1::before_prompt)?;
+            pending.insert(
+                routed.task.clone(),
+                PendingCold {
+                    backend: backend.clone(),
+                    lease: lease.clone(),
+                    session: claim.session.clone(),
+                    abort: canceled.clone(),
+                },
+            );
         }
-        claim.validate()?;
+        let pending = PendingColdGuard {
+            pending: srv.pending_cold.clone(),
+            task: routed.task.clone(),
+            session: claim.session.clone(),
+        };
+        drop(bindings);
         applying = true;
         claim
             .applying
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        backend
+        let configured = backend
             .configure_session(
                 &claim.session,
                 &SessionSpec {
@@ -929,15 +951,32 @@ async fn governed_local_dispatch(
                     cwd: routed.session_cwd.clone(),
                 },
             )
-            .await?;
-        claim.validate()?;
+            .await;
+        let mut bindings = srv.bindings().lock().await;
+        // Atomic with cancel_backend_for: cancel sees either pending or published.
+        drop(pending);
+        if canceled.is_cancelled() {
+            return Err(AccountingFailureV1::canceled_before_prompt());
+        }
+        configured.map_err(AccountingFailureV1::before_prompt)?;
+        if bindings.contains_key(&routed.task) {
+            return Err(AccountingFailureV1::before_prompt(
+                BridgeError::ConfigMismatch {
+                    field: "cold binding identity",
+                },
+            ));
+        }
+        claim
+            .validate()
+            .map_err(AccountingFailureV1::before_prompt)?;
         let obs_ctx = obs_ctx_for_dispatch(
             routed,
             &agent,
             eff.model.clone(),
             eff.effort.map(effort_to_string),
             eff.mode.clone(),
-        )?;
+        )
+        .map_err(AccountingFailureV1::before_prompt)?;
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
@@ -967,17 +1006,13 @@ async fn governed_local_dispatch(
         })
     }
     .await;
-    drop(bindings);
     let prepared = match prepared {
         Ok(dispatch) => Ok(dispatch),
-        Err(error) => {
-            let failure = AccountingFailureV1::before_prompt(error);
-            Err(if applying {
-                failure.with_checked_cleanup(claim.cleanup().await)
-            } else {
-                failure
-            })
-        }
+        Err(failure) => Err(if applying {
+            failure.with_checked_cleanup(claim.cleanup().await)
+        } else {
+            failure
+        }),
     };
     let (mut dispatch, usage) = bridge_core::translator::settle_usage_preparation_v1(
         prepared,
@@ -2439,8 +2474,16 @@ async fn stream_message(
                                     governed,
                                 )
                                 .await;
-                            let _ = tx.send(Err(e.surfaced_error())).await;
-                            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                            let outcome = if e.preparation_exit
+                                == bridge_core::translator::AccountingPreparationExitV1::Canceled
+                                && e.persistence.is_none()
+                            {
+                                TaskOutcome::Canceled
+                            } else {
+                                let _ = tx.send(Err(e.surfaced_error())).await;
+                                TaskOutcome::Failed
+                            };
+                            let _ = tx.send(Ok(Event::terminal(outcome))).await;
                         });
                     }
                 };
@@ -4806,6 +4849,23 @@ async fn unary_message(
                         srv.coordinator().has_budget_policy(),
                     )
                     .await;
+                    if e.preparation_exit
+                        == bridge_core::translator::AccountingPreparationExitV1::Canceled
+                        && e.persistence.is_none()
+                    {
+                        return jsonrpc_ok(
+                            id,
+                            json!({
+                                "task": {
+                                    "id": routed.task.as_str(),
+                                    "state": "TASK_STATE_CANCELED",
+                                    "metadata": attempt_identity_metadata(&supplied_identity, None),
+                                },
+                                "artifact": { "text": "" },
+                                "status": [],
+                            }),
+                        );
+                    }
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
@@ -17483,6 +17543,55 @@ mod tests {
             vec![(bare_entry("a"), backend as Arc<dyn AgentBackend>)],
         );
         build_registry_store(registry, Arc::new(FakeStore::default()), "a")
+    }
+
+    #[tokio::test]
+    async fn cold_cleanup_releases_old_session_after_successor_publication() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let backend = WarmRecordingBackend::new();
+            let srv = cold_configure_server(backend.clone());
+            let agent = AgentId::parse("a").unwrap();
+            let resolved = srv.registry().resolve(&agent).await.unwrap();
+            let task = TaskId::parse("cleanup-race").unwrap();
+            let session = mint_cold_session().unwrap();
+            let claim = ColdTurnClaim {
+                registry: srv.registry().clone(),
+                entry: resolved.entry,
+                backend: backend.clone(),
+                lease: Arc::from(resolved.lease),
+                bindings: srv.bindings().clone(),
+                task: task.clone(),
+                session: session.clone(),
+                cleaned: Default::default(),
+                applying: Default::default(),
+            };
+            // Publish a successor while old cleanup waits for the bindings lock.
+            let mut bindings = srv.bindings().lock().await;
+            let cleanup = claim.start_cleanup();
+            let successor = mint_cold_session().unwrap();
+            let lease: Arc<dyn Lease> = Arc::new(NoopLease);
+            bindings.insert(
+                task.clone(),
+                TaskBinding {
+                    session: successor.clone(),
+                    agent,
+                    backend: backend.clone(),
+                    eff: Default::default(),
+                    lease: lease.clone(),
+                },
+            );
+            drop(bindings);
+            assert_eq!(
+                cleanup.await.unwrap().unwrap(),
+                bridge_core::ports::BackendCleanupDispositionV1::Complete
+            );
+            assert_eq!(backend.forgotten(), [session.as_str()]);
+            let bindings = srv.bindings().lock().await;
+            assert_eq!(bindings[&task].session, successor);
+            assert!(Arc::ptr_eq(&bindings[&task].lease, &lease));
+        })
+        .await
+        .expect("old cleanup must finish without disturbing its successor");
     }
 
     async fn cold_configure_case(method: &'static str, cancel: bool, successor: bool) {
