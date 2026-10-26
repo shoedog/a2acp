@@ -1234,7 +1234,12 @@ async fn r3_policy_attach_rejects_live_context() {
 async fn config_reload_during_apply() {
     use futures::FutureExt;
     for method in ["SendMessage", "SendStreamingMessage", "Mcp"] {
-        for (state, failed_cleanup) in [("warm", false), ("warm", true), ("fresh", false)] {
+        for (state, failed_cleanup) in [
+            ("warm", false),
+            ("warm", true),
+            ("fresh", false),
+            ("fresh", true),
+        ] {
             if method == "Mcp" && state != "warm" {
                 continue;
             }
@@ -1322,6 +1327,11 @@ async fn config_reload_during_apply() {
                 assert_eq!(reservations(&f).len(), 1);
                 assert_eq!(prompts(&f), 0);
                 assert_eq!(f.backend.releases.lock().unwrap().len(), 1);
+                if state == "fresh" {
+                    // Failed checked cleanup must still evict this cold binding,
+                    // while its error reaches durable and served accounting below.
+                    wait_binding(&f, &identity, false).await;
+                }
                 let expected = if failed_cleanup {
                     if state == "warm" && !during_apply {
                         "failed"
