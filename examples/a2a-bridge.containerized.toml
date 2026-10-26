@@ -204,7 +204,7 @@ addr = "127.0.0.1:8080"
 [[agents]]
 id  = "claude"
 cmd = "claude-agent-acp"
-model = "sonnet"   # alias; resolves to claude-sonnet-5-5 on claude-agent-acp 0.93.0 (docs/compatibility.md 2026-10-17)
+model = "sonnet"   # alias; resolves to claude-sonnet-5-5 on claude-agent-acp 0.93.0 and 0.97.0 (docs/compatibility.md)
 [[agents.mcp]]
 name = "prism"
 command = "/Users/wesleyjinks/code/slicing/target/release/prism-mcp"
@@ -330,6 +330,36 @@ volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/au
 # so RA never fetches; --target-cache /lsp-target is the writable per-repo CARGO_TARGET_DIR; the call log lands
 # under the clone's .git/ (survives --rm, fetched at hand-off). Both /cargo + /lsp-target are runtime-derived
 # named volumes appended in main.rs (per-clone names, NOT static).
+[[agents.mcp]]
+name = "lsp"
+command = "/usr/local/bin/lsp-mcp"
+args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/lsp-target"]
+[[agents.mcp.env]]
+name = "LSP_MCP_LOG"
+value = "{cwd}/.git/a2a-bridge/lsp-mcp-calls.log"
+
+# ── impl-terra: the `impl` implementor pinned to gpt-6.1-terra, a lower-cost Codex model for normal
+#    implementation (docs/compatibility.md 2026-10-26: codex-acp 2.3.0 advertises gpt-6.1-terra low..ultra).
+#    Select it with `implement --config <this file>` plus an implement workflow whose impl node names it, or
+#    per request with `a2a-bridge.model=gpt-6.1-terra` on `impl`.
+[[agents]]
+id     = "impl-terra"
+kind   = "container_rw"
+cmd    = "codex-acp"
+pre_authenticated = true
+model  = "gpt-6.1-terra"
+effort = "high"
+mode   = "agent-full-access"
+args   = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+[agents.sandbox]
+image   = "a2a-toolchain:latest"
+mount   = "/Users/wesleyjinks/code"
+access  = "rw"
+egress  = "locked"
+network = "a2a-egress-internal"
+proxy   = "http://a2a-egress-proxy:8888"
+no_proxy = "localhost,127.0.0.1,::1"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
 [[agents.mcp]]
 name = "lsp"
 command = "/usr/local/bin/lsp-mcp"

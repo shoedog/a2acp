@@ -69,6 +69,45 @@ fake adapter. With the option on, one served fixed-`PONG` turn passed on codex-a
 serve; one `prism-mcp` instead of two, freed about 60 s after release), and the codex host lane of the
 2026-10-13 provider refresh below passed on codex-acp 2.2.2 with the option on.
 
+## Provider refresh — 2026-10-26 (codex-acp 2.3.0, claude-agent-acp 0.97.0, `gpt-6.1-terra`)
+
+Motive: routine adapter refresh, and adopting `gpt-6.1-terra` as the Terra implementation model. codex-acp 2.3.0
+declares Codex `^0.164.0` (resolved 0.164.0). claude-agent-acp 0.97.0 pins Agent SDK 0.3.310 (bundled Claude Code
+2.1.310). Kiro and OpenCode pins are unchanged. Both adapter releases were published the same day, so they were staged
+in a separate npm prefix behind an absolute-path candidate config and verified before promotion.
+
+Binary: operator release `a2a-bridge` 0.3.1 built from `main` `64cb5a84`, SHA-256
+`c7bb41e2ba1c3524df2e0e20fd646478cae7ee9fdbe6b25de2edd37f920a89d5`. Images (linux/arm64): reader
+`sha256:8bbc2816fcf50efb09ff199c95d8e74c87594dc4afffec911a3e2de9eb5c9c2d`, and toolchain
+`sha256:4b8dd7b0dd0538ee9ef3eb5ff1719f22c84adc5a17074d648093601f1888ca35` built `FROM` that reader. Both carry the
+`codex-acp=2.3.0` / `codex=0.164.0` / `claude-agent-acp=0.97.0` / `claude-agent-sdk=0.3.310` provenance labels.
+
+**Catalogs.**
+- **Codex:** both 2.2.2 and 2.3.0 advertise `gpt-6.1-terra` at `low`..`ultra`. The catalog comes from the service, so
+  the model was already selectable per request before this refresh.
+- **Claude:** the 0.97.0 catalog is identical to 0.93.0's (aliases `opus`/`sonnet`/`haiku`, `claude-sonnet-5`,
+  `claude-opus-5`, and so on). The `sonnet` alias still resolves to `claude-sonnet-5-5`: the container transcript's
+  `"model"` field records it, on Claude Code 2.1.310.
+- **Cold start:** the first `models` probe of the freshly installed codex-acp 2.3.0 timed out at 20 s. The immediate
+  re-probe answered in about 1 s with the full catalog, so this was a cold first exec; serve's startup catalog retry
+  covers it.
+
+Every lane ran exactly one fixed `PONG` prompt (`--acknowledge-billable`, no retry). Each artifact records
+`success: true`, terminal state `completed`, one prompt call, `exact_pong: true`, stop reason `end_turn` and
+`timed_out: false`:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Codex host (ACP 2.3.0, read-only) | `gpt-6.1-terra` / `low` | **PASS** | `attempt-3b8a59f4…` |
+| Claude host (ACP 0.97.0) | `haiku` / `low` | **PASS** | `attempt-174e15eb…`; USD 0.0075 |
+| Codex reader (reader `8bbc2816…`, `:ro`) | `gpt-6-luna` / `low` | **PASS** | `attempt-426bb909…` |
+| Claude reader (reader `8bbc2816…`, `:ro`) | `haiku` / `low` | **PASS** | `attempt-7c7ce6a5…`; USD 0.0037 |
+| Codex container implementor (`container_rw`, toolchain `4b8dd7b0…`) | `gpt-6.1-terra` / `high` | **PASS** | `attempt-2892afa2…`; session cwd a throwaway git directory |
+| Claude container implementor (`container_rw`, toolchain `4b8dd7b0…`, `acceptEdits`) | `sonnet` / `high` | **PASS** | `attempt-690336b7…`; USD 0.040; transcript `claude-sonnet-5-5` |
+
+Both `container_rw` artifacts record `target.model_catalog` as `catalog_unavailable`. The 2026-10-17 `container_rw`
+artifact on 0.93.0 records the same, so this is how `container_rw` smokes behave, not a regression.
+
 ## Claude refresh — 2026-10-17 (claude-agent-acp 0.93.0, Sonnet 5.5 implementor)
 
 Motive: run Sonnet 5.5 as a second reviewer and as a containerized implementor. Claude ACP 0.93.0 declares Agent

@@ -2,17 +2,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const REQUIRED_READER_PINS: &[&str] = &[
-    "@agentclientprotocol/codex-acp@2.2.2",
-    "@openai/codex@0.162.1",
-    "@agentclientprotocol/claude-agent-acp@0.93.0",
-    "@anthropic-ai/claude-agent-sdk@0.3.300",
+    "@agentclientprotocol/codex-acp@2.3.0",
+    "@openai/codex@0.164.0",
+    "@agentclientprotocol/claude-agent-acp@0.97.0",
+    "@anthropic-ai/claude-agent-sdk@0.3.310",
     "opencode-ai@1.18.27",
     "test \"$(opencode --version)\" = \"1.18.27\"",
-    "claudeCodeVersion\")\" = \"2.1.300\"",
-    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.2.2\"",
-    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.162.1\"",
-    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.93.0\"",
-    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.300\"",
+    "claudeCodeVersion\")\" = \"2.1.310\"",
+    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.3.0\"",
+    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.164.0\"",
+    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.97.0\"",
+    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.310\"",
     "io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.18.27\"",
     "io.a2a-bridge.provenance.kiro.agent-cli=\"kiro-cli=2.24.1\"",
     "ARG KIRO_CLI_VERSION=2.24.1",
@@ -128,10 +128,10 @@ fn reader_pin_guard_rejects_floating_or_mismatched_nested_versions() {
     let valid = REQUIRED_READER_PINS.join("\n");
     assert!(validate_reader_pins(&valid).is_ok());
 
-    let floating_codex = valid.replace("@openai/codex@0.162.1", "@openai/codex@latest");
+    let floating_codex = valid.replace("@openai/codex@0.164.0", "@openai/codex@latest");
     assert!(validate_reader_pins(&floating_codex).is_err());
 
-    let mismatched_claude = valid.replace("2.1.300", "2.1.303");
+    let mismatched_claude = valid.replace("2.1.310", "2.1.313");
     assert!(validate_reader_pins(&mismatched_claude).is_err());
 
     let floating_opencode = valid.replace("opencode-ai@1.18.27", "opencode-ai@latest");
