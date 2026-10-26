@@ -9,6 +9,10 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- Reader and toolchain images pin codex-acp 2.3.0 (Codex 0.164.0) and claude-agent-acp 0.97.0 (Agent SDK 0.3.310 /
+  Claude Code 2.1.310); they were 2.2.2 / 0.162.1 and 0.93.0 / 0.3.300 / 2.1.300. The containerized example adds an
+  `impl-terra` implementor pinned to `gpt-6.1-terra`. Host, reader and `container_rw` fixed-`PONG` lanes passed; see
+  `docs/compatibility.md`.
 - Reader and toolchain images pin claude-agent-acp 0.93.0 with Agent SDK 0.3.300 / Claude Code 2.1.300
   (was 0.90.0 / 0.3.296 / 2.1.296). New `deploy/containers/claude-sonnet-impl-settings.json` pins the
   `sonnet` alias to `claude-sonnet-5-5` for containerized Claude implementors and reviewers. Host, reader

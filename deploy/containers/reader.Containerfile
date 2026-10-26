@@ -9,36 +9,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the ACP agent CLIs (portable Node packages; candidate evidence for these pins: docs/compatibility.md,
-# provider refresh 2026-10-13; claude refresh 2026-10-17).
+# provider refresh 2026-10-26).
 # claude-agent-acp pulls @anthropic-ai/claude-agent-sdk, whose optional dep is the platform `claude`
 # binary — the LINUX build resolves here, not the host's macOS one.
 RUN npm install -g \
-      @agentclientprotocol/claude-agent-acp@0.93.0 \
-      @agentclientprotocol/codex-acp@2.2.2 \
+      @agentclientprotocol/claude-agent-acp@0.97.0 \
+      @agentclientprotocol/codex-acp@2.3.0 \
       opencode-ai@1.18.27 \
     && npm install \
       --prefix /usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp \
       --omit=dev --no-save --package-lock=false \
-      @anthropic-ai/claude-agent-sdk@0.3.300 \
+      @anthropic-ai/claude-agent-sdk@0.3.310 \
     && npm install \
       --prefix /usr/local/lib/node_modules/@agentclientprotocol/codex-acp \
       --omit=dev --no-save --package-lock=false \
-      @openai/codex@0.162.1
+      @openai/codex@0.164.0
 
 # R3b: a pinned compatibility canary must bind the package identities inside the immutable image,
 # not guess from the host. Fail the build if npm resolved different transitive agent packages, then
 # publish only these non-secret exact identities as image metadata for bounded `image inspect`.
-RUN test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "2.2.2" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")" = "0.162.1" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")" = "0.93.0" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")" = "0.3.300" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.300" \
+RUN test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "2.3.0" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")" = "0.164.0" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")" = "0.97.0" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")" = "0.3.310" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.310" \
     && test "$(opencode --version)" = "1.18.27"
 
-LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.2.2" \
-      io.a2a-bridge.provenance.codex.agent-cli="@openai/codex=0.162.1" \
-      io.a2a-bridge.provenance.claude.adapter="@agentclientprotocol/claude-agent-acp=0.93.0" \
-      io.a2a-bridge.provenance.claude.agent-cli="@anthropic-ai/claude-agent-sdk=0.3.300" \
+LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.3.0" \
+      io.a2a-bridge.provenance.codex.agent-cli="@openai/codex=0.164.0" \
+      io.a2a-bridge.provenance.claude.adapter="@agentclientprotocol/claude-agent-acp=0.97.0" \
+      io.a2a-bridge.provenance.claude.agent-cli="@anthropic-ai/claude-agent-sdk=0.3.310" \
       io.a2a-bridge.provenance.opencode.agent-cli="opencode-ai=1.18.27" \
       io.a2a-bridge.provenance.kiro.agent-cli="kiro-cli=2.24.1"
 
