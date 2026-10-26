@@ -983,6 +983,9 @@ async fn r3_concurrent_fresh_same_task() {
         let policy =
             Arc::new(BudgetPolicyV1::new(vec![rule(EachRequest, Some(10), None)], vec![]).unwrap());
         let f = Fixture::with_policy(backend, registry.clone(), Some(policy));
+        // Pending cold incarnations belong to the served adapter, so every
+        // competing request must use this same server instance.
+        let router = f.router(false);
         let first = owner();
         let task = owner();
         let next = followup(&task);
@@ -991,7 +994,7 @@ async fn r3_concurrent_fresh_same_task() {
         let (finish, prompt_gate) = tokio::sync::oneshot::channel();
         *f.backend.prompt_gate.lock().unwrap() = Some(prompt_gate);
         let response = cold_response(
-            f.router(false),
+            router.clone(),
             "SendStreamingMessage",
             &first,
             &task,
@@ -999,11 +1002,11 @@ async fn r3_concurrent_fresh_same_task() {
         )
         .await;
         wait_for(|| registry.entered.load(Ordering::SeqCst) == 1).await;
-        let router = f.router(false);
+        let second_router = router.clone();
         let second_identity = next.clone();
         let second = tokio::spawn(async move {
             rpc_on(
-                router,
+                second_router,
                 method,
                 cold_params(&second_identity, &second_identity, "good"),
             )
@@ -1013,7 +1016,7 @@ async fn r3_concurrent_fresh_same_task() {
         first_ready.send(()).unwrap();
         wait_for(|| f.backend.effects.lock().unwrap().contains(&"configure")).await;
         // Both requests passed the no-binding seam. The second commits admission while
-        // the first owns the apply lock and is still configuring.
+        // the first owns the pending incarnation and is still configuring.
         second_ready.send(()).unwrap();
         wait_for(|| reservations(&f).len() == 2).await;
         assert_eq!(*f.backend.effects.lock().unwrap(), ["configure"]);
@@ -1035,7 +1038,7 @@ async fn r3_concurrent_fresh_same_task() {
         candidates.sort();
         assert_eq!(candidates, ["good", "model"]);
         // A third arrival sees the published winner and must take the pre-admission refusal.
-        assert_cold_refusal(&f, f.router(false), method, &followup(&task)).await;
+        assert_cold_refusal(&f, router, method, &followup(&task)).await;
         finish.send(()).unwrap();
         assert!(response_text(response).await.contains("answer"));
         wait_binding(&f, &task, false).await;
@@ -1993,4 +1996,211 @@ async fn concurrent_fresh_keys() {
         assert!(response_text(a).await.contains("answer"));
         wait_binding(&f, &task, false).await;
     }
+}
+
+async fn capped_configure_case(cancel: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for method in ["SendMessage", "SendStreamingMessage"] {
+            let f = governed(1);
+            let router = f.router(false);
+            let identity = owner();
+            let (release, gate) = tokio::sync::oneshot::channel();
+            *f.backend.configure_gate.lock().unwrap() = Some(gate);
+            let params = cold_params(&identity, &identity, "model");
+            let request = tokio::spawn(rpc_on(router.clone(), method, params));
+            wait_for(|| !f.backend.configured_sessions.lock().unwrap().is_empty()).await;
+            let session = f.backend.configured_sessions.lock().unwrap()[0].0.clone();
+            assert_eq!(prompts(&f), 0);
+            assert_eq!(reservations(&f).len(), 1, "admit precedes configure");
+            if cancel {
+                let body = rpc_on(
+                    router.clone(),
+                    "CancelTask",
+                    json!({"id":identity.execution_id.as_str()}),
+                )
+                .await;
+                assert!(body.contains("TASK_STATE_CANCELED"), "{body}");
+                assert!(f.backend.effects.lock().unwrap().contains(&"cancel"));
+            }
+            release.send(()).unwrap();
+            let body = request.await.unwrap();
+            let state = if cancel { "CANCELED" } else { "COMPLETED" };
+            assert!(body.contains(&format!("TASK_STATE_{state}")), "{body}");
+            assert!(!body.contains("TASK_STATE_FAILED"), "{body}");
+            assert_eq!(prompts(&f), usize::from(!cancel));
+            wait_binding(&f, &identity, false).await;
+            let rows = f.rows();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].finalized);
+            // Admission conservatively marks usage dispatched; pre-prompt
+            // cancellation finalizes that reservation without provider actuals.
+            assert!(rows[0].dispatched);
+            assert_eq!(rows[0].usage.terminal.is_none(), cancel);
+            let saved = f
+                .store
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let terminal = saved.terminal.unwrap();
+            assert_eq!(
+                terminal.outcome,
+                if cancel { "canceled" } else { "completed" }
+            );
+            if cancel {
+                assert_eq!(terminal.terminal_reason, "pre_prompt_failure");
+                assert_eq!(terminal.prompt_acceptance, "not_dispatched");
+                assert_eq!(terminal.cleanup_disposition, "complete");
+                assert_eq!(*f.backend.releases.lock().unwrap(), [session]);
+                // Reuse the same server/task after cleanup: neither the pending
+                // registration nor its cancellation latch may poison a successor.
+                let next = owner();
+                let body = rpc_on(
+                    router,
+                    "SendStreamingMessage",
+                    cold_params(&next, &identity, "model"),
+                )
+                .await;
+                assert!(body.contains("TASK_STATE_COMPLETED"), "{body}");
+                assert_eq!(prompts(&f), 1);
+            }
+        }
+    })
+    .await
+    .expect("capped configure/cancel must finish");
+}
+
+#[tokio::test]
+async fn capped_cancel_during_configure() {
+    capped_configure_case(true).await;
+}
+
+#[tokio::test]
+async fn capped_no_cancel_control() {
+    capped_configure_case(false).await;
+}
+
+struct CancellableRecording {
+    inner: Arc<Recording>,
+    aborts:
+        std::sync::Mutex<std::collections::HashMap<SessionId, tokio_util::sync::CancellationToken>>,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for CancellableRecording {
+    fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
+        self.inner.resource_flight_v1()
+    }
+    async fn configure_session(
+        &self,
+        s: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<(), BridgeError> {
+        self.inner.configure_session(s, spec).await
+    }
+    async fn prompt(&self, s: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        let abort = tokio_util::sync::CancellationToken::new();
+        self.aborts.lock().unwrap().insert(s.clone(), abort.clone());
+        tokio::select! {
+            biased;
+            _ = abort.cancelled() => Ok(Box::pin(futures::stream::iter([
+                Ok(Update::done(STOP_REASON_CANCELLED)),
+            ])) as BackendStream),
+            result = self.inner.prompt(s, parts) => result,
+        }
+    }
+    async fn cancel(&self, s: &SessionId) -> Result<(), BridgeError> {
+        if let Some(abort) = self.aborts.lock().unwrap().get(s) {
+            abort.cancel();
+        }
+        self.inner.cancel(s).await
+    }
+    async fn forget_session(&self, s: &SessionId) {
+        self.aborts.lock().unwrap().remove(s);
+        self.inner.forget_session(s).await;
+    }
+}
+
+#[tokio::test]
+async fn capped_configure_does_not_block_others() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let recording = Arc::new(Recording::default());
+        let backend = Arc::new(CancellableRecording {
+            inner: recording.clone(),
+            aborts: Default::default(),
+        });
+        let registry = crate::common::single_agent_registry("agent", backend);
+        let policy = BudgetPolicyV1::new(vec![rule(EachRequest, Some(10), None)], vec![]).unwrap();
+        let f = Fixture::with_policy(recording, registry, Some(Arc::new(policy)));
+        let router = f.router(false);
+        // B is running; C is another producer that will finish while A configures.
+        let b = owner();
+        let c = owner();
+        let (_finish_b, gate) = tokio::sync::oneshot::channel();
+        *f.backend.prompt_gate.lock().unwrap() = Some(gate);
+        let response_b =
+            cold_response(router.clone(), "SendStreamingMessage", &b, &b, "model").await;
+        wait_for(|| prompts(&f) == 1).await;
+        let (finish_c, gate) = tokio::sync::oneshot::channel();
+        *f.backend.prompt_gate.lock().unwrap() = Some(gate);
+        let response_c =
+            cold_response(router.clone(), "SendStreamingMessage", &c, &c, "model").await;
+        wait_for(|| prompts(&f) == 2).await;
+        let session_c = f.backend.configured_sessions.lock().unwrap()[1].0.clone();
+        let a = owner();
+        let (release_a, gate) = tokio::sync::oneshot::channel();
+        *f.backend.configure_gate.lock().unwrap() = Some(gate);
+        let request_a = tokio::spawn(rpc_on(
+            router.clone(),
+            "SendStreamingMessage",
+            cold_params(&a, &a, "model"),
+        ));
+        wait_for(|| f.backend.configured_sessions.lock().unwrap().len() == 3).await;
+
+        let canceled = rpc_on(
+            router.clone(),
+            "CancelTask",
+            json!({"id":b.execution_id.as_str()}),
+        )
+        .await;
+        assert!(canceled.contains("TASK_STATE_CANCELED"), "{canceled}");
+        assert_eq!(
+            f.backend
+                .effects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == "cancel")
+                .count(),
+            1
+        );
+        assert!(response_text(response_b)
+            .await
+            .contains("TASK_STATE_CANCELED"));
+        let d = owner();
+        let independent =
+            rpc_on(router, "SendStreamingMessage", cold_params(&d, &d, "model")).await;
+        assert!(
+            independent.contains("TASK_STATE_COMPLETED"),
+            "{independent}"
+        );
+        finish_c.send(()).unwrap();
+        assert!(response_text(response_c)
+            .await
+            .contains("TASK_STATE_COMPLETED"));
+        wait_binding(&f, &c, false).await;
+        wait_for(|| f.backend.forgets.lock().unwrap().contains(&session_c)).await;
+        assert_eq!(
+            prompts(&f),
+            3,
+            "A must remain unprompted until configure resumes"
+        );
+
+        release_a.send(()).unwrap();
+        assert!(request_a.await.unwrap().contains("TASK_STATE_COMPLETED"));
+        wait_binding(&f, &a, false).await;
+        wait_binding(&f, &b, false).await;
+    })
+    .await
+    .expect("unrelated cancel/bind/eviction must finish while capped configure is parked");
 }

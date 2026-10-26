@@ -897,9 +897,9 @@ async fn governed_local_dispatch(
             .settle(Some(usage))
             .await);
     }
-    // Mint only after admission and under publication exclusion. Configure is the
-    // sole subsequent preparation await; cancel snapshots the published key.
-    let mut bindings = srv.bindings().lock().await;
+    // Mint/register only after admission and under publication exclusion. Cancel
+    // latches this incarnation while configure runs without the global lock.
+    let bindings = srv.bindings().lock().await;
     let claim = match mint_cold_session() {
         Ok(session) => Arc::new(claim(session)),
         Err(error) => {
@@ -911,12 +911,35 @@ async fn governed_local_dispatch(
     };
     let mut applying = false;
     let prepared = async {
-        if bindings.contains_key(&routed.task) {
-            return Err(BridgeError::ConfigMismatch {
-                field: "cold binding identity",
-            });
+        let canceled = tokio_util::sync::CancellationToken::new();
+        {
+            let mut pending = srv.pending_cold.lock().unwrap();
+            if bindings.contains_key(&routed.task) || pending.contains_key(&routed.task) {
+                return Err(AccountingFailureV1::before_prompt(
+                    BridgeError::ConfigMismatch {
+                        field: "cold binding identity",
+                    },
+                ));
+            }
+            claim
+                .validate()
+                .map_err(AccountingFailureV1::before_prompt)?;
+            pending.insert(
+                routed.task.clone(),
+                PendingCold {
+                    backend: backend.clone(),
+                    lease: lease.clone(),
+                    session: claim.session.clone(),
+                    abort: canceled.clone(),
+                },
+            );
         }
-        claim.validate()?;
+        let pending = PendingColdGuard {
+            pending: srv.pending_cold.clone(),
+            task: routed.task.clone(),
+            session: claim.session.clone(),
+        };
+        drop(bindings);
         applying = true;
         claim
             .applying
@@ -929,15 +952,32 @@ async fn governed_local_dispatch(
                     cwd: routed.session_cwd.clone(),
                 },
             )
-            .await?;
-        claim.validate()?;
+            .await
+            .map_err(AccountingFailureV1::before_prompt)?;
+        let mut bindings = srv.bindings().lock().await;
+        // Atomic with cancel_backend_for: cancel sees either pending or published.
+        drop(pending);
+        if canceled.is_cancelled() {
+            return Err(AccountingFailureV1::canceled_before_prompt());
+        }
+        if bindings.contains_key(&routed.task) {
+            return Err(AccountingFailureV1::before_prompt(
+                BridgeError::ConfigMismatch {
+                    field: "cold binding identity",
+                },
+            ));
+        }
+        claim
+            .validate()
+            .map_err(AccountingFailureV1::before_prompt)?;
         let obs_ctx = obs_ctx_for_dispatch(
             routed,
             &agent,
             eff.model.clone(),
             eff.effort.map(effort_to_string),
             eff.mode.clone(),
-        )?;
+        )
+        .map_err(AccountingFailureV1::before_prompt)?;
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
@@ -967,17 +1007,13 @@ async fn governed_local_dispatch(
         })
     }
     .await;
-    drop(bindings);
     let prepared = match prepared {
         Ok(dispatch) => Ok(dispatch),
-        Err(error) => {
-            let failure = AccountingFailureV1::before_prompt(error);
-            Err(if applying {
-                failure.with_checked_cleanup(claim.cleanup().await)
-            } else {
-                failure
-            })
-        }
+        Err(failure) => Err(if applying {
+            failure.with_checked_cleanup(claim.cleanup().await)
+        } else {
+            failure
+        }),
     };
     let (mut dispatch, usage) = bridge_core::translator::settle_usage_preparation_v1(
         prepared,
@@ -2439,8 +2475,16 @@ async fn stream_message(
                                     governed,
                                 )
                                 .await;
-                            let _ = tx.send(Err(e.surfaced_error())).await;
-                            let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
+                            let outcome = if e.preparation_exit
+                                == bridge_core::translator::AccountingPreparationExitV1::Canceled
+                                && e.persistence.is_none()
+                            {
+                                TaskOutcome::Canceled
+                            } else {
+                                let _ = tx.send(Err(e.surfaced_error())).await;
+                                TaskOutcome::Failed
+                            };
+                            let _ = tx.send(Ok(Event::terminal(outcome))).await;
                         });
                     }
                 };
@@ -4806,6 +4850,23 @@ async fn unary_message(
                         srv.coordinator().has_budget_policy(),
                     )
                     .await;
+                    if e.preparation_exit
+                        == bridge_core::translator::AccountingPreparationExitV1::Canceled
+                        && e.persistence.is_none()
+                    {
+                        return jsonrpc_ok(
+                            id,
+                            json!({
+                                "task": {
+                                    "id": routed.task.as_str(),
+                                    "state": "TASK_STATE_CANCELED",
+                                    "metadata": attempt_identity_metadata(&supplied_identity, None),
+                                },
+                                "artifact": { "text": "" },
+                                "status": [],
+                            }),
+                        );
+                    }
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
