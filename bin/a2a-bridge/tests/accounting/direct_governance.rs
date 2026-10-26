@@ -1075,6 +1075,7 @@ async fn route_matrix_exactly_once() {
                     f.coordinator.bindings().lock().await.insert(
                         TaskId::parse(identity.execution_id.as_str()).unwrap(),
                         bridge_coordinator::dispatch::TaskBinding {
+                            session: SessionId::parse("control").unwrap(),
                             agent: resolved.entry.id.clone(),
                             backend: resolved.backend,
                             eff: Default::default(),
@@ -1563,5 +1564,433 @@ async fn disconnect_during_admission_keeps_committed_outcome() {
         assert_eq!(sm.status(&ctx).await.unwrap().state, "idle");
         let usage = f.store.usage_summary_v1(&Default::default()).await.unwrap();
         assert_eq!(usage.buckets[0].dispatched, turns);
+    }
+}
+
+async fn cold_acp(capped: bool, turns: u64) -> (Fixture, Arc<crate::cold_acp_fixture::ColdAcp>) {
+    let (rec, backend) = crate::cold_acp_fixture::ColdAcp::connect().await;
+    let registry = crate::common::single_agent_registry("agent", backend);
+    let policy = capped.then(|| {
+        Arc::new(
+            BudgetPolicyV1::new(
+                vec![rule(
+                    if turns == 1 {
+                        UtcDayAgent(AgentId::parse("agent").unwrap())
+                    } else {
+                        EachRequest
+                    },
+                    Some(turns),
+                    None,
+                )],
+                vec![],
+            )
+            .unwrap(),
+        )
+    });
+    let store = (capped && turns == 1).then(|| {
+        Arc::new(
+            bridge_store::sqlite::SqliteStore::open_in_memory_with_clock(Arc::new(|| 86_400_000))
+                .unwrap(),
+        )
+    });
+    (
+        Fixture::with_policy_and_store(Arc::new(Recording::default()), registry, policy, store),
+        rec,
+    )
+}
+async fn cold_repeat(next_model: &str) {
+    for capped in [false, true] {
+        for first_method in ["SendMessage", "SendStreamingMessage"] {
+            for method in ["SendMessage", "SendStreamingMessage"] {
+                // Unary owns the task execution; its next independent attempt uses SSE.
+                if first_method == "SendMessage" && method == "SendMessage" {
+                    continue;
+                }
+                let (f, rec) = cold_acp(capped, 10).await;
+                let task = owner();
+                for (index, model) in ["model", next_model].into_iter().enumerate() {
+                    let transport = if index == 0 { first_method } else { method };
+                    let identity = if transport == "SendMessage" {
+                        followup(&task)
+                    } else {
+                        owner()
+                    };
+                    let mut params = cold_params(&identity, &task, model);
+                    params["message"]["metadata"]["a2a-bridge.effort"] = json!("low");
+                    params["message"]["metadata"]["a2a-bridge.mode"] = json!("ask");
+                    let body = rpc_on(f.router(false), transport, params).await;
+                    assert!(body.contains("answer"), "{body}");
+                    assert!(!body.contains("cold-turn_"), "backend key leaked: {body}");
+                    wait_binding(&f, &task, false).await;
+                }
+                let prompts = rec.prompts.lock().unwrap().clone();
+                assert_eq!(prompts.len(), 2);
+                assert_ne!(prompts[0].0, prompts[1].0, "{method}, capped={capped}");
+                assert_eq!(prompts[1].1.model.as_deref(), Some(next_model));
+                assert_eq!(prompts[1].1.effort, Some(Effort::Low));
+                assert_eq!(prompts[1].1.mode.as_deref(), Some("ask"));
+                assert!(rec.teardown.lock().unwrap().is_empty());
+                let rows = f.rows();
+                assert!(rows
+                    .iter()
+                    .any(|r| r.attribution.effective_model.as_deref() == Some(next_model)));
+                if capped {
+                    let saved = reservations(&f);
+                    assert_eq!(saved.len(), 2);
+                    assert!(saved
+                        .iter()
+                        .any(|r| r.candidate.model.as_deref() == Some(next_model)));
+                }
+                let before = rec.sessions.lock().unwrap().len();
+                let body = rpc(&f, "GetTask", json!({"id":task.execution_id.as_str()})).await;
+                assert!(body.contains(task.execution_id.as_str()), "{body}");
+                assert_eq!(rec.sessions.lock().unwrap().len(), before);
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn cold_reuse_after_eviction() {
+    cold_repeat("good").await;
+}
+#[tokio::test]
+async fn cold_same_selection_repeat() {
+    cold_repeat("model").await;
+}
+
+#[tokio::test]
+async fn exhausted_budget_after_eviction() {
+    for method in ["SendMessage", "SendStreamingMessage"] {
+        let (f, rec) = cold_acp(true, 1).await;
+        let task = owner();
+        assert!(rpc_on(
+            f.router(false),
+            "SendStreamingMessage",
+            cold_params(&owner(), &task, "model")
+        )
+        .await
+        .contains("answer"));
+        wait_binding(&f, &task, false).await;
+        let before = rec.sessions.lock().unwrap().clone();
+        safe(
+            &rpc_on(
+                f.router(false),
+                method,
+                cold_params(&followup(&task), &task, "good"),
+            )
+            .await,
+            method,
+        );
+        assert_eq!(*rec.sessions.lock().unwrap(), before);
+        assert_eq!(rec.prompts.lock().unwrap().len(), 1);
+        assert!(rec.teardown.lock().unwrap().is_empty());
+        assert_eq!(
+            f.store
+                .usage_summary_v1(&Default::default())
+                .await
+                .unwrap()
+                .buckets
+                .iter()
+                .map(|b| b.dispatched)
+                .sum::<u64>(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn outliving_follow_up() {
+    for first_method in ["SendMessage", "SendStreamingMessage"] {
+        for park in ["in_prompt", "before_configure", "after_configure"] {
+            let delayed = park != "in_prompt";
+            let (f, rec) = cold_acp(false, 10).await;
+            let task = owner();
+            let task_id = TaskId::parse(task.execution_id.as_str()).unwrap();
+            let (finish, gate) = tokio::sync::oneshot::channel();
+            let (finish_f, gate_f) = tokio::sync::oneshot::channel();
+            *rec.gates.lock().unwrap() = if delayed {
+                vec![Some(gate), None, Some(gate_f)]
+            } else {
+                vec![Some(gate), Some(gate_f), None]
+            };
+            let cwd = f.dir.path().canonicalize().unwrap();
+            let identity = if first_method == "SendMessage" {
+                followup(&task)
+            } else {
+                owner()
+            };
+            let mut params = cold_params(&identity, &task, "model");
+            params["message"]["metadata"]["a2a-bridge.cwd"] = json!(cwd);
+            let router = f.router(false);
+            let first = tokio::spawn(async move { rpc_on(router, first_method, params).await });
+            wait_for(|| rec.prompts.lock().unwrap().len() == 1).await;
+            let old_key = f.store.session_for(&task_id).await.unwrap().unwrap();
+            let (backend, lease) = {
+                let map = f.coordinator.bindings();
+                let bindings = map.lock().await;
+                let b = &bindings[&task_id];
+                (b.backend.clone(), Arc::downgrade(&b.lease))
+            };
+            // Park on either side of the actual configure, always before the prompt poll.
+            let (release, gate) = tokio::sync::oneshot::channel();
+            let mut release = Some(release);
+            let (entered, configured) = tokio::sync::oneshot::channel();
+            let wrapper = Arc::new(BoundConfigureGate {
+                backend: backend.clone(),
+                after_configure: park == "after_configure",
+                entered: std::sync::Mutex::new(Some(entered)),
+                gate: std::sync::Mutex::new(Some(gate)),
+            });
+            f.coordinator
+                .bindings()
+                .lock()
+                .await
+                .get_mut(&task_id)
+                .unwrap()
+                .backend = wrapper;
+            let router = f.router(false);
+            let next = owner();
+            let request_task = task.clone();
+            let mut params = cold_params(&next, &request_task, "good");
+            params["message"]["metadata"]["a2a-bridge.cwd"] = json!(cwd);
+            let follow =
+                tokio::spawn(async move { rpc_on(router, "SendStreamingMessage", params).await });
+            configured.await.unwrap();
+            if !delayed {
+                release.take().unwrap().send(()).unwrap();
+            }
+            finish.send(()).unwrap();
+            assert!(first.await.unwrap().contains("answer"));
+            wait_binding(&f, &task, false).await;
+            assert!(
+                lease.strong_count() > 0,
+                "F alone must retain the evicted lease"
+            );
+            let (finish_b, gate_b) = tokio::sync::oneshot::channel();
+            rec.gates.lock().unwrap().resize_with(3, || None);
+            let successor_index = if delayed { 1 } else { 2 };
+            if !delayed {
+                wait_for(|| rec.prompts.lock().unwrap().len() == 2).await;
+            }
+            rec.gates.lock().unwrap()[successor_index] = Some(gate_b);
+            let b = cold_response(
+                f.router(false),
+                "SendStreamingMessage",
+                &owner(),
+                &task,
+                "good",
+            )
+            .await;
+            wait_for(|| rec.prompts.lock().unwrap().len() > successor_index).await;
+            let new_key = f.store.session_for(&task_id).await.unwrap().unwrap();
+            assert_ne!(old_key, new_key);
+            let stale = bridge_coordinator::dispatch::BindingGuard {
+                bindings: f.coordinator.bindings().clone(),
+                task: task_id.clone(),
+                backend: Arc::new(bridge_coordinator::dispatch::ColdBindingLease::new(
+                    f.backend.clone(),
+                    old_key.clone(),
+                    Arc::new(UntrackedLease),
+                )),
+                session: old_key.clone(),
+            };
+            drop(stale);
+            wait_for(|| f.backend.forgets.lock().unwrap().len() == 1).await;
+            assert_eq!(f.backend.forgets.lock().unwrap()[0], old_key);
+            if delayed {
+                release.take().unwrap().send(()).unwrap();
+            }
+            wait_for(|| rec.prompts.lock().unwrap().len() == 3 || follow.is_finished()).await;
+            finish_f.send(()).unwrap();
+            let body = follow.await.unwrap();
+            assert!(body.contains("answer"), "{park}, {first_method}: {body}");
+            wait_for(|| lease.strong_count() == 0).await;
+            assert_eq!(
+                f.coordinator.bindings().lock().await[&task_id]
+                    .eff
+                    .model
+                    .as_deref(),
+                Some("good")
+            );
+            assert_eq!(f.store.session_for(&task_id).await.unwrap(), Some(new_key));
+            let prompts = rec.prompts.lock().unwrap().clone();
+            let follow_index = if delayed { 2 } else { 1 };
+            assert_eq!(
+                prompts[0].0, prompts[follow_index].0,
+                "F must use A's exact ACP session"
+            );
+            assert_ne!(prompts[0].0, prompts[successor_index].0);
+            assert_eq!(
+                prompts
+                    .iter()
+                    .filter(|(_, cfg)| cfg.model.as_deref() == Some("model"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                prompts
+                    .iter()
+                    .filter(|(_, cfg)| cfg.model.as_deref() == Some("good"))
+                    .count(),
+                1
+            );
+            assert!(rec.teardown.lock().unwrap().is_empty());
+            finish_b.send(()).unwrap();
+            assert!(response_text(b).await.contains("answer"));
+            wait_binding(&f, &task, false).await;
+        }
+    }
+}
+
+struct UntrackedLease;
+impl Lease for UntrackedLease {}
+
+struct BoundConfigureGate {
+    after_configure: bool,
+    backend: Arc<dyn AgentBackend>,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+#[async_trait::async_trait]
+impl AgentBackend for BoundConfigureGate {
+    async fn configure_session(
+        &self,
+        id: &SessionId,
+        spec: &SessionSpec,
+    ) -> Result<(), BridgeError> {
+        if self.after_configure {
+            self.backend.configure_session(id, spec).await?;
+        }
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        let gate = self.gate.lock().unwrap().take().unwrap();
+        gate.await.unwrap();
+        if self.after_configure {
+            Ok(())
+        } else {
+            self.backend.configure_session(id, spec).await
+        }
+    }
+    async fn prompt(&self, id: &SessionId, parts: Vec<Part>) -> Result<BackendStream, BridgeError> {
+        self.backend.prompt(id, parts).await
+    }
+    async fn cancel(&self, id: &SessionId) -> Result<(), BridgeError> {
+        self.backend.cancel(id).await
+    }
+}
+
+#[tokio::test]
+async fn cancel_after_rebinding() {
+    for capped in [false, true] {
+        let (f, rec) = cold_acp(capped, 10).await;
+        let task = owner();
+        let id = TaskId::parse(task.execution_id.as_str()).unwrap();
+        assert!(rpc_on(
+            f.router(false),
+            "SendStreamingMessage",
+            cold_params(&owner(), &task, "model")
+        )
+        .await
+        .contains("answer"));
+        wait_binding(&f, &task, false).await;
+        let old_key = f.store.session_for(&id).await.unwrap().unwrap();
+        let (finish, gate) = tokio::sync::oneshot::channel();
+        *rec.gates.lock().unwrap() = vec![None, Some(gate)];
+        let next = cold_response(
+            f.router(false),
+            "SendStreamingMessage",
+            &owner(),
+            &task,
+            "good",
+        )
+        .await;
+        wait_for(|| rec.prompts.lock().unwrap().len() == 2).await;
+        let new_key = f.store.session_for(&id).await.unwrap().unwrap();
+        // Model an older mapping read racing the successor's publication.
+        f.store.put(&id, &old_key).await.unwrap();
+        let body = rpc(&f, "CancelTask", json!({"id":id.as_str()})).await;
+        assert!(body.contains("CANCELED"), "{body}");
+        wait_for(|| !rec.teardown.lock().unwrap().is_empty()).await;
+        let expected = format!("cancel:{}", rec.prompts.lock().unwrap()[1].0);
+        assert_eq!(*rec.teardown.lock().unwrap(), [expected]);
+        assert_ne!(old_key, new_key);
+        finish.send(()).unwrap();
+        response_text(next).await;
+        wait_binding(&f, &task, false).await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_fresh_keys() {
+    for method in ["SendMessage", "SendStreamingMessage"] {
+        let (rec, backend) = crate::cold_acp_fixture::ColdAcp::connect().await;
+        let (ready_a, gate_a) = tokio::sync::oneshot::channel();
+        let (ready_b, gate_b) = tokio::sync::oneshot::channel();
+        let registry = Arc::new(ColdResolveGates {
+            inner: crate::common::single_agent_registry("agent", backend),
+            gates: Default::default(),
+            entered: AtomicUsize::new(0),
+        });
+        let policy =
+            Arc::new(BudgetPolicyV1::new(vec![rule(EachRequest, Some(10), None)], vec![]).unwrap());
+        let f = Fixture::with_policy(
+            Arc::new(Recording::default()),
+            registry.clone(),
+            Some(policy),
+        );
+        let task = owner();
+        let id = TaskId::parse(task.execution_id.as_str()).unwrap();
+        assert!(rpc_on(
+            f.router(false),
+            "SendStreamingMessage",
+            cold_params(&owner(), &task, "model")
+        )
+        .await
+        .contains("answer"));
+        wait_binding(&f, &task, false).await;
+        let previous = f.store.session_for(&id).await.unwrap().unwrap();
+        registry.gates.lock().unwrap().extend([gate_a, gate_b]);
+        registry.entered.store(0, Ordering::SeqCst);
+        let (finish, gate) = tokio::sync::oneshot::channel();
+        *rec.gates.lock().unwrap() = vec![None, Some(gate)];
+        let a = cold_response(
+            f.router(false),
+            "SendStreamingMessage",
+            &owner(),
+            &task,
+            "good",
+        )
+        .await;
+        wait_for(|| registry.entered.load(Ordering::SeqCst) == 1).await;
+        let router = f.router(false);
+        let next = followup(&task);
+        let request_task = task.clone();
+        let b = tokio::spawn(async move {
+            rpc_on(router, method, cold_params(&next, &request_task, "model")).await
+        });
+        wait_for(|| registry.entered.load(Ordering::SeqCst) == 2).await;
+        ready_a.send(()).unwrap();
+        wait_for(|| rec.prompts.lock().unwrap().len() == 2).await;
+        let key = f.store.session_for(&id).await.unwrap().unwrap();
+        ready_b.send(()).unwrap();
+        assert!(b.await.unwrap().contains("config mismatch"));
+        assert_eq!(reservations(&f).len(), 3);
+        assert_eq!(f.store.session_for(&id).await.unwrap(), Some(key.clone()));
+        assert_ne!(key, previous);
+        assert_eq!(rec.sessions.lock().unwrap().len(), 2);
+        assert_eq!(rec.prompts.lock().unwrap().len(), 2);
+        assert_eq!(
+            rec.prompts.lock().unwrap()[1].1.model.as_deref(),
+            Some("good")
+        );
+        assert!(rec.teardown.lock().unwrap().is_empty());
+        finish.send(()).unwrap();
+        assert!(response_text(a).await.contains("answer"));
+        wait_binding(&f, &task, false).await;
     }
 }
