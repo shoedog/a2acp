@@ -4819,13 +4819,34 @@ async fn unary_message(
     }
 
     let route_was_local = matches!(&routed.target, RouteTarget::Local(_));
+    let mut candidate_agent = local_agent_id(&srv, &routed.target);
+    let mut routing = if route_was_local
+        && routed.context_id.is_none()
+        && !srv.bindings().lock().await.contains_key(&routed.task)
+        && matches!(srv.store.session_for(&routed.task).await, Ok(None))
+    {
+        srv.coordinator().freeze_direct_fallback(
+            &candidate_agent,
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        )
+    } else {
+        None
+    };
+    let fallback_active = routing.is_some();
+    if fallback_active {
+        if let Some(history) = direct_history.as_mut() {
+            history.begin_multi_provider_terminal();
+        }
+    }
+    let mut preceding: Option<bridge_core::translator::AccountingFailureV1> = None;
 
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
     let collected: Vec<Result<Event, bridge_core::translator::AccountingFailureV1>> = match routed
         .target
     {
-        RouteTarget::Local(ref agent_id) => {
+        RouteTarget::Local(_) => loop {
             // First-message dispatch: resolve the routed agent, apply its effective
             // config, and bind the task (or reuse a follow-up binding). An unknown
             // agent surfaces as a JSON-RPC error. The dispatch's BindingGuard binds
@@ -4835,7 +4856,7 @@ async fn unary_message(
             let diagnostic = direct_diagnostic_observer();
             let dispatch = accounted_local_dispatch(
                 &srv,
-                agent_id,
+                &candidate_agent,
                 &routed,
                 diagnostic.clone(),
                 supplied_identity.clone(),
@@ -4845,6 +4866,10 @@ async fn unary_message(
             let dispatch = match dispatch {
                 Ok(d) => d,
                 Err(e) => {
+                    if let Some(mut original) = preceding.take() {
+                        original.persistence = e.persistence.or(Some(e.original));
+                        break vec![Err(original)];
+                    }
                     let e = bridge_coordinator::Coordinator::finish_direct_preparation_failure(
                         direct_history.as_mut(),
                         e,
@@ -4871,6 +4896,29 @@ async fn unary_message(
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
+            let observation = if fallback_active {
+                match direct_history
+                    .as_ref()
+                    .unwrap()
+                    .served_provider_observation(
+                        dispatch.backend.clone(),
+                        &dispatch.session,
+                        &dispatch.obs_ctx.turn_id,
+                    ) {
+                    Ok(observation) => Some(observation),
+                    Err(error) => {
+                        let failure = bridge_core::translator::AccountingFailureV1::from(error)
+                            .settle(dispatch.usage)
+                            .await;
+                        break vec![Err(failure)];
+                    }
+                }
+            } else {
+                None
+            };
+            let prompt_backend: Arc<dyn AgentBackend> = observation
+                .as_ref()
+                .map_or_else(|| dispatch.backend.clone(), |o| o.0.clone());
             if routed.context_id.is_some() {
                 let _ = srv.store.put(&routed.task, &dispatch.session).await;
             }
@@ -4891,9 +4939,12 @@ async fn unary_message(
             )
             .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
-            let abort = dispatch.abort;
-            let mut parts =
-                assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+            let abort = dispatch.abort.clone();
+            let mut parts = assemble_turn_parts(
+                dispatch.seed.as_deref(),
+                &dispatch.injects,
+                routed.parts.clone(),
+            );
             let prefix_capability = dispatch.backend.prefix_attestation_capability();
             let prefix_attestation_request = dispatch
                 .turn_meta
@@ -4909,6 +4960,14 @@ async fn unary_message(
                 bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
             );
             let (activity_recorder, terminal_evidence) = match direct_history.as_ref() {
+                Some(_) if observation.is_some() => {
+                    let (backend, activity) = observation.as_ref().unwrap();
+                    (
+                        activity.clone(),
+                        backend.clone()
+                            as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+                    )
+                }
                 Some(history) => {
                     let capability = dispatch.backend.terminal_evidence_capability();
                     if let Some(meta) = turn_meta.as_ref() {
@@ -4954,11 +5013,11 @@ async fn unary_message(
                 ),
             };
             let translator = match dispatch.usage {
-                Some(usage) => Translator::for_turn(dispatch.backend.clone(), Some(usage)),
+                Some(usage) => Translator::for_turn(prompt_backend.clone(), Some(usage)),
                 None => Translator::new(), // Explicit compatibility path without installed accounting.
             };
             let mut events = translator.run_observed_with_attempt_telemetry(
-                dispatch.backend.as_ref(),
+                prompt_backend.as_ref(),
                 srv.store.as_ref(),
                 srv.policy().as_ref(),
                 &routed.task,
@@ -4992,8 +5051,13 @@ async fn unary_message(
                     }
                     maybe = async {
                         if !prompt_polled {
+                            if fallback_active && srv.store.cancel_requested(&routed.task).await.unwrap_or(true) {
+                                abort.cancel();
+                                return Ok(None);
+                            }
                             if let Some(history) = direct_history.as_mut() {
                                 history.mark_prompt_dispatch().await?;
+                                if let Some((backend, _)) = &observation { history.arm_served_provider(backend); }
                             }
                             // Continue directly into events.next() in this poll;
                             // a pre-first-poll cancellation leaves the durable
@@ -5003,7 +5067,10 @@ async fn unary_message(
                         Ok::<_, BridgeError>(events.next().await)
                     } => match maybe {
                         Ok(Some(ev)) => ev,
-                        Ok(None) => break,
+                        Ok(None) => {
+                            if abort.is_cancelled() { collected.push(Ok(Event::terminal(TaskOutcome::Canceled))); }
+                            break;
+                        }
                         Err(error) => {
                             let error = translator.reject_preparation(error.into()).await;
                             if let Some(warm) = warm.as_mut() {
@@ -5066,8 +5133,76 @@ async fn unary_message(
                     }
                 }
             }
-            collected
-        }
+            if fallback_active {
+                if let Some(index) = collected.iter().position(Result::is_err) {
+                    let mut failure = collected[index].as_ref().unwrap_err().clone();
+                    let observed = observation.as_ref().unwrap().0.observed();
+                    observation
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .retain_replay_effects(&mut failure);
+                    // Release this exact cold incarnation before selecting or preparing a successor.
+                    failure = failure.with_checked_cleanup(
+                        dispatch
+                            .backend
+                            .release_session_checked(&dispatch.session)
+                            .await,
+                    );
+                    cleanup_disposition = failure.cleanup.as_str();
+                    if let Some(original) = preceding.take().filter(|_| !observed) {
+                        failure = bridge_core::translator::AccountingFailureV1 {
+                            persistence: failure.persistence.or(Some(failure.original)),
+                            ..original
+                        };
+                        routing = None;
+                    }
+                    let canceled = abort.is_cancelled()
+                        || srv
+                            .store
+                            .cancel_requested(&routed.task)
+                            .await
+                            .unwrap_or(true);
+                    let transition = routing.take().ok_or(failure.clone()).and_then(|run| {
+                        run.transition(failure.clone(), canceled, |next| {
+                            let overrides = AgentOverride {
+                                model: Some(next.model.clone()),
+                                ..routed.overrides.clone().unwrap_or_default()
+                            };
+                            srv.coordinator()
+                                .bind_fallback_candidate(
+                                    next,
+                                    &overrides,
+                                    routed.session_cwd.as_ref(),
+                                )
+                                .ok_or(BridgeError::ConfigMismatch {
+                                    field: "fallback authority",
+                                })
+                        })
+                    });
+                    match transition {
+                        Ok((run, next)) => {
+                            let mut bindings = srv.bindings().lock().await;
+                            if bindings
+                                .get(&routed.task)
+                                .is_some_and(|b| b.session == dispatch.session)
+                            {
+                                bindings.remove(&routed.task);
+                            }
+                            drop(bindings);
+                            candidate_agent = next.agent;
+                            routed.overrides.get_or_insert_with(Default::default).model =
+                                Some(next.model);
+                            preceding = Some(failure);
+                            routing = Some(run);
+                            continue;
+                        }
+                        Err(failure) => collected = vec![Err(failure)],
+                    }
+                }
+            }
+            break collected;
+        },
         RouteTarget::Delegate => {
             if let Some(history) = direct_history.as_mut() {
                 if let Err(error) = history.mark_prompt_dispatch().await {

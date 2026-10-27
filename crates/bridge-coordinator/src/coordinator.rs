@@ -84,15 +84,24 @@ type ProviderLeg = (
     Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
     Arc<dyn TerminalEvidenceSink>,
 );
-struct ProviderPollBackend {
+pub struct ProviderPollBackend {
     inner: Arc<dyn AgentBackend>,
     observed: Arc<AtomicBool>,
     pending: std::sync::Mutex<Option<Box<dyn FnOnce() -> ProviderLeg + Send>>>,
     leg: std::sync::OnceLock<ProviderLeg>,
+    served_binding: Option<(EvidenceCapability, TurnEvidenceBinding)>,
     evidence: Arc<dyn TerminalEvidenceSink>,
     effects: Arc<AtomicBool>,
 }
 impl ProviderPollBackend {
+    pub fn observed(&self) -> bool {
+        self.observed.load(Ordering::Acquire)
+    }
+    pub fn retain_replay_effects(&self, failure: &mut AccountingFailureV1) {
+        if self.effects.load(Ordering::Relaxed) {
+            failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
+        }
+    }
     fn observe(&self) {
         if !self.observed.swap(true, Ordering::AcqRel) {
             if let Some(register) = self.pending.lock().unwrap().take() {
@@ -405,6 +414,48 @@ impl DirectAttemptHandle {
         Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
     ) {
         self.barrier.multi_provider_leg(capability, binding)
+    }
+
+    /// Served unary uses the same actual-provider-poll authority as MCP.
+    pub fn served_provider_observation(
+        &self,
+        backend: Arc<dyn AgentBackend>,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<
+        (
+            Arc<ProviderPollBackend>,
+            Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+        ),
+        BridgeError,
+    > {
+        let binding = self.multi_provider_leg_binding(0, session, turn)?;
+        let capability = backend.terminal_evidence_capability();
+        let effects = Arc::new(AtomicBool::new(false));
+        let activity = Arc::new(ReplayActivity {
+            inner: self.activity_recorder(),
+            effects: effects.clone(),
+        });
+        Ok((
+            Arc::new(ProviderPollBackend {
+                inner: backend,
+                observed: Default::default(),
+                pending: Default::default(),
+                served_binding: Some((capability, binding)),
+                leg: Default::default(),
+                evidence: self.terminal_evidence_sink(),
+                effects,
+            }),
+            activity,
+        ))
+    }
+
+    pub fn arm_served_provider(&self, backend: &ProviderPollBackend) {
+        let (capability, binding) = backend.served_binding.clone().unwrap();
+        let barrier = self.barrier.clone();
+        *backend.pending.lock().unwrap() = Some(Box::new(move || {
+            barrier.multi_provider_leg(capability, Some(binding))
+        }));
     }
 
     pub fn multi_provider_leg_dispatch_observer(
@@ -883,7 +934,28 @@ impl Coordinator {
         self
     }
 
-    fn bind_fallback_candidate(
+    /// Caller must also exclude retained contexts and existing task/session state.
+    pub fn freeze_direct_fallback(
+        &self,
+        agent: &AgentId,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<bridge_core::fallback_runtime::FrozenFallbackInvocationV1> {
+        if self.has_budget_policy() {
+            return None;
+        }
+        let source = self
+            .mcp_fallback
+            .iter()
+            .find(|c| &c.source.agent == agent)
+            .and_then(|c| self.bind_fallback_candidate(&c.source, overrides, cwd))?;
+        bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(
+            self.mcp_fallback.clone(),
+            source,
+        )
+    }
+
+    pub fn bind_fallback_candidate(
         &self,
         declared: &bridge_core::routing::FallbackCandidateV1,
         overrides: &AgentOverride,
@@ -1970,6 +2042,7 @@ impl Coordinator {
             inner: turn.backend.clone(),
             observed,
             pending: std::sync::Mutex::new(None),
+            served_binding: None,
             leg: std::sync::OnceLock::new(),
             evidence: terminal_evidence,
             effects: replay_activity.effects.clone(),

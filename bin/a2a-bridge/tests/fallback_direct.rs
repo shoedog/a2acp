@@ -29,13 +29,15 @@ fn rejected(accepted: bool, class: &str) -> BridgeError {
         ),
     }
 }
-struct Provider {
-    behavior: &'static str,
-    setup: AtomicUsize,
-    prompts: AtomicUsize,
+pub(crate) struct Provider {
+    pub(crate) behavior: &'static str,
+    pub(crate) setup: AtomicUsize,
+    pub(crate) prompts: AtomicUsize,
     cleaned: Arc<AtomicUsize>,
-    inputs: Mutex<Vec<Vec<Part>>>,
-    cleanup: (tokio::sync::Notify, tokio::sync::Notify),
+    pub(crate) inputs: Mutex<Vec<Vec<Part>>>,
+    pub(crate) cleanup: (tokio::sync::Notify, tokio::sync::Notify),
+    pub(crate) configure: (tokio::sync::Notify, tokio::sync::Notify),
+    pub(crate) sessions: Mutex<Vec<SessionId>>,
 }
 #[async_trait::async_trait]
 impl AgentBackend for Provider {
@@ -49,8 +51,17 @@ impl AgentBackend for Provider {
     fn resource_flight_v1(&self) -> Result<BackendResourceFlightV1, BridgeError> {
         Ok(BackendResourceFlightV1::LegacyV2)
     }
-    async fn configure_session(&self, _: &SessionId, _: &SessionSpec) -> Result<(), BridgeError> {
+    async fn configure_session(
+        &self,
+        session: &SessionId,
+        _: &SessionSpec,
+    ) -> Result<(), BridgeError> {
         self.setup.fetch_add(1, Ordering::SeqCst);
+        self.sessions.lock().unwrap().push(session.clone());
+        if self.behavior == "blocked-setup" {
+            self.configure.0.notify_one();
+            self.configure.1.notified().await;
+        }
         if self.behavior == "checkout-store" {
             Err(BridgeError::StoreFailure)
         } else if self.behavior == "setup" {
@@ -87,14 +98,19 @@ impl AgentBackend for Provider {
         }
         let error = rejected(
             self.behavior == "accepted",
-            if self.behavior == "billing" {
+            if matches!(self.behavior, "billing" | "billing-match") {
                 "billing_failure"
+            } else if self.behavior == "region" {
+                "region_restricted"
+            } else if self.behavior == "rate" {
+                "rate_limited"
             } else {
                 "quota_exhausted"
             },
         );
         match self.behavior {
-            "reject" | "accepted" | "billing" | "cleanup" | "blocked-cleanup" => Err(error),
+            "reject" | "shared-reject" | "accepted" | "billing" | "billing-match" | "region"
+            | "rate" | "cleanup" | "blocked-cleanup" => Err(error),
             "tool" => {
                 obs.activity.record(
                     bridge_core::attempt_activity::AttemptPhase::Tool,
@@ -107,11 +123,23 @@ impl AgentBackend for Provider {
                 Ok(Update::Text("partial".into())),
                 Err(error),
             ]))),
+            "missing" => Ok(Box::pin(futures::stream::empty())),
             "permission" => Ok(Box::pin(futures::stream::iter([
                 Ok(Update::Permission(PermissionRequest::read())),
                 Err(error),
             ]))),
             _ => Ok(Box::pin(futures::stream::iter([
+                Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                    terminal: Some(bridge_core::orch::TerminalUsage {
+                        total_tokens: 15,
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        thought_tokens: None,
+                        cached_read_tokens: None,
+                        cached_write_tokens: None,
+                    }),
+                    ..Default::default()
+                })),
                 Ok(Update::Text("answer".into())),
                 Ok(Update::done("end_turn")),
             ]))),
@@ -121,7 +149,7 @@ impl AgentBackend for Provider {
         &self,
         _: &SessionId,
     ) -> Result<BackendCleanupDispositionV1, BridgeError> {
-        if self.behavior == "blocked-cleanup" {
+        if matches!(self.behavior, "blocked-cleanup" | "shared-reject") {
             self.cleanup.0.notify_one();
             self.cleanup.1.notified().await;
         }
@@ -184,15 +212,15 @@ impl BillingIdentityProviderV1 for Billing {
         })
     }
 }
-struct Fixture {
-    dir: tempfile::TempDir,
-    coordinator: Arc<bridge_coordinator::Coordinator>,
-    providers: Vec<Arc<Provider>>,
-    spawns: Arc<Mutex<Vec<String>>>,
-    store: Arc<bridge_store::sqlite::SqliteStore>,
+pub(crate) struct Fixture {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) coordinator: Arc<bridge_coordinator::Coordinator>,
+    pub(crate) providers: Vec<Arc<Provider>>,
+    pub(crate) spawns: Arc<Mutex<Vec<String>>>,
+    pub(crate) store: Arc<bridge_store::sqlite::SqliteStore>,
 }
 impl Fixture {
-    fn new(source: &'static str, target: &'static str, chain: bool) -> Self {
+    pub(crate) fn new(source: &'static str, target: &'static str, chain: bool) -> Self {
         Self::with_dispatch_failure(source, target, chain, false)
     }
     fn with_dispatch_failure(
@@ -203,12 +231,22 @@ impl Fixture {
     ) -> Self {
         Self::with_options(source, target, chain, fail, false)
     }
-    fn with_options(
+    pub(crate) fn with_options(
         source: &'static str,
         target: &'static str,
         chain: bool,
         fail: bool,
         governed: bool,
+    ) -> Self {
+        Self::with_billing(source, target, chain, fail, governed, Arc::new(Billing))
+    }
+    pub(crate) fn with_billing(
+        source: &'static str,
+        target: &'static str,
+        chain: bool,
+        fail: bool,
+        governed: bool,
+        billing: Arc<dyn BillingIdentityProviderV1>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -228,6 +266,8 @@ impl Fixture {
                     cleaned: cleaned.clone(),
                     inputs: Mutex::new(vec![]),
                     cleanup: Default::default(),
+                    configure: Default::default(),
+                    sessions: Default::default(),
                 })
             })
             .collect();
@@ -240,7 +280,14 @@ impl Fixture {
                     .unwrap())
                 .clone();
                 entry.id = AgentId::parse(name).unwrap();
-                entry.model = Some(name.into());
+                entry.model = Some(
+                    if source == "shared-reject" {
+                        "shared"
+                    } else {
+                        name
+                    }
+                    .into(),
+                );
                 entry.cwd = Some(dir.path().display().to_string());
                 entry
             })
@@ -321,7 +368,7 @@ impl Fixture {
             store.clone()
         }))
         .with_accounting(AccountingV1 {
-            billing: Some(Arc::new(Billing)),
+            billing: Some(billing),
             budget_policy: governed.then(|| {
                 Arc::new(
                     BudgetPolicyV1::new(
@@ -341,12 +388,29 @@ impl Fixture {
             ..AccountingV1::new(store.clone())
         })
         .with_mcp_fallback(if chain {
-            vec![FrozenFallbackChainV1 {
-                id: "capacity".into(),
-                source: candidates[0].clone(),
-                causes: [FallbackCauseV1::QuotaExhausted].into(),
-                steps: candidates[1..].to_vec(),
-            }]
+            vec![
+                FrozenFallbackChainV1 {
+                    id: "capacity".into(),
+                    source: candidates[0].clone(),
+                    causes: if source == "billing-match" {
+                        [FallbackCauseV1::BillingFailure].into()
+                    } else {
+                        [
+                            FallbackCauseV1::QuotaExhausted,
+                            FallbackCauseV1::RegionRestricted,
+                            FallbackCauseV1::RateLimited,
+                        ]
+                        .into()
+                    },
+                    steps: candidates[1..].to_vec(),
+                },
+                FrozenFallbackChainV1 {
+                    id: "never-reroot".into(),
+                    source: candidates[1].clone(),
+                    causes: [FallbackCauseV1::QuotaExhausted].into(),
+                    steps: vec![candidates[0].clone()],
+                },
+            ]
         } else {
             vec![]
         });
@@ -358,7 +422,7 @@ impl Fixture {
             store,
         }
     }
-    async fn call(&self, tool: &str, context: Option<&str>) -> serde_json::Value {
+    pub(crate) async fn call(&self, tool: &str, context: Option<&str>) -> serde_json::Value {
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(server);
         let serve = bridge_mcp::serve(read, write, self.coordinator.clone());
@@ -390,7 +454,59 @@ impl Fixture {
         served.unwrap();
         reply
     }
-    fn rows(&self) -> Vec<UsageAttemptV1> {
+    #[allow(dead_code)] // Shared with served and production-composition witnesses.
+    pub(crate) fn server(&self) -> Arc<bridge_a2a_inbound::server::InboundServer> {
+        struct Route;
+        impl RouteDecision for Route {
+            fn route(&self, _: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+                Ok(RouteTarget::Local(AgentId::parse("source")?))
+            }
+        }
+        Arc::new(bridge_a2a_inbound::server::InboundServer::from_coordinator(
+            self.coordinator.clone(),
+            Arc::new(Route),
+            Arc::new(bridge_policy::auth::AlwaysGrant),
+            "http://localhost",
+            Arc::new(bridge_a2a_outbound::StubDelegation),
+            "source",
+        ))
+    }
+    #[allow(dead_code)]
+    pub(crate) async fn served(
+        &self,
+        method: &str,
+        owner: &AttemptIdentity,
+        context: Option<&str>,
+    ) -> String {
+        use tower::ServiceExt;
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":{
+            "message":{"text":"original input", "taskId":owner.execution_id.as_str(), "contextId":context,
+                "metadata":{"account_group":"forged", "billing_mode":"subscription", "fallback_chain":"forged",
+                    "a2a-bridge.execution_id":owner.execution_id.as_str(), "a2a-bridge.attempt_id":owner.attempt_id.as_str()}}
+        }});
+        let response = self
+            .server()
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/json")
+                    .header("A2A-Version", "1.0")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+    pub(crate) fn rows(&self) -> Vec<UsageAttemptV1> {
         let db = rusqlite::Connection::open(self.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
             .unwrap();
         let rows = db
