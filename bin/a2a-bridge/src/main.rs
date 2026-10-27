@@ -1498,7 +1498,7 @@ fn turn_log_observer_enabled(
 /// policy / batch plus the interactive-permission registry.
 #[allow(clippy::too_many_arguments)]
 fn build_coordinator(
-    mcp_fallback: Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    cfg: &RegistryConfig,
     budget_policy: Option<Arc<bridge_core::governance::BudgetPolicyV1>>,
     billing: Arc<dyn bridge_core::accounting::BillingIdentityProviderV1>,
     session_manager: Arc<bridge_coordinator::session_manager::SessionManager>,
@@ -1525,7 +1525,8 @@ fn build_coordinator(
     workflow_admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
     perm_registry: Arc<PermissionRegistry>,
     warm_idle_ttl_secs: u64,
-) -> Arc<bridge_coordinator::Coordinator> {
+) -> Result<Arc<bridge_coordinator::Coordinator>, config::ConfigError> {
+    let chains = cfg.fallback_chains_v1()?;
     let accounting = bridge_core::accounting::AccountingV1 {
         billing: Some(billing),
         budget_policy,
@@ -1547,7 +1548,7 @@ fn build_coordinator(
             resume_cap,
         )
         .with_accounting(accounting)
-        .with_mcp_fallback(mcp_fallback)
+        .with_mcp_fallback(chains)
         .with_trace_refs_config(trace_refs_enabled, max_task_turns)
         .with_workflow_history(workflow_history)
         .with_workflow_admission(workflow_admission)
@@ -1555,7 +1556,7 @@ fn build_coordinator(
     );
     // Policy installation must finish before any background task can lock the session table.
     start_session_reaper(&coordinator, warm_idle_ttl_secs);
-    coordinator
+    Ok(coordinator)
 }
 
 #[cfg(test)]
@@ -1618,7 +1619,7 @@ mod governed_startup_tests {
                 None,
             ));
             let coordinator = build_coordinator(
-                Vec::new(),
+                &startup.config,
                 startup.policy,
                 startup.config.billing_provider_v1().unwrap(),
                 manager,
@@ -1639,7 +1640,8 @@ mod governed_startup_tests {
                 admission,
                 PermissionRegistry::new(),
                 1,
-            );
+            )
+            .unwrap();
             // This synchronous witness is recorded at the production spawn seam, before the
             // initial reaper tick can race any session-table access on the second worker.
             REAPER_START_POLICIES
@@ -9708,7 +9710,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     )?;
 
     let coordinator = build_coordinator(
-        cfg.fallback_chains_v1()?,
+        &cfg,
         budget_policy.clone(),
         cfg.billing_provider_v1()?,
         session_manager,
@@ -9729,7 +9731,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         workflow_admission,
         Arc::clone(&perm_registry),
         warm_ttl,
-    );
+    )?;
 
     if budget_policy.is_some() {
         eprintln!("a2a-bridge: recovery disabled under caps; outstanding records preserved");
@@ -11541,7 +11543,7 @@ async fn main() -> Result<(), BoxError> {
         &[],
     )?;
     let coordinator = build_coordinator(
-        Vec::new(), // Served paths remain inactive until C2b3.
+        &cfg,
         budget_policy.clone(),
         billing,
         session_manager,
@@ -11562,8 +11564,7 @@ async fn main() -> Result<(), BoxError> {
         workflow_admission,
         Arc::clone(&perm_registry),
         warm_ttl,
-    );
-
+    )?;
     // The inbound server is a thin adapter over the ONE Coordinator (#10 slice 7):
     // the Coordinator owns the registry/policy/stores/session-manager/workflow maps/
     // batch; the adapter keeps only wire state (route/auth/base_url/delegation/label/
@@ -20891,5 +20892,157 @@ cmd = "cargo build --locked"
         super::apply_warm_writer_env(&mut cold_cmd, &mut cold_args, Some(&p), None);
         assert_eq!(cold_cmd, "codex-acp");
         assert_eq!(cold_args, vec!["--flag"]);
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/fallback_direct.rs"]
+mod fallback_billing_fixture;
+#[cfg(test)]
+#[tokio::test]
+async fn production_billing_per_visited_candidate() {
+    use bridge_core::{ids::AttemptIdentity, routing::BillingModeV1, task_store::TaskStore};
+    for (surface, target, mapped) in [
+        ("SendMessage", "success", true),
+        ("Mcp", "success", true),
+        ("SendMessage", "setup", true),
+        ("SendMessage", "success", false),
+    ] {
+        let identities: Vec<_> = ["source", "target"]
+            .into_iter()
+            .filter(|name| mapped || *name == "source")
+            .map(|name| bridge_core::routing::BillingIdentityV1 {
+                agent: bridge_core::ids::AgentId::parse(name).unwrap(),
+                effective_model: "shared".into(),
+                account_group: name.into(),
+                billing_mode: if name == "source" {
+                    BillingModeV1::Metered
+                } else {
+                    BillingModeV1::Subscription
+                },
+            })
+            .collect();
+        let billing = Arc::new(config::BillingProviderV1::new(identities.clone()));
+        let mut f = fallback_billing_fixture::Fixture::with_billing(
+            "shared-reject",
+            target,
+            false,
+            false,
+            false,
+            billing.clone(),
+        );
+        let agents = ["source", "target", "last"]
+            .map(|id| {
+                format!(
+                    "[[agents]]\nid={id:?}\ncmd=\"test-cmd\"\nmodel=\"shared\"\ncwd={:?}\n",
+                    f.dir.path().join("scope").to_str().unwrap()
+                )
+            })
+            .join("");
+        let cfg = RegistryConfig::parse(&format!("default=\"source\"\n{agents}[registry]\nallowed_cmds=[\"test-cmd\"]\n[[routing.chains]]\nid=\"capacity\"\nsource={{agent=\"source\",model=\"shared\"}}\ncauses=[\"quota_exhausted\"]\nsteps=[{{agent=\"target\",model=\"shared\"}},{{agent=\"last\",model=\"shared\"}}]\n[server]\n")).unwrap();
+        let registry = f.coordinator.registry();
+        let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+            registry.clone(),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse(f.dir.path().to_str().unwrap()).unwrap(),
+            None,
+        ));
+        f.coordinator = build_coordinator(
+            &cfg,
+            None,
+            billing.clone(),
+            f.coordinator.session_manager.clone(),
+            Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+                registry.clone(),
+            )),
+            Default::default(),
+            f.store.clone(),
+            f.store.clone(),
+            f.coordinator.policy(),
+            registry,
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            Arc::new(bridge_observ::NoopObserver),
+            3,
+            false,
+            512,
+            Ok(f.store.clone()),
+            admission,
+            PermissionRegistry::new(),
+            60,
+        )
+        .unwrap();
+        let owner = AttemptIdentity::initial().unwrap();
+        let call = async {
+            if surface == "Mcp" {
+                f.call("run", None).await.to_string()
+            } else {
+                f.served(surface, &owner, None).await
+            }
+        };
+        tokio::pin!(call);
+        let early = tokio::select! {
+            biased;
+            _ = f.providers[0].cleanup.0.notified() => None,
+            body = &mut call => Some(body),
+        };
+        assert_eq!(f.rows().len(), 1);
+        // Reload the source mapping after its attempt start; the persisted identity is frozen.
+        let registry = f.coordinator.registry();
+        let mut changed = identities;
+        changed[0].account_group = "changed".into();
+        let mut snapshot = f.snapshot();
+        snapshot.billing_identities = changed;
+        billing.apply(registry.as_ref(), snapshot).await.unwrap();
+        f.providers[0].cleanup.1.notify_one();
+        let body = match early {
+            Some(body) => body,
+            None => call.await,
+        };
+        assert_eq!(body.contains("answer"), target == "success", "{body}");
+        let rows = f.rows();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+        for row in &rows {
+            assert_eq!(row.attribution.effective_model.as_deref(), Some("shared"));
+            let name = row.attribution.agent.as_str();
+            assert_eq!(row.dispatched, name == "source" || target == "success");
+            assert_eq!(
+                row.attribution
+                    .billing
+                    .as_ref()
+                    .map(|b| b.account_group.as_str()),
+                (name == "source" || mapped).then_some(name)
+            );
+            if name == "target" && mapped {
+                assert_eq!(
+                    row.attribution.billing.as_ref().unwrap().billing_mode,
+                    "subscription"
+                );
+            }
+        }
+        let reopened = bridge_store::sqlite::SqliteStore::open_history_read_only(
+            &f.dir.path().join("tasks.sqlite"),
+        )
+        .unwrap();
+        let summary = reopened
+            .usage_summary_v1(&Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            summary
+                .buckets
+                .iter()
+                .map(|b| b.total_tokens.reported_sum)
+                .sum::<u64>(),
+            if target == "success" { 15 } else { 0 }
+        );
+        assert_eq!(
+            f.providers[2]
+                .setup
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

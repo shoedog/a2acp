@@ -589,6 +589,17 @@ fn local_agent_id(srv: &InboundServer, target: &RouteTarget) -> AgentId {
 /// so the binding exists the instant the call returns — a follow-up or cancel can
 /// never race an async bind window.
 /// Accounting starts before checkout/resolution; reusable bindings remain plain.
+type ServedAdmission = (
+    Arc<bridge_core::domain::AgentEntry>,
+    Arc<dyn Fn() -> bool + Send + Sync>,
+    Arc<bridge_coordinator::dispatch::ColdAbortControl>,
+);
+
+fn fallback_refusal(error: &BridgeError) -> bool {
+    matches!(error, BridgeError::ConfigMismatch { field } if field.starts_with("fallback"))
+        || matches!(error, BridgeError::SessionExpired)
+}
+
 async fn accounted_local_dispatch(
     srv: &Arc<InboundServer>,
     agent: &AgentId,
@@ -596,6 +607,7 @@ async fn accounted_local_dispatch(
     diagnostic: Arc<dyn DiagnosticObserver>,
     owner: bridge_core::ids::AttemptIdentity,
     receiver: Option<&tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
+    admitted: Option<&ServedAdmission>,
 ) -> Result<LocalDispatch, bridge_core::translator::AccountingFailureV1> {
     if srv.coordinator().has_budget_policy() {
         return governed_local_dispatch(srv, agent, routed, diagnostic, owner, receiver)
@@ -608,23 +620,41 @@ async fn accounted_local_dispatch(
         .await
         .get(&routed.task)
         .map(|b| (b.agent.clone(), b.eff.clone()));
-    let usage = match bound_config {
-        Some((agent, config)) => {
-            srv.coordinator()
-                .prepare_usage_selection(owner, agent.as_str().into(), Some(config), "direct", None)
-                .await?
-        }
-        None => {
-            srv.coordinator()
-                .prepare_usage(
-                    owner,
-                    agent,
-                    routed.overrides.as_ref(),
-                    None,
-                    "direct",
-                    None,
-                )
-                .await?
+    let usage = if let Some(entry) = admitted {
+        srv.coordinator()
+            .prepare_usage_selection(
+                owner,
+                agent.as_str().into(),
+                Some(effective_config(&entry.0, routed.overrides.as_ref())),
+                "direct",
+                None,
+            )
+            .await?
+    } else {
+        match bound_config {
+            Some((agent, config)) => {
+                srv.coordinator()
+                    .prepare_usage_selection(
+                        owner,
+                        agent.as_str().into(),
+                        Some(config),
+                        "direct",
+                        None,
+                    )
+                    .await?
+            }
+            None => {
+                srv.coordinator()
+                    .prepare_usage(
+                        owner,
+                        agent,
+                        routed.overrides.as_ref(),
+                        None,
+                        "direct",
+                        None,
+                    )
+                    .await?
+            }
         }
     };
     let result = match warm_local_dispatch(srv, agent, routed, diagnostic.clone()).await {
@@ -637,6 +667,7 @@ async fn accounted_local_dispatch(
                 routed.overrides.as_ref(),
                 routed.session_cwd.clone(),
                 diagnostic,
+                admitted,
             )
             .await
         }
@@ -982,6 +1013,7 @@ async fn governed_local_dispatch(
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
+                abort: Default::default(),
                 session: claim.session.clone(),
                 agent,
                 backend: backend.clone(),
@@ -1040,6 +1072,16 @@ struct PendingColdGuard {
     session: SessionId,
 }
 
+impl PendingColdGuard {
+    fn is_current(&self) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&self.task)
+            .is_some_and(|p| p.session == self.session)
+    }
+}
+
 impl Drop for PendingColdGuard {
     fn drop(&mut self) {
         let mut pending = self.pending.lock().unwrap();
@@ -1059,6 +1101,7 @@ async fn resolve_configure_bind(
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
     observer: Arc<dyn DiagnosticObserver>,
+    admitted: Option<&ServedAdmission>,
 ) -> Result<LocalDispatch, BridgeError> {
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
     // route/resolve/recompute. Re-stash the bound effective config with the per-request
@@ -1067,12 +1110,22 @@ async fn resolve_configure_bind(
     {
         let bindings = srv.bindings().lock().await;
         if let Some(binding) = bindings.get(&routed.task) {
+            if admitted.is_some() {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "fallback binding",
+                });
+            }
             let session = binding.session.clone();
             let backend = binding.backend.clone();
             let bound_agent = binding.agent.clone();
             let eff = binding.eff.clone();
             // Co-hold the lease: the first producer may evict the binding while we still drive it.
             let lease = binding.lease.clone();
+            let abort = binding
+                .abort
+                .as_ref()
+                .map(|control| control.token.clone())
+                .unwrap_or_default();
             drop(bindings);
             backend
                 .configure_session(
@@ -1094,7 +1147,7 @@ async fn resolve_configure_bind(
                 lease: Some(lease),
                 warm_guard: None,
                 // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
-                abort: tokio_util::sync::CancellationToken::new(),
+                abort,
                 obs_ctx: obs_ctx_for_dispatch(
                     routed,
                     &bound_agent,
@@ -1106,7 +1159,28 @@ async fn resolve_configure_bind(
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
-    let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
+    let resolved = if let Some((entry, scope, control)) = admitted {
+        if control.token.is_cancelled() {
+            return Err(BridgeError::SessionExpired);
+        }
+        if !scope() {
+            return Err(BridgeError::ConfigMismatch {
+                field: "fallback scope",
+            });
+        }
+        srv.registry()
+            .resolve_admitted_observed(entry, observer)
+            .await?
+    } else {
+        srv.registry().resolve_observed(agent_id, observer).await?
+    };
+    if admitted.is_some_and(|entry| {
+        !Arc::ptr_eq(&entry.0, &resolved.entry) || !(entry.1)() || entry.2.token.is_cancelled()
+    }) {
+        return Err(BridgeError::ConfigMismatch {
+            field: "fallback entry",
+        });
+    }
     let eff = effective_config(&resolved.entry, overrides);
     let obs_model = eff.model.clone();
     let obs_effort = eff.effort;
@@ -1119,7 +1193,9 @@ async fn resolve_configure_bind(
         session.clone(),
         Arc::from(resolved.lease),
     ));
-    let canceled = tokio_util::sync::CancellationToken::new();
+    let canceled = admitted
+        .map(|entry| entry.2.token.clone())
+        .unwrap_or_default();
     {
         let mut pending = srv.pending_cold.lock().unwrap();
         if bindings.contains_key(&routed.task) || pending.contains_key(&routed.task) {
@@ -1152,17 +1228,29 @@ async fn resolve_configure_bind(
             },
         )
         .await?;
+    if admitted.is_some_and(|(_, scope, _)| !scope()) {
+        return Err(BridgeError::ConfigMismatch {
+            field: "fallback scope",
+        });
+    }
     let mut bindings = srv.bindings().lock().await;
-    // Atomic with cancel_backend_for: cancel either latches preparation or sees
-    // the published tuple. A latched turn uses the ordinary abort projection.
+    // Atomic with cancel_backend_for and newer registrations. A stale configure
+    // must neither publish over a newer incarnation nor retire its pending entry.
+    if bindings.contains_key(&routed.task) || !pending.is_current() {
+        return Err(BridgeError::ConfigMismatch {
+            field: "cold publication identity",
+        });
+    }
+    // A latched turn uses the ordinary abort projection.
     drop(pending);
-    let abort = tokio_util::sync::CancellationToken::new();
+    let abort = canceled.clone();
     if canceled.is_cancelled() {
         abort.cancel();
     } else {
         bindings.insert(
             routed.task.clone(),
             TaskBinding {
+                abort: admitted.map(|entry| entry.2.clone()),
                 session: session.clone(),
                 agent: resolved.entry.id.clone(),
                 backend: backend.clone(),
@@ -1636,11 +1724,17 @@ async fn cancel_backend_for(
         ));
     }
     if let Some(binding) = bindings.get(task) {
-        return Ok((
+        let target = (
             binding.backend.clone(),
             binding.lease.clone(),
             Some(binding.session.clone()),
-        ));
+        );
+        let control = binding.abort.clone();
+        drop(bindings);
+        if let Some(control) = control {
+            control.cancel().await;
+        }
+        return Ok(target);
     }
     drop(bindings);
     // Fallback: no binding exists — resolve the registry default agent.
@@ -2458,6 +2552,7 @@ async fn stream_message(
                     diagnostic.clone(),
                     stream_owner.clone(),
                     governed.then_some(&tx),
+                    None,
                 )
                 .await;
                 match dispatch {
@@ -4819,13 +4914,60 @@ async fn unary_message(
     }
 
     let route_was_local = matches!(&routed.target, RouteTarget::Local(_));
+    let mut candidate_agent = local_agent_id(&srv, &routed.target);
+    let mut routing = if route_was_local
+        && routed.context_id.is_none()
+        && !srv.bindings().lock().await.contains_key(&routed.task)
+        && matches!(srv.store.session_for(&routed.task).await, Ok(None))
+    {
+        srv.coordinator().freeze_direct_fallback(
+            &candidate_agent,
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        )
+    } else {
+        None
+    };
+    let mut admitted_entry = routing.as_ref().and_then(|run| {
+        srv.coordinator().admit_served_candidate(
+            run.source(),
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        )
+    });
+    if admitted_entry.is_none() {
+        routing = None;
+    }
+    let scope_guard = routing.as_ref().map(|run| run.scope_guard());
+    let mut provider_resolution = None;
+    let fallback_active = routing.is_some();
+    let fallback_control = fallback_active.then(|| {
+        Arc::new(bridge_coordinator::dispatch::ColdAbortControl::new(
+            Default::default(),
+        ))
+    });
+    if fallback_active {
+        if let Some(history) = direct_history.as_mut() {
+            history.begin_multi_provider_terminal();
+        }
+    }
+    let mut preceding: Option<bridge_core::translator::AccountingFailureV1> = None;
 
     // Collect the same event stream the streaming path produces, into one JSON
     // response. Local drives the translator; Delegate drives the delegation.
     let collected: Vec<Result<Event, bridge_core::translator::AccountingFailureV1>> = match routed
         .target
     {
-        RouteTarget::Local(ref agent_id) => {
+        RouteTarget::Local(_) => loop {
+            if fallback_control
+                .as_ref()
+                .is_some_and(|control| control.token.is_cancelled())
+            {
+                break preceding.take().map_or_else(
+                    || vec![Ok(Event::terminal(TaskOutcome::Canceled))],
+                    |failure| vec![Err(failure)],
+                );
+            }
             // First-message dispatch: resolve the routed agent, apply its effective
             // config, and bind the task (or reuse a follow-up binding). An unknown
             // agent surfaces as a JSON-RPC error. The dispatch's BindingGuard binds
@@ -4833,18 +4975,29 @@ async fn unary_message(
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
             let diagnostic = direct_diagnostic_observer();
+            let admission = admitted_entry
+                .clone()
+                .zip(scope_guard.clone())
+                .map(|(entry, scope)| (entry, scope, fallback_control.clone().unwrap()));
             let dispatch = accounted_local_dispatch(
                 &srv,
-                agent_id,
+                &candidate_agent,
                 &routed,
                 diagnostic.clone(),
                 supplied_identity.clone(),
                 None,
+                admission.as_ref(),
             )
             .await;
             let dispatch = match dispatch {
                 Ok(d) => d,
                 Err(e) => {
+                    if let Some(mut original) = preceding.take() {
+                        original.persistence = e
+                            .persistence
+                            .or_else(|| (!fallback_refusal(&e.original)).then_some(e.original));
+                        break vec![Err(original)];
+                    }
                     let e = bridge_coordinator::Coordinator::finish_direct_preparation_failure(
                         direct_history.as_mut(),
                         e,
@@ -4871,6 +5024,57 @@ async fn unary_message(
                     return bridge_err_to_jsonrpc(id, &e.surfaced_error());
                 }
             };
+            let observation = if fallback_active {
+                match direct_history
+                    .as_ref()
+                    .unwrap()
+                    .served_provider_observation(
+                        dispatch.backend.clone(),
+                        &dispatch.session,
+                        &dispatch.obs_ctx.turn_id,
+                    ) {
+                    Ok(observation) => Some(observation),
+                    Err(error) => {
+                        let failure = bridge_core::translator::AccountingFailureV1::from(error)
+                            .settle(dispatch.usage)
+                            .await;
+                        break vec![Err(failure)];
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some((backend, _)) = &observation {
+                let registry = srv.registry().clone();
+                let entry = admitted_entry.clone().unwrap();
+                let scope = scope_guard.clone().unwrap();
+                let control = fallback_control.clone().unwrap();
+                let lease = dispatch.lease.clone().unwrap();
+                backend.set_poll_guard(Arc::new(move || {
+                    let permit = control
+                        .first_poll
+                        .clone()
+                        .try_lock_owned()
+                        .map_err(|_| BridgeError::SessionExpired)?;
+                    if lease.is_retired()
+                        || !scope()
+                        || !registry
+                            .entry_snapshot(&entry.id)
+                            .is_some_and(|now| Arc::ptr_eq(&now, &entry))
+                    {
+                        return Err(BridgeError::ConfigMismatch {
+                            field: "fallback poll authority",
+                        });
+                    }
+                    if control.token.is_cancelled() {
+                        return Err(BridgeError::SessionExpired);
+                    }
+                    Ok(Some(permit))
+                }));
+            }
+            let prompt_backend: Arc<dyn AgentBackend> = observation
+                .as_ref()
+                .map_or_else(|| dispatch.backend.clone(), |o| o.0.clone());
             if routed.context_id.is_some() {
                 let _ = srv.store.put(&routed.task, &dispatch.session).await;
             }
@@ -4891,9 +5095,12 @@ async fn unary_message(
             )
             .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
-            let abort = dispatch.abort;
-            let mut parts =
-                assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+            let abort = dispatch.abort.clone();
+            let mut parts = assemble_turn_parts(
+                dispatch.seed.as_deref(),
+                &dispatch.injects,
+                routed.parts.clone(),
+            );
             let prefix_capability = dispatch.backend.prefix_attestation_capability();
             let prefix_attestation_request = dispatch
                 .turn_meta
@@ -4909,6 +5116,14 @@ async fn unary_message(
                 bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
             );
             let (activity_recorder, terminal_evidence) = match direct_history.as_ref() {
+                Some(_) if observation.is_some() => {
+                    let (backend, activity) = observation.as_ref().unwrap();
+                    (
+                        activity.clone(),
+                        backend.clone()
+                            as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+                    )
+                }
                 Some(history) => {
                     let capability = dispatch.backend.terminal_evidence_capability();
                     if let Some(meta) = turn_meta.as_ref() {
@@ -4953,12 +5168,16 @@ async fn unary_message(
                         as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
                 ),
             };
-            let translator = match dispatch.usage {
-                Some(usage) => Translator::for_turn(dispatch.backend.clone(), Some(usage)),
+            let usage = dispatch.usage.map(|usage| match &observation {
+                Some((backend, _)) => usage.with_provider_poll(backend.poll_observation()),
+                None => usage,
+            });
+            let translator = match usage {
+                Some(usage) => Translator::for_turn(prompt_backend.clone(), Some(usage)),
                 None => Translator::new(), // Explicit compatibility path without installed accounting.
             };
             let mut events = translator.run_observed_with_attempt_telemetry(
-                dispatch.backend.as_ref(),
+                prompt_backend.as_ref(),
                 srv.store.as_ref(),
                 srv.policy().as_ref(),
                 &routed.task,
@@ -4968,7 +5187,7 @@ async fn unary_message(
                 dispatch.obs_ctx.clone(),
                 harvest_audit_store.clone(),
                 activity_recorder,
-                terminal_evidence,
+                terminal_evidence.clone(),
             );
             let mut collected = Vec::new();
             // The backend records genuine provider message/thought deltas through the
@@ -4992,8 +5211,13 @@ async fn unary_message(
                     }
                     maybe = async {
                         if !prompt_polled {
+                            if fallback_active && srv.store.cancel_requested(&routed.task).await.unwrap_or(true) {
+                                abort.cancel();
+                                return Ok(None);
+                            }
                             if let Some(history) = direct_history.as_mut() {
                                 history.mark_prompt_dispatch().await?;
+                                if let Some((backend, _)) = &observation { history.arm_served_provider(backend); }
                             }
                             // Continue directly into events.next() in this poll;
                             // a pre-first-poll cancellation leaves the durable
@@ -5003,7 +5227,10 @@ async fn unary_message(
                         Ok::<_, BridgeError>(events.next().await)
                     } => match maybe {
                         Ok(Some(ev)) => ev,
-                        Ok(None) => break,
+                        Ok(None) => {
+                            if abort.is_cancelled() { collected.push(Ok(Event::terminal(TaskOutcome::Canceled))); }
+                            break;
+                        }
                         Err(error) => {
                             let error = translator.reject_preparation(error.into()).await;
                             if let Some(warm) = warm.as_mut() {
@@ -5066,8 +5293,94 @@ async fn unary_message(
                     }
                 }
             }
-            collected
-        }
+            if fallback_active {
+                terminal_evidence.record_child_liveness(child_liveness);
+                provider_resolution = observation
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .resolve_terminal()
+                    .filter(|_| collected.iter().all(Result::is_ok));
+                if let Some(index) = collected.iter().position(Result::is_err) {
+                    let mut failure = collected[index].as_ref().unwrap_err().clone();
+                    let observed = observation.as_ref().unwrap().0.observed();
+                    observation
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .retain_replay_effects(&mut failure);
+                    // Release this exact cold incarnation before selecting or preparing a successor.
+                    failure = failure.with_checked_cleanup(
+                        dispatch
+                            .backend
+                            .release_session_checked(&dispatch.session)
+                            .await,
+                    );
+                    cleanup_disposition = failure.cleanup.as_str();
+                    if let Some(original) = preceding.take().filter(|_| !observed) {
+                        failure = bridge_core::translator::AccountingFailureV1 {
+                            persistence: failure.persistence.or_else(|| {
+                                (!fallback_refusal(&failure.original)).then_some(failure.original)
+                            }),
+                            ..original
+                        };
+                        routing = None;
+                    }
+                    let canceled = abort.is_cancelled()
+                        || srv
+                            .store
+                            .cancel_requested(&routed.task)
+                            .await
+                            .unwrap_or(true);
+                    // Cleanup can drain late tool/permission activity from this provider.
+                    observation
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .retain_replay_effects(&mut failure);
+                    let mut next_entry = None;
+                    let transition = routing.take().ok_or(failure.clone()).and_then(|run| {
+                        run.transition(failure.clone(), canceled, |next| {
+                            let overrides = AgentOverride {
+                                model: Some(next.model.clone()),
+                                ..routed.overrides.clone().unwrap_or_default()
+                            };
+                            next_entry = srv.coordinator().admit_served_candidate(
+                                next,
+                                &overrides,
+                                routed.session_cwd.as_ref(),
+                            );
+                            next_entry.as_ref().map(|_| next.clone()).ok_or(
+                                BridgeError::ConfigMismatch {
+                                    field: "fallback authority",
+                                },
+                            )
+                        })
+                    });
+                    match transition {
+                        Ok((run, next)) => {
+                            let mut bindings = srv.bindings().lock().await;
+                            if bindings
+                                .get(&routed.task)
+                                .is_some_and(|b| b.session == dispatch.session)
+                            {
+                                bindings.remove(&routed.task);
+                            }
+                            drop(bindings);
+                            admitted_entry = next_entry;
+                            candidate_agent = next.agent;
+                            routed.overrides.get_or_insert_with(Default::default).model =
+                                Some(next.model);
+                            preceding = Some(failure);
+                            routing = Some(run);
+                            continue;
+                        }
+                        Err(failure) => collected = vec![Err(failure)],
+                    }
+                }
+            }
+            break collected;
+        },
         RouteTarget::Delegate => {
             if let Some(history) = direct_history.as_mut() {
                 if let Err(error) = history.mark_prompt_dispatch().await {
@@ -5263,6 +5576,17 @@ async fn unary_message(
             "TASK_STATE_CANCELED" => ("canceled", "canceled", true),
             _ => ("failed", "prompt_failed", true),
         };
+        if let Some(resolved) = provider_resolution {
+            history.retain_provider_resolution(resolved);
+        }
+        let (outcome, reason, degraded) =
+            provider_resolution.map_or((outcome, reason, degraded), |resolved| {
+                (
+                    resolved.outcome.as_str(),
+                    resolved.reason.as_str(),
+                    degraded || resolved.outcome.as_str() != "completed",
+                )
+            });
         let terminal = match history
             .finish_resolved(outcome, reason, degraded, cleanup_disposition)
             .await
@@ -5574,10 +5898,24 @@ async fn cancel_task(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
 
+    let control = srv
+        .bindings()
+        .lock()
+        .await
+        .get(&task)
+        .and_then(|binding| binding.abort.clone());
+    let cancel_permit = match &control {
+        Some(control) => Some(control.first_poll.clone().lock_owned().await),
+        None => None,
+    };
     // Always latch the early-cancel flag: this covers the race where the peer id
     // is not yet known (the streaming supervisor's select! / peer-persist watcher
     // will apply the cancel once the id appears) and signals an in-flight stream.
     let _ = srv.store.request_cancel(&task).await;
+    if let Some(control) = control {
+        control.token.cancel();
+    }
+    drop(cancel_permit);
 
     // Durable detached task? Consult the store first (it owns the truth).
     if let Ok(Some(rec)) = srv.task_store().get(&task).await {
@@ -17587,6 +17925,7 @@ mod tests {
         srv.bindings().lock().await.insert(
             claim.task.clone(),
             TaskBinding {
+                abort: Default::default(),
                 session: claim.session.clone(),
                 agent,
                 backend: claim.backend.clone(),
@@ -17762,6 +18101,7 @@ mod tests {
                     let successor_session = mint_cold_session().unwrap();
                     let successor_lease = claim.lease.clone();
                     let successor = || TaskBinding {
+                        abort: Default::default(),
                         session: successor_session.clone(),
                         agent: AgentId::parse("a").unwrap(),
                         backend: backend.clone(),
@@ -17873,6 +18213,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_pending_configure_cannot_publish_or_remove_successor() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let backend = WarmRecordingBackend::new();
+            let srv = cold_configure_server(backend.clone());
+            let routed = srv
+                .gate(
+                    &HeaderMap::new(),
+                    &json!({"taskId":"pending-replacement", "message":{"text":"go"}}),
+                )
+                .unwrap();
+            let (release, gate) = oneshot::channel();
+            *backend.configure_gate.lock().unwrap() = Some(gate);
+            let agent = AgentId::parse("a").unwrap();
+            let mut call = Box::pin(resolve_configure_bind(
+                &srv,
+                &agent,
+                &routed,
+                None,
+                None,
+                direct_diagnostic_observer(),
+                None,
+            ));
+            tokio::select! {
+                _ = backend.configure_entered.notified() => {},
+                _ = &mut call => panic!("configure did not hold"),
+            }
+            let newer_session = mint_cold_session().unwrap();
+            {
+                let _bindings = srv.bindings().lock().await;
+                let mut pending = srv.pending_cold.lock().unwrap();
+                let old = pending.remove(&routed.task).unwrap();
+                assert_ne!(old.session, newer_session);
+                pending.insert(
+                    routed.task.clone(),
+                    PendingCold {
+                        session: newer_session.clone(),
+                        ..old
+                    },
+                );
+            }
+            release.send(()).unwrap();
+            assert!(
+                call.await.is_err(),
+                "old configure published over a newer pending incarnation"
+            );
+            assert!(!srv.bindings().lock().await.contains_key(&routed.task));
+            let mut pending = srv.pending_cold.lock().unwrap();
+            assert_eq!(
+                pending[&routed.task].session, newer_session,
+                "old guard removed newer pending incarnation"
+            );
+            pending.remove(&routed.task);
+            assert!(pending.is_empty());
+        })
+        .await
+        .expect("stale configure must settle");
+    }
+
+    #[tokio::test]
     async fn cancel_during_cold_configure() {
         for method in [methods::SEND_STREAMING_MESSAGE, methods::SEND_MESSAGE] {
             cold_configure_case(method, true, false).await;
@@ -17908,6 +18307,7 @@ mod tests {
             None,
             None,
             direct_diagnostic_observer(),
+            None,
         )
         .await
         .unwrap();

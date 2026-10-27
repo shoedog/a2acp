@@ -1017,6 +1017,19 @@ pub trait AgentRegistry: Send + Sync {
     ) -> Result<Resolved, BridgeError> {
         self.resolve(id).await
     }
+    fn supports_admitted_resolution(&self) -> bool {
+        false
+    }
+    /// Resolve only this retained entry; a replacement must never be spawned.
+    async fn resolve_admitted_observed(
+        &self,
+        _entry: &std::sync::Arc<AgentEntry>,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<Resolved, BridgeError> {
+        Err(BridgeError::ConfigMismatch {
+            field: "fallback entry",
+        })
+    }
     /// Lease and read one exact immutable entry without spawning a backend. `None` is an explicit
     /// opt-out for registries that cannot provide the bound V2 contract.
     fn bind_entry_use(&self, _id: &crate::ids::AgentId) -> Option<BoundEntryUseV1> {

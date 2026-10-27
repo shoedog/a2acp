@@ -45,7 +45,7 @@ pub struct FrozenFallbackInvocationV1 {
     source: FallbackCandidateV1,
     selected: Option<usize>,
     position: FallbackPositionV1,
-    scope: ScopeV1,
+    scope: std::sync::Arc<ScopeV1>,
 }
 impl FrozenFallbackInvocationV1 {
     /// Only the effective source's local scope is pinned. No target resolution,
@@ -58,8 +58,18 @@ impl FrozenFallbackInvocationV1 {
             source,
             selected: None,
             position: FallbackPositionV1::Source,
-            scope,
+            scope: std::sync::Arc::new(scope),
         })
+    }
+
+    pub fn source(&self) -> &FallbackCandidateV1 {
+        &self.source
+    }
+
+    /// Retain the same pinned objects through preparation and the first provider poll.
+    pub fn scope_guard(&self) -> std::sync::Arc<dyn Fn() -> bool + Send + Sync> {
+        let scope = self.scope.clone();
+        std::sync::Arc::new(move || scope.unchanged())
     }
 
     /// Called only for a failed attempt after checked cleanup. Admission binds

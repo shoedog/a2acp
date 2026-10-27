@@ -3,7 +3,7 @@ use crate::{
     accounting::PreparedUsageAttemptV1, attestation::*, domain::*, error::BridgeError,
     governance::BudgetAdmissionOutcomeV1, ids::*, ports::*,
 };
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use std::sync::Arc;
 
 pub struct AccountingBackendV1 {
@@ -15,6 +15,71 @@ impl AccountingBackendV1 {
     }
 }
 impl AccountingBackendV1 {
+    // The shared provider-poll decorator is the authority. Preflight storage before
+    // polling, then persist dispatch only if that decorator actually reached the provider.
+    async fn prompt_polled(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        attempt: PreparedUsageAttemptV1,
+        observers: Option<BackendObservers>,
+        observed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<BackendStream, crate::translator::AccountingFailureV1> {
+        use crate::translator::AccountingFailureV1;
+        if attempt.is_admitted() || attempt.has_prompt_gate() {
+            return Err(BridgeError::InvalidStateTransition.into());
+        }
+        match attempt.admit().await? {
+            BudgetAdmissionOutcomeV1::Ungoverned => {}
+            BudgetAdmissionOutcomeV1::Refused(mut refusal) => {
+                refusal.persistence = attempt.preparation_failed().await.err().map(Box::new);
+                return Err(AccountingFailureV1::from(BridgeError::BudgetRefused {
+                    refusal: Box::new(refusal),
+                }));
+            }
+            _ => return Err(BridgeError::InvalidStateTransition.into()),
+        }
+        attempt.update(false, None, false).await?;
+        let mut prompt = Box::pin(async {
+            match observers {
+                Some(observers) => {
+                    self.inner
+                        .prompt_with_observers(session, parts, observers)
+                        .await
+                }
+                None => self.inner.prompt(session, parts).await,
+            }
+        });
+        let first =
+            futures::future::poll_fn(|cx| std::task::Poll::Ready(prompt.as_mut().poll(cx))).await;
+        if observed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Err(error) = attempt.update(true, None, false).await {
+                let mut failure = match first {
+                    std::task::Poll::Ready(Err(original)) => {
+                        AccountingFailureV1::prompt_open_failure(original)
+                    }
+                    _ => AccountingFailureV1::from(error.clone()),
+                };
+                failure.persistence = Some(error);
+                return Err(failure);
+            }
+        }
+        let result = match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => prompt.await,
+        };
+        match result {
+            Ok(stream) => Ok(capture(stream, attempt)),
+            Err(error) => {
+                let mut failure = AccountingFailureV1::prompt_open_failure(error);
+                if !observed.load(std::sync::atomic::Ordering::Acquire) {
+                    failure.persistence = attempt.preparation_failed().await.err();
+                }
+                Err(failure)
+            }
+        }
+    }
+
     pub async fn prompt_prepared_v1(
         &self,
         session: &SessionId,
@@ -22,6 +87,11 @@ impl AccountingBackendV1 {
         mut attempt: PreparedUsageAttemptV1,
         observers: Option<BackendObservers>,
     ) -> Result<BackendStream, crate::translator::AccountingFailureV1> {
+        if let Some(observed) = attempt.provider_poll.take() {
+            return self
+                .prompt_polled(session, parts, attempt, observers, observed)
+                .await;
+        }
         let gate = attempt.take_prompt_gate();
         let settlement = attempt.preparation_settlement();
         let mut prompt = Box::pin(self.prompt_accounted_v1(session, parts, attempt, observers));
@@ -87,23 +157,7 @@ impl AgentBackend for AccountingBackendV1 {
             None => self.inner.prompt(session, parts).await,
         };
         // Errors can follow acceptance; only Done affirms provider settlement.
-        let mut stream = result?;
-        Ok(Box::pin(async_stream::try_stream! {
-            while let Some(item) = stream.next().await {
-                match &item {
-                    Ok(Update::Usage(usage)) => attempt.update(false, Some(usage.clone()), false).await?,
-                    Ok(Update::Done { .. }) => {
-                        attempt.update(false, None, true).await?;
-                        yield item?;
-                        return;
-                    }
-                    _ => {}
-                }
-                yield item?;
-            }
-            // An unterminated provider stream is interrupted, never finalized by inference.
-            Err(BridgeError::MissingTerminal)?;
-        }))
+        Ok(capture(result?, attempt))
     }
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         self.inner.cancel(session).await
@@ -231,4 +285,22 @@ impl AgentBackend for AccountingBackendV1 {
     async fn retire(&self) -> Result<(), BridgeError> {
         self.inner.retire().await
     }
+}
+
+fn capture(mut stream: BackendStream, attempt: PreparedUsageAttemptV1) -> BackendStream {
+    Box::pin(async_stream::try_stream! {
+        while let Some(item) = stream.next().await {
+            match &item {
+                Ok(Update::Usage(usage)) => attempt.update(false, Some(usage.clone()), false).await?,
+                Ok(Update::Done { .. }) => {
+                    attempt.update(false, None, true).await?;
+                    yield item?;
+                    return;
+                }
+                _ => {}
+            }
+            yield item?;
+        }
+        Err(BridgeError::MissingTerminal)?;
+    })
 }

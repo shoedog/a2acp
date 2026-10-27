@@ -1,0 +1,486 @@
+#[path = "fallback_direct.rs"]
+mod direct;
+use bridge_core::{ids::*, task_store::TaskStore, workflow_history::WorkflowHistoryStore};
+use direct::Fixture;
+use std::sync::atomic::Ordering;
+
+async fn terminal(
+    f: &Fixture,
+    owner: &AttemptIdentity,
+) -> bridge_core::workflow_history::AttemptTerminal {
+    f.store
+        .attempt(&owner.attempt_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .terminal
+        .unwrap()
+}
+
+#[tokio::test]
+async fn served_safe_rejection_routes() {
+    for source in ["reject", "region", "rate", "billing-match"] {
+        let f = Fixture::new(source, "success", true);
+        let owner = AttemptIdentity::initial().unwrap();
+        let body = f.served("SendMessage", &owner, None).await;
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            reply["result"]["artifact"]["text"], "answer",
+            "{source}: {body}"
+        );
+        assert_eq!(reply["result"]["task"]["id"], owner.execution_id.as_str());
+        assert_eq!(reply["result"]["task"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(*f.spawns.lock().unwrap(), ["source", "target"]);
+        assert_eq!(
+            *f.providers[0].inputs.lock().unwrap(),
+            *f.providers[1].inputs.lock().unwrap()
+        );
+        let rows = f.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.dispatched
+            && r.attribution.run_attempt.as_deref() == Some(owner.attempt_id.as_str())));
+        let terminal = f
+            .coordinator
+            .attempt_status(&owner.attempt_id)
+            .await
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.terminal_evidence_counts.reached, 2);
+    }
+}
+
+#[tokio::test]
+async fn served_replay_refusals_and_lazy_controls() {
+    for (source, chain, context) in [
+        ("accepted", true, None),
+        ("text", true, None),
+        ("tool", true, None),
+        ("permission", true, None),
+        ("cleanup", true, None),
+        ("missing", true, None),
+        ("success", true, None),
+        ("reject", false, None),
+        ("billing", true, None),
+        ("reject", true, Some("existing")),
+    ] {
+        let f = Fixture::new(source, "setup", chain);
+        let owner = AttemptIdentity::initial().unwrap();
+        let body = f.served("SendMessage", &owner, context).await;
+        assert_eq!(
+            body.contains("answer"),
+            source == "success",
+            "{source}: {body}"
+        );
+        assert_eq!(*f.spawns.lock().unwrap(), ["source"]);
+        assert_eq!(f.rows().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn sse_request_keeps_original_failure() {
+    let f = Fixture::new("reject", "success", true);
+    let owner = AttemptIdentity::initial().unwrap();
+    let body = f.served("SendStreamingMessage", &owner, None).await;
+    assert!(!body.contains("answer"), "{body}");
+    assert!(body.contains("error"), "{body}");
+    assert_eq!(*f.spawns.lock().unwrap(), ["source"]);
+    assert_eq!(f.rows().len(), 1);
+}
+
+#[tokio::test]
+async fn served_governed_never_routes() {
+    let f = Fixture::with_options("reject", "success", true, false, true);
+    let owner = AttemptIdentity::initial().unwrap();
+    let body = f.served("SendMessage", &owner, None).await;
+    assert!(body.contains("quota_exhausted"), "{body}");
+    assert_eq!(*f.spawns.lock().unwrap(), ["source"]);
+    assert_eq!(f.rows().len(), 1);
+}
+
+#[tokio::test]
+async fn served_target_setup_failure_and_provider_poll_authority() {
+    for (target, fail) in [("setup", false), ("success", true), ("usage", false)] {
+        let f = Fixture::with_options("reject", target, true, fail, false);
+        if target == "usage" {
+            f.store.usage_summary_v1(&Default::default()).await.unwrap();
+            let db = rusqlite::Connection::open(f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                .unwrap();
+            db.execute_batch("PRAGMA journal_mode=PERSIST; CREATE TRIGGER refuse_target BEFORE UPDATE ON usage_attempts_v1 WHEN json_extract(NEW.record_json, '$.attribution.agent') = 'target' BEGIN SELECT RAISE(ABORT, 'candidate refused'); END;").unwrap();
+        }
+        let owner = AttemptIdentity::initial().unwrap();
+        let body = f.served("SendMessage", &owner, None).await;
+        assert!(!body.contains("answer"), "{body}");
+        let rows = f.rows();
+        assert_eq!(rows.len(), 2);
+        let target = rows
+            .iter()
+            .find(|r| r.attribution.agent == "target")
+            .unwrap();
+        assert!(!target.dispatched);
+        assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 1);
+        assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(f.providers[2].setup.load(Ordering::SeqCst), 0);
+        let terminal = f
+            .store
+            .attempt(&owner.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.terminal_evidence_counts.reached, 1);
+    }
+}
+
+#[tokio::test]
+async fn served_chain_is_frozen_and_finite() {
+    let f = Fixture::new("reject", "reject", true);
+    let owner = AttemptIdentity::initial().unwrap();
+    let body = f.served("SendMessage", &owner, None).await;
+    assert!(body.contains("model not available"), "{body}");
+    assert_eq!(*f.spawns.lock().unwrap(), ["source", "target", "last"]);
+    let rows = f.rows();
+    assert_eq!(rows.len(), 3);
+    let last = rows.iter().find(|r| r.attribution.agent == "last").unwrap();
+    assert!(!last.dispatched);
+    assert_eq!(f.providers[0].prompts.load(Ordering::SeqCst), 1);
+    assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 1);
+}
+
+async fn rpc(
+    router: &axum::Router,
+    method: &str,
+    params: serde_json::Value,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+    router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .header("A2A-Version", "1.0")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"jsonrpc":"2.0","id":2,"method":method,"params":params})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+async fn response_text(response: axum::response::Response) -> String {
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn served_cleanup_activity_is_resampled() {
+    for effect in [false, true] {
+        let f = Fixture::new(
+            if effect {
+                "cleanup-effect"
+            } else {
+                "blocked-cleanup"
+            },
+            "success",
+            true,
+        );
+        let router = f.server().router();
+        let owner = AttemptIdentity::initial().unwrap();
+        let mut call = Box::pin(Fixture::served_on(router, "SendMessage", &owner, None));
+        tokio::select! {
+            _ = f.providers[0].cleanup.0.notified() => {},
+            body = &mut call => panic!("returned before cleanup: {body}"),
+        }
+        assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 0);
+        f.providers[0].cleanup.1.notify_one();
+        let body = call.await;
+        assert_eq!(
+            body.contains("answer"),
+            !effect,
+            "late cleanup effect must forbid replay: {body}"
+        );
+        assert_eq!(
+            f.providers[1].prompts.load(Ordering::SeqCst),
+            usize::from(!effect)
+        );
+        assert_eq!(f.rows().len(), if effect { 1 } else { 2 });
+        if effect {
+            assert!(
+                body.contains("quota_exhausted"),
+                "original failure must stand: {body}"
+            );
+            assert_eq!(*f.spawns.lock().unwrap(), ["source"]);
+        }
+    }
+}
+
+async fn lifecycle(boundary: &str, action: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let f = Fixture::new("blocked-cleanup", if boundary == "configure" { "blocked-setup" } else { "success" }, true);
+        let router = f.server().router();
+        let owner = AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+        let mut call = Box::pin(Fixture::served_on(router.clone(), "SendMessage", &owner, None));
+        tokio::select! {
+            _ = f.providers[0].cleanup.0.notified() => {},
+            body = &mut call => panic!("returned before cleanup: {body}"),
+        }
+        assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 0, "target prepared before source cleanup");
+        if boundary == "configure" {
+            f.providers[0].cleanup.1.notify_one();
+            tokio::select! {
+                _ = f.providers[1].configure.0.notified() => {},
+                body = &mut call => panic!("returned before configure: {body}"),
+            }
+            assert_ne!(*f.providers[0].sessions.lock().unwrap(), *f.providers[1].sessions.lock().unwrap());
+        }
+        // One router owns pending preparations, cancellation and unrelated dispatch.
+        let unrelated = AttemptIdentity::initial().unwrap();
+        let response = rpc(&router, "SendStreamingMessage", serde_json::json!({"message":{
+            "text":"independent", "taskId":unrelated.execution_id.as_str(),
+            "metadata":{"a2a-bridge.agent":"other", "a2a-bridge.execution_id":unrelated.execution_id.as_str(), "a2a-bridge.attempt_id":unrelated.attempt_id.as_str()}
+        }})).await;
+        while f.providers[3].prompts.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+        let cancel = response_text(rpc(&router, "CancelTask", serde_json::json!({"taskId":unrelated.execution_id.as_str()})).await).await;
+        assert!(cancel.contains("TASK_STATE_CANCELED"), "unrelated cancel: {cancel}");
+        assert_eq!(f.providers[3].cancels.load(Ordering::SeqCst), 1);
+        drop(response);
+        assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        if action == "cancel" {
+            let cancel = response_text(rpc(&router, "CancelTask", serde_json::json!({"taskId":owner.execution_id.as_str()})).await).await;
+            assert!(cancel.contains("TASK_STATE_CANCELED"), "{cancel}");
+            assert_eq!(f.providers[usize::from(boundary == "configure")].cancels.load(Ordering::SeqCst), 1);
+        }
+        if action == "disconnect" {
+            // Dropping the unary HTTP service future models the client disconnect.
+            drop(call);
+        } else {
+            f.providers[0].cleanup.1.notify_one();
+            f.providers[1].configure.1.notify_one();
+            let body = call.await;
+            assert_eq!(body.contains("answer"), action == "release", "{boundary}/{action}: {body}");
+        }
+        f.providers[0].cleanup.1.notify_one();
+        f.providers[1].configure.1.notify_one();
+        while f.coordinator.bindings_ref().lock().await.contains_key(&task) { tokio::task::yield_now().await; }
+        assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), usize::from(action == "release"));
+        if boundary == "cleanup" && action != "release" {
+            assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 0);
+        }
+        // Reuse the exact task on this server with a fresh attempt. A leaked pending-cold
+        // entry would refuse configuration; a late old guard must leave this binding alive.
+        let next = AttemptId::mint().unwrap();
+        let response = rpc(&router, "SendStreamingMessage", serde_json::json!({"message":{
+            "text":"new incarnation", "taskId":owner.execution_id.as_str(),
+            "metadata":{"a2a-bridge.agent":"other", "a2a-bridge.execution_id":owner.execution_id.as_str(), "a2a-bridge.attempt_id":next.as_str()}
+        }})).await;
+        while f.providers[3].prompts.load(Ordering::SeqCst) != 2 { tokio::task::yield_now().await; }
+        let forgotten = f.providers[0].forgets.load(Ordering::SeqCst);
+        drop(bridge_coordinator::dispatch::BindingGuard {
+            bindings: f.coordinator.bindings_ref().clone(), task: task.clone(),
+            backend: f.providers[0].clone(), session: f.providers[0].sessions.lock().unwrap()[0].clone(),
+        });
+        while f.providers[0].forgets.load(Ordering::SeqCst) == forgotten { tokio::task::yield_now().await; }
+        let bindings = f.coordinator.bindings_ref().lock().await;
+        assert_eq!(bindings[&task].agent.as_str(), "other", "old guard removed new incarnation");
+        drop(bindings);
+        let cancel = response_text(rpc(&router, "CancelTask", serde_json::json!({"taskId":owner.execution_id.as_str()})).await).await;
+        assert!(cancel.contains("TASK_STATE_CANCELED"), "{cancel}");
+        assert_eq!(f.providers[3].cancels.load(Ordering::SeqCst), 2);
+        drop(response);
+    }).await.unwrap_or_else(|_| panic!("{boundary}/{action}: lifecycle did not settle"));
+}
+
+#[tokio::test]
+async fn served_cleanup_cancel_and_binding() {
+    for boundary in ["cleanup", "configure"] {
+        lifecycle(boundary, "cancel").await;
+    }
+}
+#[tokio::test]
+async fn served_disconnect_and_pending_settlement() {
+    for boundary in ["cleanup", "configure"] {
+        lifecycle(boundary, "disconnect").await;
+    }
+}
+#[tokio::test]
+async fn served_release_and_transition_controls() {
+    for boundary in ["cleanup", "configure"] {
+        lifecycle(boundary, "release").await;
+    }
+}
+
+#[tokio::test]
+async fn served_no_state_migration_or_persistence_replay() {
+    use bridge_core::ports::SessionStore;
+    for retained in [true, false] {
+        let f = Fixture::new("reject", "success", true);
+        let owner = AttemptIdentity::initial().unwrap();
+        if retained {
+            f.store
+                .put(
+                    &TaskId::parse(owner.execution_id.as_str()).unwrap(),
+                    &SessionId::parse("retained").unwrap(),
+                )
+                .await
+                .unwrap();
+        } else {
+            f.store.usage_summary_v1(&Default::default()).await.unwrap();
+            let db = rusqlite::Connection::open(f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                .unwrap();
+            db.execute_batch("CREATE TRIGGER refuse_completion BEFORE UPDATE ON usage_attempts_v1 BEGIN SELECT RAISE(ABORT, 'persist refused'); END;").unwrap();
+        }
+        let body = f.served("SendMessage", &owner, None).await;
+        assert!(!body.contains("answer"), "{body}");
+        if !retained {
+            assert!(body.contains("store failure"), "{body}");
+        }
+        assert!(f.spawns.lock().unwrap().iter().all(|name| name == "source"));
+        assert!(f.rows().len() <= 1);
+    }
+}
+
+#[tokio::test]
+async fn served_successor_terminal_contract_is_resolved_before_aggregation() {
+    for (target, reason, valid, missing, invalid) in [
+        (
+            "evidence-missing",
+            "protocol_terminal_evidence_missing",
+            0,
+            1,
+            0,
+        ),
+        (
+            "evidence-malformed",
+            "protocol_terminal_evidence_malformed",
+            0,
+            0,
+            1,
+        ),
+        ("evidence-valid", "completed_final", 1, 0, 0),
+    ] {
+        let f = Fixture::new("reject", target, true);
+        let owner = AttemptIdentity::initial().unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_str(&f.served("SendMessage", &owner, None).await).unwrap();
+        assert_eq!(
+            reply["result"]["task"]["state"],
+            if valid == 1 {
+                "TASK_STATE_COMPLETED"
+            } else {
+                "TASK_STATE_FAILED"
+            }
+        );
+        let terminal = terminal(&f, &owner).await;
+        assert_eq!(
+            terminal.outcome,
+            if valid == 1 { "completed" } else { "failed" }
+        );
+        assert_eq!(terminal.terminal_reason, reason);
+        let counts = terminal.terminal_evidence_counts;
+        assert_eq!(
+            (counts.reached, counts.valid, counts.missing, counts.invalid),
+            (2, valid, missing, invalid)
+        );
+    }
+}
+
+#[tokio::test]
+async fn served_retains_admitted_entry_and_scope_until_provider_poll() {
+    for boundary in ["blocked-resolve", "blocked-setup", "scope"] {
+        let f = Fixture::new(
+            "reject",
+            if boundary == "scope" {
+                "ledger-gate"
+            } else {
+                boundary
+            },
+            true,
+        );
+        let owner = AttemptIdentity::initial().unwrap();
+        let call = f.served("SendMessage", &owner, None);
+        tokio::pin!(call);
+        tokio::select! {
+            _ = async { if boundary == "scope" { f.dispatch_gate.0.notified().await; } else { f.providers[1].configure.0.notified().await; } } => {},
+            body = &mut call => panic!("returned before admitted target gate: {body}"),
+        }
+        if boundary == "scope" {
+            let path = f.dir.path().join("scope");
+            std::fs::rename(&path, f.dir.path().join("old-scope")).unwrap();
+            std::fs::create_dir(path).unwrap();
+        } else {
+            let mut snapshot = f.snapshot();
+            snapshot.entries[1].mode = Some("write".into());
+            f.coordinator.registry().apply(snapshot).await.unwrap();
+        }
+        if boundary == "scope" {
+            f.dispatch_gate.1.notify_one();
+        } else {
+            f.providers[1].configure.1.notify_one();
+        }
+        let body = call.await;
+        assert!(body.contains("quota_exhausted"), "{boundary}: {body}");
+        assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(f.providers[2].setup.load(Ordering::SeqCst), 0);
+        let rows = f.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.attribution.agent == "target")
+                .unwrap()
+                .dispatched
+        );
+        let terminal = terminal(&f, &owner).await;
+        assert_eq!(terminal.terminal_evidence_counts.reached, 1);
+    }
+}
+
+#[tokio::test]
+async fn real_cancel_during_successor_dispatch_barrier_prevents_provider_poll() {
+    let f = Fixture::new("reject", "ledger-gate", true);
+    let router = f.server().router();
+    let owner = AttemptIdentity::initial().unwrap();
+    let call = Fixture::served_on(router.clone(), "SendMessage", &owner, None);
+    tokio::pin!(call);
+    tokio::select! {
+        _ = f.dispatch_gate.0.notified() => {},
+        body = &mut call => panic!("returned before successor ledger barrier: {body}"),
+    }
+    let body = response_text(
+        rpc(
+            &router,
+            "CancelTask",
+            serde_json::json!({"taskId":owner.execution_id.as_str()}),
+        )
+        .await,
+    )
+    .await;
+    assert!(body.contains("TASK_STATE_CANCELED"), "{body}");
+    f.dispatch_gate.1.notify_one();
+    let body = call.await;
+    assert!(body.contains("TASK_STATE_CANCELED"), "{body}");
+    assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 1);
+    assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    let rows = f.rows();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        !rows
+            .iter()
+            .find(|r| r.attribution.agent == "target")
+            .unwrap()
+            .dispatched
+    );
+    let terminal = terminal(&f, &owner).await;
+    assert_eq!(terminal.terminal_evidence_counts.reached, 1);
+}
