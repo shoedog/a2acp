@@ -1048,10 +1048,23 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
     let adapter = dir.path().join("fd-reporting-agent");
     fs::write(
         &adapter,
-        format!(
-            "#!/bin/sh\nfor fd in /proc/self/fd/*; do readlink \"$fd\" || true; done > {:?}\nexit 1\n",
-            report
-        ),
+        r#"#!/bin/sh
+for fd in /proc/self/fd/*; do readlink "$fd" || true; done > '__REPORT__'
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -E 's/^\{"jsonrpc":"2.0","id":([^,]+),"method".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[]},"id":%s}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","result":{"sessionId":"fd-probe","models":{"currentModelId":"test-model","availableModels":[{"modelId":"test-model","name":"Test"}]}},"id":%s}\n' "$id" ;;
+    *'"method":"session/set_model"'*)
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fd-probe","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"PONG"}}}}'
+      printf '{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":%s}\n' "$id" ;;
+  esac
+done
+"#.replace("__REPORT__", report.to_str().unwrap()),
     )
     .unwrap();
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
@@ -1065,9 +1078,11 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
         &config,
         format!(
             "default = \"marker\"\n\n\
+             [store]\npath = {store:?}\n\n\
              [registry]\nallowed_cmds = [{adapter:?}]\n\n\
-             [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\n\n\
-             [server]\n"
+             [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\npre_authenticated = true\n\n\
+             [server]\n",
+            store = dir.path().join("history.sqlite"),
         ),
     )
     .unwrap();
@@ -1076,7 +1091,11 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
     let manifest_text = fs::read_to_string(&manifest)
         .unwrap()
         .replace("config = \"missing.toml\"", "config = \"a2a-bridge.toml\"")
-        .replace("agent = \"missing-agent\"", "agent = \"marker\"");
+        .replace("agent = \"missing-agent\"", "agent = \"marker\"")
+        // The successful fake turn and joined teardown are the completion events.
+        // These bounds are watchdogs, not the one-second negative-control fixture.
+        .replace("timeout_secs = 30\n", "timeout_secs = 300\n")
+        .replace("timeout_secs = 1\n", "timeout_secs = 60\n");
     fs::write(&manifest, manifest_text).unwrap();
     let out = dir.path().join("aggregate.json");
 
@@ -1099,7 +1118,15 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(&out).unwrap_or_else(|error| format!("<unreadable: {error}>"))
     );
-    let inherited = fs::read_to_string(&report).expect("provider process must record its fds");
+    let aggregate: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    let smoke = &aggregate["results"][0]["smoke"];
+    assert_eq!(smoke["success"], true, "{aggregate:#}");
+    assert_eq!(
+        smoke["turn"]["terminal_state"], "completed",
+        "{aggregate:#}"
+    );
+    let inherited = fs::read_to_string(&report)
+        .unwrap_or_else(|error| panic!("provider fd report missing: {error}; {aggregate:#}"));
     assert!(
         !inherited.contains("a2a-bridge-candidate"),
         "provider inherited staged executable capability: {inherited}"

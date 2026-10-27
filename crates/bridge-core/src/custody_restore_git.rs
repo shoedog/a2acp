@@ -1111,7 +1111,11 @@ fn fs_error(error: FsCustodyError) -> GitBootstrapErrorV1 {
 /// and never a success. The comparison is the runner's own (`now >= deadline`): the deadline instant
 /// itself is already spent.
 pub(super) fn before_deadline(deadline: Instant) -> Result<(), GitBootstrapErrorV1> {
-    if Instant::now() >= deadline {
+    #[cfg(test)]
+    let now = super::git_tests::deadline_now_for_test();
+    #[cfg(not(test))]
+    let now = Instant::now();
+    if now >= deadline {
         return Err(GitBootstrapErrorV1::Git(CustodyGitError::Timeout));
     }
     Ok(())

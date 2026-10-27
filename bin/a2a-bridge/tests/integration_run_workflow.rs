@@ -789,6 +789,8 @@ done
                 r#"
 default = "fake"
 allowed_cwd_root = {root:?}
+[store]
+path = {store:?}
 [registry]
 allowed_cmds = [{adapter:?}]
 [[agents]]
@@ -807,7 +809,9 @@ mode = {mode:?}
 [server]
 addr = "127.0.0.1:0"
 "#,
-                root = dir.path()
+                root = dir.path(),
+                // Each concurrent fixture owns its ledger; cwd does not isolate platform history.
+                store = dir.path().join("selection.sqlite"),
             ),
         )
         .unwrap();
@@ -846,7 +850,11 @@ addr = "127.0.0.1:0"
                 "progress must show configured model: {stderr}"
             );
         } else {
-            assert!(format!("{stderr}{}", String::from_utf8_lossy(&output.stdout)).contains(error));
+            assert!(
+                format!("{stderr}{}", String::from_utf8_lossy(&output.stdout)).contains(error),
+                "{model}/{mode}: expected {error:?}; stderr={stderr}; stdout={}",
+                String::from_utf8_lossy(&output.stdout),
+            );
         }
     }
 }

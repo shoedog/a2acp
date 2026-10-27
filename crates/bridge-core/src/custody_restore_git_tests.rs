@@ -34,6 +34,63 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// A guard matrix advances time at an observed event, rather than racing fixture I/O
+// against a short wall deadline. Child processes still have the real far_deadline()
+// watchdog. Thread-local state follows the existing hooks, including scoped row threads.
+thread_local! {
+    static DEADLINE_NOW_V1: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn deadline_now_for_test() -> Instant {
+    DEADLINE_NOW_V1.with(|clock| clock.get().unwrap_or_else(Instant::now))
+}
+
+struct DeadlineClockV1(Option<Instant>);
+
+impl DeadlineClockV1 {
+    fn freeze() -> Self {
+        Self(DEADLINE_NOW_V1.with(|clock| clock.replace(Some(Instant::now()))))
+    }
+
+    fn advance_to(now: Instant) {
+        DEADLINE_NOW_V1.with(|clock| {
+            assert!(
+                clock.get().is_some(),
+                "advance requires a scoped test clock"
+            );
+            clock.set(Some(now));
+        });
+    }
+
+    fn expire(deadline: Instant) {
+        DEADLINE_NOW_V1.with(|clock| {
+            assert!(clock.get().is_some(), "expiry requires a scoped test clock");
+            clock.set(Some(deadline));
+        });
+    }
+}
+
+impl Drop for DeadlineClockV1 {
+    fn drop(&mut self) {
+        DEADLINE_NOW_V1.with(|clock| clock.set(self.0));
+    }
+}
+
+#[test]
+fn event_deadline_clock_expires_at_equality_and_restores_after_unwind() {
+    let deadline = far_deadline();
+    let result = std::panic::catch_unwind(|| {
+        let _clock = DeadlineClockV1::freeze();
+        before_deadline(deadline).expect("headroom before the selected event");
+        DeadlineClockV1::expire(deadline);
+        assert!(is_timeout(&before_deadline(deadline).unwrap_err()));
+        // Distinguish the intended unwind from any assertion failure above.
+        std::panic::panic_any(());
+    });
+    assert!(result.unwrap_err().is::<()>());
+    before_deadline(deadline).expect("the scoped clock was restored");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The lane Git
 // ---------------------------------------------------------------------------------------------
@@ -7372,9 +7429,11 @@ fn run_guarded(
     rules: &[(&str, &str)],
     at: AtGuardV1,
 ) -> (RanV1, OutcomeV1, std::rc::Rc<GuardLogV1>, Instant) {
+    let _clock = DeadlineClockV1::freeze();
     let log = std::rc::Rc::new(GuardLogV1::default());
     let shared = log.clone();
-    let (ran, outcome, deadline) = run_before(rules, ROUND6_DEADLINE_V1, move |dest, deadline| {
+    let watchdog = Duration::from_secs(120);
+    let (ran, outcome, deadline) = run_before(rules, watchdog, move |dest, deadline| {
         let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
         {
             let log = shared.clone();
@@ -7401,7 +7460,7 @@ fn run_guarded(
                         if index == *at {
                             log.injected.set(Some(event.label));
                             if event.label == *label {
-                                pass_the_deadline(deadline);
+                                DeadlineClockV1::expire(deadline);
                             }
                         }
                     }
@@ -7637,7 +7696,7 @@ fn guard_rows(shape: &GuardShapeV1) -> Vec<(usize, &'static str)> {
     rows
 }
 
-/// Every guard of the success path halts the run ALONE: the step before it is made slow past the deadline,
+/// Every guard of the success path halts the run ALONE: the selected event advances the test clock to the deadline,
 /// and the run must end with a typed timeout AT that guard: the children that had started, the step it
 /// names as last completed, the ledger exactly as a clean run leaves it, and NO later guard run (so nothing
 /// further was done toward a verified result, and the root's identity was never reached).
@@ -7649,15 +7708,14 @@ fn round6_each_late_validation_guard_halts_the_run_alone() {
     let mut problems = Vec::new();
     for (index, label) in guard_rows(&shape) {
         let name = format!("guard #{index} `{label}`");
-        let (ran, outcome, log, deadline) =
+        let (ran, outcome, log, _) =
             run_guarded(&[], AtGuardV1::PassTheDeadline { at: index, label });
         let events = log.events.borrow().clone();
         println!(
-            "GUARD-MARKER {name}: found={:?} guards_run={} last={:?} returned {}ms after the deadline",
+            "GUARD-MARKER {name}: found={:?} guards_run={} last={:?} (guard clock injected)",
             log.injected.get(),
             events.len(),
-            events.last(),
-            Instant::now().saturating_duration_since(deadline).as_millis()
+            events.last()
         );
         if log.injected.get() != Some(label) {
             problems.push(format!(
@@ -16809,7 +16867,8 @@ fn b2a_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
             let row = format!("{target} #{nth}");
             let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
             let lengths = case.lengths();
-            let deadline = Instant::now() + B2A_LATE_ROW_DEADLINE_V1;
+            let deadline = far_deadline();
+            let _clock = DeadlineClockV1::freeze();
             let spent = std::rc::Rc::new(std::cell::Cell::new(false));
             let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
             let effects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -16820,7 +16879,7 @@ fn b2a_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
                         counter.set(counter.get() + 1);
                         if counter.get() == nth {
                             flag.set(true);
-                            pass_the_deadline(deadline);
+                            DeadlineClockV1::expire(deadline);
                         }
                     }
                 });
@@ -24508,16 +24567,18 @@ fn halting_row(
         PlaneInV1::unborn(capsule, CustodyGitObjectFormatV1::Sha1)
     };
     let route = RouteV1::recorder();
-    // These concurrent rows share fixture I/O.  This headroom lets each row reach its named
-    // recorded guard; the injected guard still supplies the typed timeout proof.
-    let deadline = Instant::now() + Duration::from_secs(12);
-    let (events, found, _hook) = act_at_index(index, label, move || pass_the_deadline(deadline));
+    // Reach the named guard regardless of fixture scheduling, then expire at that event.
+    // Real Git children retain a bounded watchdog independent of the injected clock.
+    let deadline = far_deadline();
+    let _clock = DeadlineClockV1::freeze();
+    let (events, found, _hook) =
+        act_at_index(index, label, move || DeadlineClockV1::expire(deadline));
     let ran = run_plane(input, &route, deadline);
     println!(
-        "GUARD-MARKER {name}: found={:?} guards_run={} returned {}ms after the deadline",
+        "GUARD-MARKER {name}: found={:?} guards_run={} observed clock {}ms past the deadline",
         found.get(),
         events.borrow().len(),
-        Instant::now()
+        deadline_now_for_test()
             .saturating_duration_since(deadline)
             .as_millis()
     );
@@ -24567,12 +24628,12 @@ fn halting_row(
     }
 }
 
-/// Every guard of the final stage halts the run alone: the step before it is made slow past the one deadline,
+/// Every guard of the final stage halts the run alone: its event advances the clock to the one deadline,
 /// and the run ends with the typed timeout AT that guard: the children that had started and the proofs that had
 /// returned (a refusal in a runner callback makes the runner return an error, so that child's proof is not
 /// recorded), `Config` as the last completed step, the ledger exactly as a clean run leaves it, a failure and
 /// never a success, and NO later guard read (so nothing further was done toward a result, and the root's
-/// identity was never reached). The rows are independent runs that mostly wait for their deadline, so they run
+/// identity was never reached). The rows are independent runs with thread-local event clocks, and run
 /// on a few threads at once. The rows are derived from an Empty database's run; the guards that exist only for a
 /// Captured database (those of its admitted bootstrap files) are derived from a Captured run, and every one of
 /// them has its rows too.
@@ -27857,7 +27918,16 @@ fn bracket_row(
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
     let route = RouteV1::recorder();
-    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let clock = matches!(slow, HowSlowV1::WithHeadroom).then(DeadlineClockV1::freeze);
+    let deadline = if clock.is_some() {
+        far_deadline()
+    } else {
+        Instant::now() + B2C_DEADLINE_V1
+    };
+    if clock.is_some() {
+        // Keep the original logical headroom; real child launches retain a bounded watchdog.
+        DeadlineClockV1::advance_to(deadline - B2C_DEADLINE_V1);
+    }
     let log: std::rc::Rc<std::cell::RefCell<Vec<SeenV1>>> = std::rc::Rc::default();
     let armed = std::rc::Rc::new(std::cell::Cell::new(false));
     let window: WindowV1 = WindowV1::default();
@@ -27883,7 +27953,9 @@ fn bracket_row(
             *at_the_slow_call.borrow_mut() = Some(snapshot(&root));
             match slow {
                 HowSlowV1::PastTheDeadline => pass_the_deadline(deadline),
-                HowSlowV1::WithHeadroom => std::thread::sleep(HEADROOM_SLOW_V1),
+                HowSlowV1::WithHeadroom => {
+                    DeadlineClockV1::advance_to(deadline_now_for_test() + HEADROOM_SLOW_V1);
+                }
             }
         })
     };
@@ -28087,7 +28159,7 @@ fn bracket_row(
             if route.children() != CAPTURED_CHILDREN_V1 {
                 judged.push(format!("children {:?}", route.children()));
             }
-            if Instant::now() >= deadline {
+            if deadline_now_for_test() >= deadline {
                 judged.push("finished after its deadline".to_owned());
             }
             if after.is_empty() {
