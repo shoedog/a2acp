@@ -90,3 +90,164 @@ the source-proven-race exception.
 - `cargo run -p a2a-bridge -- validate --repo-hygiene`: passed,
   **44 tracked artifacts / 9 validated example configs**.
 - `git diff --check`: passed. All changes fit the approximately 400-line budget.
+
+## H3 — population and size-limit handoff (2026-10-27)
+
+Base: `30c4bfae328dd64ea7812cf178a456454c7c0f24`, Linux aarch64 container,
+Rust 1.94.0, Git 2.54.0, nextest 0.9.146. No host or provider gate ran.
+**Stopped at the task's explicit size limit; implementation is not complete.**
+A discarded, unvalidated conversion draft already required 491 changed lines
+(398 Git tests, 39 payload tests, 54 snapshot implementation/regression), before
+this inventory and evidence. It did not yet address every population member.
+Only this inventory/evidence is staged; the draft is not a proposed fix.
+
+### Population
+
+Audited all three `custody_restore*tests.rs` modules, every `Instant::now`, sleep,
+finite deadline, and callers of `pass_the_deadline`, `run_late`, `run_guarded`,
+`CallClockV1::watch`, `bracket_row`, `known_row`, `owed_row`, and `run_raw_row_v3`.
+The table names every deliberate expiry/headroom control, including immediate
+spent-deadline controls and H2's shared guard-driver controls. Generic 120s
+success watchdogs without deliberate pacing/expiry are not guard-clock races.
+Filesystem timestamp sleeps (`let_the_clock_tick`, the payload content rewrite)
+are not deadline controls. `custody_restore_tests.rs` has no timing controls.
+Payload tests are nested under `custody_restore::git_tests::payload_tests` and
+already import the H2 seam via `super::*`; no second clock is needed.
+
+“Converting now” means the required conversion population, **deferred at the
+size gate**, not an assertion that a conversion has landed. Real-time rows must
+retain bounded real runner watchdogs; their short bootstrap budget can still
+expire before the target child under load. Freezing guard time alone cannot
+prevent that runner admission race. Mixed tests are classified by their timeout
+rows; deterministic entry/settlement guard rows should be split out when needed.
+
+Population: 72 Git tests (8 already H2, 53 deferred conversions, 11 real-child
+timeout tests) and 5 payload tests requiring conversion.
+
+Git test names below are relative to `custody_restore::git_tests`.
+
+| Test | Classification / reason |
+|---|---|
+| `event_deadline_clock_expires_at_equality_and_restores_after_unwind` | Already converted by H2 (existing scoped guard clock). |
+| `an_expired_deadline_refuses_before_any_child_and_a_slow_child_times_out` | Real-time: must observe the runner killing the real index-pack child; entry-expired row is convertible. |
+| `round5_a_final_fsck_that_finishes_before_the_deadline_cannot_succeed_after_it` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round5_a_final_fsck_settling_with_headroom_succeeds_before_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_a_deadline_spent_before_the_final_gate_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_a_deadline_spent_inside_the_closing_tree_census_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_a_deadline_spent_inside_the_closing_mount_census_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_a_deadline_spent_inside_the_final_childs_success_gate_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_a_deadline_spent_after_the_final_digest_read_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_with_headroom_every_late_validation_step_succeeds_before_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `round6_the_late_validation_guards_run_in_the_documented_order` | Already converted by H2 (existing scoped guard clock). |
+| `round6_each_late_validation_guard_halts_the_run_alone` | Already converted by H2 (existing scoped guard clock). |
+| `round6_the_root_identity_is_still_the_last_fallible_gate_after_its_guard` | Already converted by H2 (existing scoped guard clock). |
+| `round6_a_failed_final_child_is_never_held_to_the_success_gate_guards` | Already converted by H2 (existing scoped guard clock). |
+| `b1a_every_refusal_is_in_the_failure_shape_that_began_no_materialization` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1a_the_paced_rehash_checks_rewinds_and_reads_a_bounded_prefix` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1a_each_guard_halts_the_run_alone_and_headroom_succeeds` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1a_a_spent_deadline_refuses_before_any_frame_is_touched` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1a_the_deadline_is_observed_before_every_decoded_entry` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1a_no_frame_byte_is_read_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1b_no_source_read_follows_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1b_a_spent_deadline_refuses_before_a_file_is_routed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1b_the_agreement_phases_each_observe_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1b_the_retained_agreement_observes_the_one_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b1b_the_retained_agreement_decodes_nothing_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_a_spent_deadline_refuses_before_any_write` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_each_guard_halts_the_run_alone_and_headroom_succeeds` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_a_deadline_spent_in_the_final_gate_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_no_chunk_is_read_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_no_effect_follows_a_guard_that_finds_the_deadline_spent` | Already converted by H2 (existing scoped guard clock). |
+| `b2a_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_write` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_an_interrupted_read_or_write_is_never_retried_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_the_length_probe_is_never_called_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_no_read_write_or_probe_follows_a_call_that_returned_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2a_interrupted_and_short_calls_with_headroom_copy_exactly_and_conserve_the_ledger` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_the_drain_after_a_held_ref_fault_never_reads_past_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_a_spent_deadline_refuses_before_any_write` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_each_guard_halts_the_run_alone_and_headroom_succeeds` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_a_deadline_spent_in_the_final_gate_cannot_succeed` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_no_effect_follows_a_guard_that_finds_the_deadline_spent` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_write` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_an_interrupted_write_is_never_retried_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_no_chunk_is_read_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_no_read_or_write_follows_a_call_that_returned_after_the_deadline` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2b_interrupted_and_short_writes_with_headroom_restore_exactly_and_conserve_the_ledger` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_the_one_deadline_reaches_every_helper_and_none_resets_it` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_every_final_guard_halts_the_run_alone_and_no_success_follows_expiry` | Already converted by H2 (existing scoped guard clock). |
+| `b2c_a_final_child_that_leaves_an_effect_is_refused_beside_its_own_outcome_on_every_outcome` | Real-time timeout rows: must kill the final fsck after its filesystem effects; other outcomes use watchdog headroom. |
+| `b2c_a_failed_childs_reconciliation_digest_reads_one_byte_past_the_census_and_no_further` | Real-time timeout row: must kill fsck before measuring its effect through retained descriptors. |
+| `b2c_a_deadline_spent_before_the_call_refuses_before_any_child_starts` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_deadline_spent_before_a_childs_digest_refuses_before_the_child_starts` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_slow_call_that_returns_after_the_deadline_is_followed_by_no_further_call` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child_left` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_slow_call_inside_a_childs_bracket_is_followed_by_no_further_call` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_slow_call_with_headroom_inside_a_childs_bracket_changes_nothing` | Already converted by H2 (existing scoped guard clock). |
+| `b2c_a_timed_out_final_child_is_reconciled_once_beside_every_retained_chain_and_mount_it_left_owed` | Real-time: runner must kill fsck after swaps/mount effects, then reconcile each owed unit. |
+| `b2c_a_successful_final_child_whose_settlement_returns_late_is_reconciled_once_beside_what_it_left` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_known_failure_whose_gate_already_ran_is_reconciled_for_the_tree_only_and_a_headroom_call_for_none` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_timed_out_final_child_that_added_an_entry_and_rewrote_head_reports_the_timeout_beside_both` | Real-time: must kill fsck after both entry creation and HEAD rewrite. |
+| `b2c_a_drifted_binary_stays_the_primary_beside_the_callback_refusal_and_what_the_child_left` | Real-time timeout row: must kill the drifted route and retain drift beside callback timeout. |
+| `b2c_two_swapped_retained_chain_entries_and_a_swapped_root_are_all_reported_with_the_root_last` | Real-time timeout row: must kill fsck after both chain and root swaps. |
+| `b2c_controls_a_refused_pre_spawn_gate_is_not_replayed_and_a_completed_post_exit_gate_is_not_repeated` | Real-time timeout control: must kill the final fsck and count exactly one reconciliation. |
+| `b2c_a_returned_slow_census_call_is_counted_once_and_every_unattempted_unit_still_runs_once` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_a_timeout_after_the_paced_digest_bytes_returned_does_not_reread_them` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_work_and_plain_swapped_together_are_both_reported_once_each_with_unique_prefixes_and_the_root_last` | Real-time timeout rows: must kill fsck after work/plain/root swaps; successful-child controls retain watchdogs. |
+| `b2c_a_gate_stopped_between_an_admitted_files_two_calls_does_not_repeat_the_first` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `b2c_lossless_raw_name_aliases_are_independent_census_units_with_exact_attempts_and_resume` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `corrective_a_pre_spawn_or_post_exit_refusal_settles_the_reservation` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+| `corrective_a_timed_out_writing_child_settles_its_reservation` | Real-time: must kill real init/index-pack children and settle their actual reservations. |
+| `corrective_a_timed_out_read_only_child_is_refused_beside_its_effect` | Real-time: must kill verify-pack/fsck and reconcile the effect beside the runner timeout. |
+| `round4_the_baseline_digest_honours_the_one_deadline_before_a_read_only_child_starts` | Converting now (deferred): advance the existing H2 clock at the selected event. |
+
+Payload test names below are relative to `custody_restore::git_tests::payload_tests`.
+
+| Test | Classification / reason |
+|---|---|
+| `c2a_the_one_deadline_is_kept_before_every_step_and_entry` | Converting now (deferred): use the imported H2 guard clock in each row thread. |
+| `c2b_the_deadline_expiring_mid_frame_or_mid_step_halts_with_the_partial_kept` | Converting now (deferred): use the imported H2 guard clock in each row thread. |
+| `c2b_every_materialization_guard_is_in_its_place_and_halts_the_run_alone` | Converting now (deferred): use the imported H2 guard clock in each row thread. |
+| `c2b_a_create_returning_after_the_deadline_is_never_followed_by_another` | Converting now (deferred): use the imported H2 guard clock in each row thread. |
+| `c3_the_one_deadline_is_kept_before_every_entry_and_every_seal` | Converting now (deferred): use the imported H2 guard clock in each row thread. |
+
+### Custody-push hypothesis, probe, and result
+
+Before probing, `/tmp/h3-hypotheses.md` recorded the hypothesis: copying the Git
+index gives it a newer timestamp, potentially suppressing racy-clean content
+checks after a same-length worktree rewrite. Alternative: a concurrent writer
+or shared fixture. The unchanged test creates a unique `TempDir`, writes both
+versions synchronously, and starts no writer thread. A snapshot retaining the
+original blob despite those ordered writes distinguishes this from that
+alternative, but does not alone prove the precise stat-cache cause.
+
+Built unchanged base binaries with `CARGO_INCREMENTAL=0 cargo nextest run
+--workspace --locked --no-run` (passed, 117s), privately copied/stripped the core
+and controller binaries, then used H2's 15 owned Python CPU burners, concurrency
+50, and `A2A_LANE_GIT=/opt/git/bin/git PATH=/opt/git/bin:$PATH`. No retry or skip.
+Each subprocess ran `--exact <name> --nocapture`; complete output and exit/time
+records are in `/tmp/h3-base/`, orchestrated by `/tmp/h3-probe.py`.
+
+| Completed base population | Failures / executions | Maximum duration |
+|---|---|---|
+| `custody_push::tests::dirty_snapshot_contents_and_no_worktree_index_or_ref_mutation` | **1/50** | 4.388s |
+| `custody_restore::git_tests::b2b_each_guard_halts_the_run_alone_and_headroom_succeeds` | **0/50** (not reproduced) | 82.551s |
+
+The failing push run is `dirty_snapshot_contents_and_no_worktree_index_or_ref_mutation-14.log`:
+`custody_push.rs:1197`, left `"original"`, right `"modified"`, 2.96s. It reproduces
+the reported signature. The timestamp hypothesis still needs a deterministic
+regression that fails on base; no production fix is claimed or staged.
+
+At the size gate, the in-flight `b2b_no_effect_follows_a_guard_that_finds_the_deadline_spent`
+population was interrupted; it is not a completed 50-run sample. Only the owned
+probe coordinator, burners, and descendants were stopped. The two remaining
+planned base populations (slow bracket and slow closing gate) never started.
+No post-fix population, full nextest execution, fmt check, or touched-crate
+clippy gate is claimed. Acceptance remains open. Continue in separately bounded
+Git guard, payload guard, real-child fixture, and snapshot regression changes,
+then collect the requested four loaded 50-run comparisons (including the two
+slowest converted tests) and aggregate suite/lint evidence.
+
+Handoff checks: all 77 table test names resolve uniquely to source tests;
+`git diff --check` passed. `CARGO_INCREMENTAL=0 cargo run -p a2a-bridge --
+validate --repo-hygiene` passed (44 tracked artifacts, 9 example configs).
