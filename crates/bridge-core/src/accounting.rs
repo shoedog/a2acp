@@ -273,6 +273,7 @@ impl AccountingV1 {
             attribution: row.attribution,
             admitted: None,
             prompt_gate: None,
+            provider_poll: None,
         })
     }
 }
@@ -298,6 +299,7 @@ pub trait DirectPromptGateV1: Send + Sync {
 /// Not Clone: a completed/replayed result cannot reuse this dispatch authority.
 /// Dropping this handle or its stream deliberately leaves durable pending accounting.
 pub struct PreparedUsageAttemptV1 {
+    pub(crate) provider_poll: Option<Arc<std::sync::atomic::AtomicBool>>,
     accounting: AccountingV1,
     concrete: AttemptId,
     context: BudgetContextV1,

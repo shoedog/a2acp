@@ -758,6 +758,7 @@ pub struct DirectAttemptBarrier {
     terminal_evidence: std::sync::Arc<crate::terminal_evidence::SharedTurnEvidence>,
     multi_provider_legs: std::sync::Arc<crate::terminal_evidence::WorkflowTurnEvidenceCollector>,
     multi_provider: bool,
+    resolved_provider: Option<crate::terminal_evidence::TerminalResolution>,
     prompt_acceptance: &'static str,
     prompt_barrier_failed: bool,
     prepared_terminal: Option<AttemptTerminal>,
@@ -792,6 +793,7 @@ impl DirectAttemptBarrier {
                 crate::terminal_evidence::WorkflowTurnEvidenceCollector::default(),
             ),
             multi_provider: false,
+            resolved_provider: None,
             prompt_acceptance: "not_dispatched",
             prompt_barrier_failed: false,
             prepared_terminal: None,
@@ -822,6 +824,14 @@ impl DirectAttemptBarrier {
     /// projection: exact producer/final evidence projects only when exactly
     /// one provider leg was reached; otherwise the durable row keeps unknown
     /// evidence plus truthful bounded per-leg counts.
+    /// A resolved final provider contract must survive the count-only aggregate.
+    pub fn retain_provider_resolution(
+        &mut self,
+        resolution: crate::terminal_evidence::TerminalResolution,
+    ) {
+        self.resolved_provider = Some(resolution);
+    }
+
     pub fn begin_multi_provider_terminal(&mut self) {
         self.multi_provider = true;
     }
@@ -1055,6 +1065,7 @@ impl DirectAttemptBarrier {
                 },
             )
         });
+        let resolution = self.resolved_provider.or(resolution);
         // Attempt-level aggregate rows (multi-provider without exactly one
         // reached leg) cannot claim one adapter's capability: zero reached
         // legs are `not_applicable`; several stay `unknown` with counts.

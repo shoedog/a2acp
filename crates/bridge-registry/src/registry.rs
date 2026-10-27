@@ -518,6 +518,7 @@ impl Registry {
         &self,
         id: &AgentId,
         observer: Arc<dyn DiagnosticObserver>,
+        admitted: Option<&Arc<AgentEntry>>,
     ) -> Result<Resolved, BridgeError> {
         Self::observe_resolve(&observer, PhaseStatus::Started, None).await?;
         loop {
@@ -528,6 +529,11 @@ impl Registry {
                 st.slots.get(id).cloned()
             };
             let Some(slot) = slot else {
+                if admitted.is_some() {
+                    return Err(BridgeError::ConfigMismatch {
+                        field: "fallback entry",
+                    });
+                }
                 Self::observe_resolve(&observer, PhaseStatus::Failed, Some("agent.unknown"))
                     .await?;
                 return Err(BridgeError::UnknownAgent {
@@ -541,6 +547,11 @@ impl Registry {
             let initialized_here = Arc::new(AtomicBool::new(false));
             let initialized_in_closure = initialized_here.clone();
             let entry_for_spawn = slot.entry.load_full();
+            if admitted.is_some_and(|entry| !Arc::ptr_eq(entry, &entry_for_spawn)) {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "fallback entry",
+                });
+            }
             let observer_for_spawn = observer.clone();
             let backend = match slot
                 .backend
@@ -587,7 +598,7 @@ impl Registry {
             let code = (!initialized_here.load(SeqCst)).then_some("backend.reused");
             Self::observe_resolve(&observer, PhaseStatus::Completed, code).await?;
             return Ok(Resolved {
-                entry: slot.entry.load_full(),
+                entry: admitted.cloned().unwrap_or_else(|| slot.entry.load_full()),
                 backend,
                 lease: Box::new(lease),
             });
@@ -790,7 +801,7 @@ impl Registry {
 #[async_trait::async_trait]
 impl AgentRegistry for Registry {
     async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
-        self.resolve_with_observer(id, Arc::new(NoopDiagnosticObserver::default()))
+        self.resolve_with_observer(id, Arc::new(NoopDiagnosticObserver::default()), None)
             .await
     }
 
@@ -799,7 +810,19 @@ impl AgentRegistry for Registry {
         id: &AgentId,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<Resolved, BridgeError> {
-        self.resolve_with_observer(id, observer).await
+        self.resolve_with_observer(id, observer, None).await
+    }
+
+    fn supports_admitted_resolution(&self) -> bool {
+        true
+    }
+    async fn resolve_admitted_observed(
+        &self,
+        entry: &Arc<AgentEntry>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Resolved, BridgeError> {
+        self.resolve_with_observer(&entry.id, observer, Some(entry))
+            .await
     }
 
     fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> {
@@ -1397,6 +1420,18 @@ mod tests {
         let mut reloaded = snapshot(&["a"]);
         reloaded.entries[0].model = Some("model-b".into());
         registry.apply(reloaded).await.unwrap();
+        assert!(matches!(
+            registry
+                .resolve_admitted_observed(
+                    &bound.entry,
+                    Arc::new(NoopDiagnosticObserver::default())
+                )
+                .await,
+            Err(BridgeError::ConfigMismatch {
+                field: "fallback entry"
+            })
+        ));
+        assert!(spawned_models.lock().unwrap().is_empty());
         registry
             .resolve_bound(
                 &bound,
@@ -1453,6 +1488,18 @@ mod tests {
         let mut replacement = snapshot(&["a"]);
         replacement.entries[0].args = vec!["new".into()];
         registry.apply(replacement).await.unwrap();
+        assert!(matches!(
+            registry
+                .resolve_admitted_observed(
+                    &bound.entry,
+                    Arc::new(NoopDiagnosticObserver::default())
+                )
+                .await,
+            Err(BridgeError::ConfigMismatch {
+                field: "fallback entry"
+            })
+        ));
+        assert!(spawned_args.lock().unwrap().is_empty());
         registry
             .resolve_bound(
                 &bound,
