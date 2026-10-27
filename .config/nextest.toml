@@ -1,6 +1,8 @@
 # Do not hide flaky tests by retrying them.
 [profile.default]
 retries = 0
+# Bound hangs at 20 minutes, with >2x headroom for the 557s loaded custody test.
+slow-timeout = { period = "60s", terminate-after = 20 }
 
 # Test-isolation audit:
 # - ENV_LOCK (bin/a2a-bridge/src/main.rs) protects process environment changes.
