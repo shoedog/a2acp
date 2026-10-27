@@ -3320,6 +3320,8 @@ mod tests {
             .expect("run_attempt prompt-barrier fixture must be valid");
 
         let mut smoke_args = args();
+        // Test persistence failure rather than racing the fixture's one-second default deadline.
+        smoke_args.timeout_secs = 30;
         smoke_args.config = config_path;
         let lifecycle = Arc::new(WorkflowLifecycleObserver::default());
         let lifecycle_dyn: Arc<dyn bridge_core::ports::Observer> = lifecycle.clone();

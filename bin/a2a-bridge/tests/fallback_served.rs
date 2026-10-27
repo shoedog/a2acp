@@ -276,7 +276,8 @@ async fn served_cleanup_activity_is_resampled() {
 }
 
 async fn lifecycle(boundary: &str, action: &str, method: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // This backstop covers several SQLite admissions and guard drains, not a liveness bound.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let f = Fixture::new("blocked-cleanup", if boundary == "configure" { "blocked-setup" } else { "success" }, true);
         let router = f.server().router();
         let owner = AttemptIdentity::initial().unwrap();
