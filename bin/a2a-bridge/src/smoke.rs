@@ -3435,12 +3435,26 @@ mod tests {
         let lifecycle_dyn: Arc<dyn bridge_core::ports::Observer> = lifecycle.clone();
         let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_unaccepted_failing_release());
         let backend_dyn: Arc<dyn AgentBackend> = backend.clone();
-        let artifact = TEST_WORKFLOW_OBSERVER
-            .scope(
-                lifecycle_dyn,
-                TEST_RESOLVED_BACKEND.scope(backend_dyn, run_attempt(&smoke_args)),
-            )
-            .await;
+        // Real config/provenance/SQLite work must reach the injected durable barrier
+        // regardless of CPU scheduling. Keep the attempt clock frozen while driving
+        // this one future; yielding keeps Tokio from auto-advancing to its timeout.
+        tokio::time::pause();
+        let attempt = TEST_WORKFLOW_OBSERVER.scope(
+            lifecycle_dyn,
+            TEST_RESOLVED_BACKEND.scope(backend_dyn, run_attempt(&smoke_args)),
+        );
+        tokio::pin!(attempt);
+        let watchdog = std::time::Instant::now() + Duration::from_secs(60);
+        let artifact = loop {
+            if let std::task::Poll::Ready(artifact) = futures::poll!(&mut attempt) {
+                break artifact;
+            }
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "smoke attempt did not settle the injected prompt barrier within 60s"
+            );
+            tokio::task::yield_now().await;
+        };
 
         assert!(!artifact.success);
         assert_eq!(artifact.turn.prompt_calls, 0);
