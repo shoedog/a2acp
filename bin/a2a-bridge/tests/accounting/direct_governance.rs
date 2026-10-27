@@ -1232,10 +1232,24 @@ async fn r3_policy_attach_rejects_live_context() {
 
 #[tokio::test]
 async fn config_reload_during_apply() {
+    config_reload_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn failed_cleanup_retains_binding() {
+    config_reload_cleanup(true).await;
+}
+
+async fn config_reload_cleanup(failed_only: bool) {
     use futures::FutureExt;
     for method in ["SendMessage", "SendStreamingMessage", "Mcp"] {
-        for (state, failed_cleanup) in [("warm", false), ("warm", true), ("fresh", false)] {
-            if method == "Mcp" && state != "warm" {
+        for (state, failed_cleanup) in [
+            ("warm", false),
+            ("warm", true),
+            ("fresh", false),
+            ("fresh", true),
+        ] {
+            if (method == "Mcp" && state != "warm") || (failed_only && !failed_cleanup) {
                 continue;
             }
             for during_apply in [false, true] {
@@ -1322,6 +1336,16 @@ async fn config_reload_during_apply() {
                 assert_eq!(reservations(&f).len(), 1);
                 assert_eq!(prompts(&f), 0);
                 assert_eq!(f.backend.releases.lock().unwrap().len(), 1);
+                if state == "fresh" {
+                    wait_binding(&f, &identity, failed_cleanup && !during_apply).await;
+                    if failed_cleanup && !during_apply {
+                        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+                        assert!(f.coordinator.bindings().lock().await[&task]
+                            .lease
+                            .is_retired());
+                        assert_cold_refusal(&f, f.router(false), method, &identity).await;
+                    }
+                }
                 let expected = if failed_cleanup {
                     if state == "warm" && !during_apply {
                         "failed"
