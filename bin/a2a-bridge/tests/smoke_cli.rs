@@ -52,11 +52,7 @@ fn claude_oauth_fixture(
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("spawned");
     let adapter = dir.path().join("claude-agent-acp");
-    fs::write(
-        &adapter,
-        format!("#!/bin/sh\ntouch {:?}\nexec /bin/cat\n", marker),
-    )
-    .unwrap();
+    fs::write(&adapter, format!("#!/bin/sh\ntouch {:?}\nexit 1\n", marker)).unwrap();
     let mut permissions = fs::metadata(&adapter).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&adapter, permissions).unwrap();
@@ -84,9 +80,11 @@ fn claude_oauth_fixture(
         &config,
         format!(
             "default = \"marker\"\n\n\
+             [store]\npath = {store:?}\n\n\
              [registry]\nallowed_cmds = [{adapter:?}]\n\n\
              [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\n\n\
-             [server]\n"
+             [server]\n",
+            store = dir.path().join("history.sqlite"),
         ),
     )
     .unwrap();
@@ -245,7 +243,7 @@ fn fresh_claude_oauth_does_not_block_adapter_spawn() {
     let output = smoke_command(&config)
         .arg("--acknowledge-billable")
         .arg("--timeout-secs")
-        .arg("1")
+        .arg("60")
         .env("HOME", home)
         .output()
         .unwrap();
@@ -254,8 +252,17 @@ fn fresh_claude_oauth_does_not_block_adapter_spawn() {
         !output.status.success(),
         "the fake adapter cannot complete ACP"
     );
-    assert!(marker.exists(), "fresh auth must not block adapter spawn");
+    assert!(
+        marker.exists(),
+        "fresh auth must reach the adapter's exit; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.resolve_timeout"
+    );
     assert_ne!(
         artifact["diagnostics"]["failure"]["code"],
         "smoke.auth_credential_stale"
