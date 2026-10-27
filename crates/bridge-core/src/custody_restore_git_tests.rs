@@ -52,6 +52,13 @@ impl DeadlineClockV1 {
         Self(DEADLINE_NOW_V1.with(|clock| clock.replace(Some(Instant::now()))))
     }
 
+    fn with_headroom(timeout: Duration) -> (Self, Instant) {
+        let clock = Self::freeze();
+        let deadline = far_deadline();
+        Self::advance_to(deadline - timeout);
+        (clock, deadline)
+    }
+
     fn advance_to(now: Instant) {
         DEADLINE_NOW_V1.with(|clock| {
             assert!(
@@ -4050,7 +4057,7 @@ fn run_with_the_actual_deadline(
     let _guards = setup(&dest, actual.clone());
     let route = RouteV1::new(rules);
     let (_area, runner) = route.runner();
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_now_for_test() + timeout;
     actual.set(Some(deadline));
     let outcome = bootstrap_git_objects_v1(verified, &runner, GitObjectFormatV1::Sha1, deadline);
     (
@@ -4662,6 +4669,7 @@ fn corrective_every_outcome_of_a_writing_child_reconciles_the_ledger_once() {
 /// bootstrap root keeps its entry. A post-exit callback refusal settles what the child made.
 #[test]
 fn corrective_a_pre_spawn_or_post_exit_refusal_settles_the_reservation() {
+    let _clock = DeadlineClockV1::freeze();
     let mut problems = Vec::new();
     let swap_plain = |paths: &PathsV1| {
         std::fs::rename(paths.work.join("plain"), paths.work.join("plain-away"))
@@ -5974,19 +5982,22 @@ fn round4_the_baseline_digest_honours_the_one_deadline_before_a_read_only_child_
     let clean = clean_charge();
     let entered = std::rc::Rc::new(std::cell::Cell::new(false));
     let seen = entered.clone();
-    let (ran, outcome) = run_with(&[], Duration::from_secs(8), move |_dest| {
-        let expire = install_git_hook_for_test(GitHookPointV1::BeforeChildCensus, |event| {
-            if event.label == "verify-pack" {
-                std::thread::sleep(Duration::from_secs(9));
-            }
+    let _clock = DeadlineClockV1::freeze();
+    let (ran, outcome, _) =
+        run_with_the_actual_deadline(&[], Duration::from_secs(120), move |_dest, actual| {
+            let expire =
+                install_git_hook_for_test(GitHookPointV1::BeforeChildCensus, move |event| {
+                    if event.label == "verify-pack" {
+                        DeadlineClockV1::expire(actual.get().expect("the attempt's deadline"));
+                    }
+                });
+            let enter = install_git_hook_for_test(GitHookPointV1::BeforeChild, move |event| {
+                if event.label == "verify-pack" {
+                    seen.set(true);
+                }
+            });
+            vec![expire, enter]
         });
-        let enter = install_git_hook_for_test(GitHookPointV1::BeforeChild, move |event| {
-            if event.label == "verify-pack" {
-                seen.set(true);
-            }
-        });
-        vec![expire, enter]
-    });
     println!(
         "CHILD-START-MARKER the expired baseline digest: runner entered={}",
         entered.get()
@@ -6474,8 +6485,8 @@ fn run_with_the_final_fsck_settling_at(
     until: Duration,
     preparation: Duration,
 ) -> (RanV1, OutcomeV1, Instant) {
-    run_with_the_actual_deadline(&[], NEAR_EXPIRY_V1, move |_dest, actual| {
-        std::thread::sleep(preparation);
+    run_with_the_actual_deadline(&[], Duration::from_secs(120), move |_dest, actual| {
+        DeadlineClockV1::advance_to(deadline_now_for_test() + preparation);
         vec![install_git_hook_for_test(
             GitHookPointV1::AfterChild,
             move |event| {
@@ -6484,7 +6495,7 @@ fn run_with_the_final_fsck_settling_at(
                         .get()
                         .expect("a child runs after the deadline is made");
                     let begun = deadline - NEAR_EXPIRY_V1;
-                    std::thread::sleep((begun + until).saturating_duration_since(Instant::now()));
+                    DeadlineClockV1::advance_to(begun + until);
                 }
             },
         )]
@@ -6498,13 +6509,14 @@ fn run_with_the_final_fsck_settling_at(
 /// returned after the deadline.
 #[test]
 fn round5_a_final_fsck_that_finishes_before_the_deadline_cannot_succeed_after_it() {
+    let _clock = DeadlineClockV1::freeze();
     let clean = clean_charge();
     let (_needle, _command, started, completed) = READ_ONLY_V1[3];
     let (ran, outcome, deadline) = run_with_the_final_fsck_settling_at(
         NEAR_EXPIRY_V1 + Duration::from_secs(1),
         Duration::ZERO,
     );
-    let after = Instant::now().saturating_duration_since(deadline);
+    let after = deadline_now_for_test().saturating_duration_since(deadline);
     println!(
         "DEADLINE-MARKER the final fsck crossing: returned {}ms after the deadline",
         after.as_millis()
@@ -6531,12 +6543,13 @@ fn round5_a_final_fsck_that_finishes_before_the_deadline_cannot_succeed_after_it
 /// deadline, succeeds with every child started, and returns before the deadline.
 #[test]
 fn round5_a_final_fsck_settling_with_headroom_succeeds_before_the_deadline() {
+    let _clock = DeadlineClockV1::freeze();
     let (ran, outcome, deadline) =
         run_with_the_final_fsck_settling_at(Duration::from_millis(500), Duration::ZERO);
     let observed = ran.route.children();
     println!(
         "CHILD-START-MARKER the headroom control: observed={observed:?} returned_before_the_deadline={}",
-        Instant::now() < deadline
+        deadline_now_for_test() < deadline
     );
     assert_eq!(observed.len(), 6, "every proof child must have run");
     match outcome {
@@ -6544,7 +6557,7 @@ fn round5_a_final_fsck_settling_with_headroom_succeeds_before_the_deadline() {
         Err(failure) => panic!("the headroom control must succeed: {failure:?}"),
     }
     assert!(
-        Instant::now() < deadline,
+        deadline_now_for_test() < deadline,
         "the control must finish inside its deadline"
     );
 }
@@ -6564,7 +6577,8 @@ fn b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives()
     const PREPARATION_V1: Duration = Duration::from_millis(1500);
     let (_needle, _command, started, completed) = READ_ONLY_V1[3];
     let crossing = || -> Vec<String> {
-        let begun = Instant::now();
+        let _clock = DeadlineClockV1::freeze();
+        let begun = deadline_now_for_test();
         let (ran, outcome, deadline) = run_with_the_final_fsck_settling_at(
             NEAR_EXPIRY_V1 + Duration::from_secs(1),
             PREPARATION_V1,
@@ -6578,13 +6592,13 @@ fn b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives()
             ChargeV1::Exactly(ran.phase_v + clean_charge()),
             is_timeout,
         );
-        if deadline < begun + PREPARATION_V1 + NEAR_EXPIRY_V1 {
+        if deadline < begun + PREPARATION_V1 + Duration::from_secs(120) {
             problems.push("the crossing row's deadline was made before its preparation".to_owned());
         }
         if outcome.is_ok() {
             problems.push(format!(
                 "success was returned {}ms after the deadline",
-                Instant::now()
+                deadline_now_for_test()
                     .saturating_duration_since(deadline)
                     .as_millis()
             ));
@@ -6592,7 +6606,8 @@ fn b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives()
         problems
     };
     let headroom = || -> Vec<String> {
-        let begun = Instant::now();
+        let _clock = DeadlineClockV1::freeze();
+        let begun = deadline_now_for_test();
         let (ran, outcome, deadline) =
             run_with_the_final_fsck_settling_at(Duration::from_millis(500), PREPARATION_V1);
         let mut problems = Vec::new();
@@ -6602,10 +6617,10 @@ fn b2c_the_near_expiry_rows_are_timed_from_the_deadline_the_bootstrap_receives()
         if outcome.is_err() {
             problems.push("the headroom control was refused".to_owned());
         }
-        if Instant::now() >= deadline {
+        if deadline_now_for_test() >= deadline {
             problems.push("the headroom control finished after its deadline".to_owned());
         }
-        if deadline < begun + PREPARATION_V1 + NEAR_EXPIRY_V1 {
+        if deadline < begun + PREPARATION_V1 + Duration::from_secs(120) {
             problems.push("the headroom row's deadline was made before its preparation".to_owned());
         }
         problems
@@ -7058,11 +7073,9 @@ fn round5_a_stable_file_and_an_atime_only_read_pass_every_descriptor_check() {
 /// visible cause (its marker prints the children), never passes wrongly.
 const ROUND6_DEADLINE_V1: Duration = Duration::from_secs(6);
 
-/// A slow step that returns after `deadline`: sleep until it has passed, plus a margin.
+/// The selected event returns at the deadline; the next guard must refuse at equality.
 fn pass_the_deadline(deadline: Instant) {
-    std::thread::sleep(
-        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
-    );
+    DeadlineClockV1::expire(deadline);
 }
 
 /// Like [`run_with`], with arbitrary seam guards and the actual deadline supplied to `setup` and
@@ -7084,7 +7097,7 @@ fn run_before(
         .expect("the staged pack");
     let route = RouteV1::new(rules);
     let (_area, runner) = route.runner();
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_now_for_test() + timeout;
     let _guards = setup(&dest, deadline);
     let outcome = bootstrap_git_objects_v1(verified, &runner, GitObjectFormatV1::Sha1, deadline);
     (
@@ -7187,14 +7200,25 @@ fn run_late(
     points: &[LateV1],
     delay: DelayV1,
     mount_calls: usize,
-) -> (RanV1, OutcomeV1, std::rc::Rc<LateStateV1>, Instant) {
+) -> (
+    RanV1,
+    OutcomeV1,
+    std::rc::Rc<LateStateV1>,
+    Instant,
+    DeadlineClockV1,
+) {
+    let clock = DeadlineClockV1::freeze();
     let state = std::rc::Rc::new(LateStateV1::default());
     let shared = state.clone();
     let points = points.to_vec();
-    let (ran, outcome, deadline) = run_before(&[], ROUND6_DEADLINE_V1, move |_dest, deadline| {
+    let watchdog = Duration::from_secs(120);
+    let (ran, outcome, deadline) = run_before(&[], watchdog, move |_dest, deadline| {
+        DeadlineClockV1::advance_to(deadline - ROUND6_DEADLINE_V1);
         let slow = move || match delay {
             DelayV1::PastTheDeadline => pass_the_deadline(deadline),
-            DelayV1::Brief => std::thread::sleep(Duration::from_millis(100)),
+            DelayV1::Brief => {
+                DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(100))
+            }
         };
         let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
         {
@@ -7269,7 +7293,7 @@ fn run_late(
         }
         guards
     });
-    (ran, outcome, state, deadline)
+    (ran, outcome, state, deadline, clock)
 }
 
 /// The six children a complete run starts, in order.
@@ -7281,8 +7305,9 @@ fn six_children() -> &'static [&'static str] {
 /// one of the SIX children started, the step `point` names as the last completed, and the ledger exactly
 /// as a clean run leaves it. Returns every problem found.
 fn late_row(point: LateV1, mount_calls: usize, clean: u64) -> Vec<String> {
-    let (ran, outcome, state, deadline) = run_late(&[point], DelayV1::PastTheDeadline, mount_calls);
-    let after = Instant::now().saturating_duration_since(deadline);
+    let (ran, outcome, state, deadline, _clock) =
+        run_late(&[point], DelayV1::PastTheDeadline, mount_calls);
+    let after = deadline_now_for_test().saturating_duration_since(deadline);
     println!(
         "DEADLINE-MARKER {point:?}: fired={:?} misplaced={:?} returned {}ms after the deadline",
         state.fired.borrow(),
@@ -7362,13 +7387,14 @@ fn round6_a_deadline_spent_after_the_final_digest_read_cannot_succeed() {
 #[test]
 fn round6_with_headroom_every_late_validation_step_succeeds_before_the_deadline() {
     let mount_calls = clean_mount_census_calls();
-    let (ran, outcome, state, deadline) = run_late(&LateV1::ALL, DelayV1::Brief, mount_calls);
+    let (ran, outcome, state, deadline, _clock) =
+        run_late(&LateV1::ALL, DelayV1::Brief, mount_calls);
     let observed = ran.route.children();
     println!(
         "CHILD-START-MARKER the headroom control: observed={observed:?} fired={:?} misplaced={:?} returned_before_the_deadline={}",
         state.fired.borrow(),
         state.misplaced.borrow(),
-        Instant::now() < deadline
+        deadline_now_for_test() < deadline
     );
     assert_eq!(observed.len(), 6, "every proof child must have run");
     let mut fired = state.fired.borrow().clone();
@@ -7385,7 +7411,7 @@ fn round6_with_headroom_every_late_validation_step_succeeds_before_the_deadline(
         Err(failure) => panic!("the headroom control must succeed: {failure:?}"),
     }
     assert!(
-        Instant::now() < deadline,
+        deadline_now_for_test() < deadline,
         "the control must finish inside its deadline"
     );
 }
@@ -9434,8 +9460,8 @@ fn b1a_every_refusal_is_in_the_failure_shape_that_began_no_materialization() {
                 far_deadline(),
             ),
         ];
-        let spent = Instant::now();
-        std::thread::sleep(Duration::from_millis(5));
+        let _clock = DeadlineClockV1::freeze();
+        let spent = deadline_now_for_test();
         rows.push((
             "a spent deadline",
             CaseV1::with_entries(&capsule, &[], None),
@@ -9612,8 +9638,8 @@ fn b1a_the_paced_rehash_checks_rewinds_and_reads_a_bounded_prefix() {
     // An expired deadline refuses before any read or rewind.
     let (mut one, _case) = fresh();
     one.file.seek(SeekFrom::Start(5)).expect("seek");
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     assert!(matches!(
         reverify_staged_v1(&mut one, spent),
         Err(GitBootstrapErrorV1::Git(CustodyGitError::Timeout))
@@ -9732,7 +9758,7 @@ fn b1a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     }
     for target in distinct {
         let mut case = two_frame_case(&capsule);
-        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
         let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let (seen, slow) = (labels.clone(), fired.clone());
@@ -9762,9 +9788,9 @@ fn b1a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     }
 
     let mut case = two_frame_case(&capsule);
-    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
     let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(40));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(40));
     });
     prevalidate(&mut case.verified, deadline).expect("ten brief delays leave most of the deadline");
 }
@@ -9781,8 +9807,8 @@ fn b1a_a_spent_deadline_refuses_before_any_frame_is_touched() {
             .seek(SeekFrom::Start(3))
             .expect("park the descriptor");
     }
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     let (labels, _hook) = record_guards();
     let error = prevalidate(&mut case.verified, spent).expect_err("a spent deadline");
     assert!(
@@ -9809,7 +9835,7 @@ fn b1a_the_deadline_is_observed_before_every_decoded_entry() {
             (b"refs/heads/d", EntryV1::File(b"4\n")),
         ],
     );
-    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
     let entries = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
     let seen = entries.clone();
     let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
@@ -9846,7 +9872,7 @@ fn b1a_no_frame_byte_is_read_after_the_deadline() {
             (b"refs/heads/big", EntryV1::File(&big)),
         ],
     );
-    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
     // The rehash reads the whole frame once; the decode must then stop after its first buffer. The
     // hook marks the decode: it runs at an entry, which only the decode reaches.
     let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
@@ -12799,8 +12825,8 @@ fn b1b_no_source_read_follows_the_deadline() {
         let label = String::from_utf8_lossy(path).into_owned();
         // Already spent: refused before the first read.
         let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
-        let spent = Instant::now();
-        std::thread::sleep(Duration::from_millis(5));
+        let _clock = DeadlineClockV1::freeze();
+        let spent = deadline_now_for_test();
         let mut source = SlowV1 {
             data,
             reads: reads.clone(),
@@ -12816,7 +12842,7 @@ fn b1b_no_source_read_follows_the_deadline() {
 
         // Passes during the first read: the second is never requested.
         let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(Duration::from_secs(3));
         let mut source = SlowV1 {
             data,
             reads: reads.clone(),
@@ -12840,8 +12866,8 @@ fn b1b_no_source_read_follows_the_deadline() {
 /// a path that is no refs file at all is a timeout, not an unexpected file, and nothing is read.
 #[test]
 fn b1b_a_spent_deadline_refuses_before_a_file_is_routed() {
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     for path in ["config", "HEAD", "refs/heads/x", "logs/HEAD"] {
         let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
         let mut source = SlowV1 {
@@ -12892,7 +12918,7 @@ fn b1b_the_agreement_phases_each_observe_the_deadline() {
     assert_eq!(*labels.borrow(), GUARDS);
 
     for target in GUARDS {
-        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
         let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let (seen, slow) = (labels.clone(), fired.clone());
@@ -12916,9 +12942,10 @@ fn b1b_the_agreement_phases_each_observe_the_deadline() {
         );
     }
     let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(40));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(40));
     });
-    run(Instant::now() + B1A_DEADLINE_V1).expect("brief delays leave most of the deadline");
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
+    run(deadline).expect("brief delays leave most of the deadline");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -13844,7 +13871,7 @@ fn b1b_the_retained_agreement_observes_the_one_deadline() {
     }
     for target in distinct {
         let (mut case, plan) = fresh();
-        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
         let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let (seen, slow) = (labels.clone(), fired.clone());
@@ -13881,14 +13908,15 @@ fn b1b_the_retained_agreement_observes_the_one_deadline() {
 
     let (mut case, plan) = fresh();
     {
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
         let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-            std::thread::sleep(Duration::from_millis(40));
+            DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(40));
         });
         agree_with(
             &mut case.verified,
             &plan,
             format,
-            Instant::now() + B1A_DEADLINE_V1,
+            deadline,
             RefsLimitsV1::v1(),
         )
         .expect("fourteen brief delays leave most of the deadline");
@@ -13902,8 +13930,8 @@ fn b1b_the_retained_agreement_observes_the_one_deadline() {
             .seek(SeekFrom::Start(3))
             .expect("park the descriptor");
     }
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     let (labels, hook) = record_guards();
     let error = agree_with(&mut case.verified, &plan, format, spent, RefsLimitsV1::v1())
         .expect_err("a spent deadline");
@@ -13950,7 +13978,7 @@ fn b1b_the_retained_agreement_decodes_nothing_after_the_deadline() {
     ] {
         let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, refs.clone())]);
         let plan = planned(&mut case);
-        let deadline = Instant::now() + B1A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
         let entries = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let seen = entries.clone();
         let hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
@@ -13996,7 +14024,7 @@ fn b1b_the_retained_agreement_decodes_nothing_after_the_deadline() {
     );
     let mut case = CaseV1::with_bytes(&capsule, &[(REFS_V1, head_frame), (LOGS_V1, logs)]);
     let plan = planned(&mut case);
-    let deadline = Instant::now() + B1A_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B1A_DEADLINE_V1);
     let _hook = install_git_hook_for_test(GitHookPointV1::FrameEntry, move |event| {
         if event.path == Path::new("logs/HEAD") {
             pass_the_deadline(deadline);
@@ -16213,8 +16241,8 @@ const B2A_GUARDS_V1: [&str; 14] = [
 #[test]
 fn b2a_a_spent_deadline_refuses_before_any_write() {
     let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     let (labels, _hook) = record_guards();
     let tree = snapshot(&case.dest.path);
     let ledger = case.ledger();
@@ -16317,7 +16345,7 @@ fn b2a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     for target in B2A_GUARDS_V1 {
         let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
-        let deadline = Instant::now() + B2A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_DEADLINE_V1);
         let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let (seen, slow) = (labels.clone(), fired.clone());
@@ -16350,9 +16378,10 @@ fn b2a_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
     // Some five hundred guards, each delayed a millisecond, still leave most of a generous deadline.
     let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(1));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(1));
     });
-    case.attempt_by(Instant::now() + 10 * B2A_DEADLINE_V1)
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(10 * B2A_DEADLINE_V1);
+    case.attempt_by(deadline)
         .unwrap_or_else(|failure| panic!("brief delays leave headroom: {:?}", failure.cause));
 }
 
@@ -16371,7 +16400,7 @@ fn b2a_a_deadline_spent_in_the_final_gate_cannot_succeed() {
     ] {
         let mut case = StoreCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
         let lengths = case.lengths();
-        let deadline = Instant::now() + B2A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_DEADLINE_V1);
         let in_final = std::rc::Rc::new(std::cell::Cell::new(false));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let started = in_final.clone();
@@ -16418,7 +16447,7 @@ fn b2a_no_chunk_is_read_after_the_deadline() {
     let (_capsule, mut case) = captured_case(CustodyGitObjectFormatV1::Sha1);
     let names = case.entry_names();
     let output = stored(&case.dest, &names[5]);
-    let deadline = Instant::now() + B2A_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_DEADLINE_V1);
     let chunks = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let seen = chunks.clone();
     let _hook = install_git_hook_for_test(GitHookPointV1::BeforeObjectChunk, move |event| {
@@ -16991,7 +17020,7 @@ impl CallClockV1 {
                 return;
             }
             if !pause.is_zero() {
-                std::thread::sleep(pause);
+                DeadlineClockV1::advance_to(deadline_now_for_test() + pause);
             }
             if let Some((label, nth, file)) = &target {
                 if event.label == *label && event.path == file.as_path() {
@@ -17128,7 +17157,7 @@ fn b2a_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_
         let original = std::fs::read(admitted_path(&case.dest.bootstrap(), "pack"))
             .expect("the admitted pack");
         let _fault = short_writes_of_five();
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let clock = CallClockV1::watch(
             deadline,
             Some(("write", slow_write, &output)),
@@ -17248,7 +17277,7 @@ fn b2a_an_interrupted_read_or_write_is_never_retried_after_the_deadline() {
         let output = stored(&case.dest, &names[5]);
         let _interrupts = interrupt_object_calls_for_test(call, interruptions);
         let _short = short.then(short_writes_of_five);
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let clock = CallClockV1::watch(deadline, Some((label, nth, &output)), Duration::ZERO);
         let failure = timed_out(row, case.attempt_by(deadline));
         assert!(clock.fired(), "{row}: the slow call never ran");
@@ -17328,7 +17357,7 @@ fn b2a_the_length_probe_is_never_called_after_the_deadline() {
         let names = case.entry_names();
         let output = stored(&case.dest, &names[5]);
         let _interrupts = interrupt_object_calls_for_test(ObjectCallV1::Probe, interruptions);
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let clock = CallClockV1::watch(deadline, Some((label, nth, &output)), Duration::ZERO);
         let failure = timed_out(row, case.attempt_by(deadline));
         assert!(clock.fired(), "{row}: the slow call never ran");
@@ -17399,7 +17428,7 @@ fn b2a_no_read_write_or_probe_follows_a_call_that_returned_after_the_deadline() 
         // This run's own pack: every case has a destination of its own.
         let target = stored(&case.dest, &case.entry_names()[5]);
         let _script = retry_script();
-        let deadline = Instant::now() + B2A_LATE_ROW_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_LATE_ROW_DEADLINE_V1);
         // Counts every call on the pack, whatever its kind: the slow one is the `nth` of them.
         let counted = std::rc::Rc::new(std::cell::Cell::new(0_usize));
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -17449,7 +17478,7 @@ fn b2a_interrupted_and_short_calls_with_headroom_copy_exactly_and_conserve_the_l
         let lengths = case.lengths();
         let expected = bootstrap_object_files(&case.dest);
         let _script = retry_script();
-        let deadline = Instant::now() + 10 * B2A_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(10 * B2A_DEADLINE_V1);
         let clock = CallClockV1::watch(deadline, None, pause);
         let done = case
             .attempt_by(deadline)
@@ -19975,7 +20004,7 @@ fn b2b_the_drain_after_a_held_ref_fault_never_reads_past_the_deadline() {
     let target = case.meta("logs/HEAD");
     // This fixture deliberately spends the deadline on the third read. Give it scheduling
     // headroom to reach that proven read before doing so under bounded contention.
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(Duration::from_secs(4));
     let reads = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let seen = reads.clone();
     let acting = target.clone();
@@ -21963,8 +21992,8 @@ fn timed_out_metadata(
 fn b2b_a_spent_deadline_refuses_before_any_write() {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
-    let spent = Instant::now();
-    std::thread::sleep(Duration::from_millis(5));
+    let _clock = DeadlineClockV1::freeze();
+    let spent = deadline_now_for_test();
     let (labels, _hook) = record_guards();
     let tree = snapshot(&case.dest().path);
     let ledger = case.ledger();
@@ -22062,7 +22091,7 @@ fn b2b_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     for target in B2B_GUARDS_V1 {
         let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
-        let deadline = Instant::now() + B2B_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2B_DEADLINE_V1);
         let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let (seen, slow) = (labels.clone(), fired.clone());
@@ -22085,9 +22114,10 @@ fn b2b_each_guard_halts_the_run_alone_and_headroom_succeeds() {
     let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
     // Some two thousand guards, each delayed a millisecond, still leave most of a generous deadline.
     let _hook = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(1));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(1));
     });
-    case.attempt_by(Instant::now() + 20 * B2B_DEADLINE_V1)
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(20 * B2B_DEADLINE_V1);
+    case.attempt_by(deadline)
         .unwrap_or_else(|failure| panic!("brief delays leave headroom: {:?}", failure.cause));
 }
 
@@ -22103,7 +22133,7 @@ fn b2b_a_deadline_spent_in_the_final_gate_cannot_succeed() {
         ("the last guard before the root's identity", "root"),
     ] {
         let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
-        let deadline = Instant::now() + B2B_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2B_DEADLINE_V1);
         let in_final = std::rc::Rc::new(std::cell::Cell::new(false));
         let fired = std::rc::Rc::new(std::cell::Cell::new(false));
         let started = in_final.clone();
@@ -22182,7 +22212,7 @@ fn b2b_no_effect_follows_a_guard_that_finds_the_deadline_spent() {
         for nth in 1..=total {
             let row = format!("{target} #{nth}");
             let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
-            let deadline = Instant::now() + B2B_SPENT_DEADLINE_V1;
+            let (_clock, deadline) = DeadlineClockV1::with_headroom(B2B_SPENT_DEADLINE_V1);
             let spent = std::rc::Rc::new(std::cell::Cell::new(false));
             let seen = std::rc::Rc::new(std::cell::Cell::new(0_usize));
             let effects = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
@@ -22298,7 +22328,7 @@ fn b2b_a_slow_short_write_keeps_exactly_the_accepted_prefix_and_makes_no_second_
         let output = case.meta(&first);
         let original = case.expected_frames()[&first].clone().expect("a file");
         let _fault = short_writes_of_five();
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let clock = CallClockV1::watch(
             deadline,
             Some(("write", slow_write, &output)),
@@ -22374,7 +22404,7 @@ fn b2b_an_interrupted_write_is_never_retried_after_the_deadline() {
         let output = case.meta(&first);
         let _interrupts = interrupt_object_calls_for_test(ObjectCallV1::Write, interruptions);
         let _short = short.then(short_writes_of_five);
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let clock = CallClockV1::watch(
             deadline,
             Some(("write", slow_write, &output)),
@@ -22423,7 +22453,7 @@ fn b2b_no_chunk_is_read_after_the_deadline() {
     let (first, length, before) = first_file_of(&case);
     assert!(length > 16 && length <= 32);
     let output = case.meta(&first);
-    let deadline = Instant::now() + B2B_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(B2B_DEADLINE_V1);
     let chunks = std::rc::Rc::new(std::cell::Cell::new(0_usize));
     let seen = chunks.clone();
     let target = output.clone();
@@ -22485,7 +22515,7 @@ fn b2b_no_read_or_write_follows_a_call_that_returned_after_the_deadline() {
         // This run's own file: every case has a destination of its own.
         let target = case.meta(&first);
         let _script = retry_script_b2b();
-        let deadline = Instant::now() + B2A_SLOW_CALL_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(B2A_SLOW_CALL_DEADLINE_V1);
         let counted = std::rc::Rc::new(std::cell::Cell::new(0_usize));
         let after = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let slowed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -22538,7 +22568,7 @@ fn b2b_interrupted_and_short_writes_with_headroom_restore_exactly_and_conserve_t
             Some(golden_config(case.format).to_vec()),
         );
         let _script = retry_script_b2b();
-        let deadline = Instant::now() + 10 * B2B_DEADLINE_V1;
+        let (_clock, deadline) = DeadlineClockV1::with_headroom(10 * B2B_DEADLINE_V1);
         let clock = CallClockV1::watch(deadline, None, pause);
         let done = case
             .attempt_by(deadline)
@@ -24128,7 +24158,8 @@ fn b2c_the_one_deadline_reaches_every_helper_and_none_resets_it() {
     for (label, completed, began, planned, objects, metadata, children) in rows {
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
         let route = RouteV1::recorder();
-        let deadline = Instant::now() + B2C_DEADLINE_V1;
+        let _clock = DeadlineClockV1::freeze();
+        let deadline = far_deadline();
         let root = input.dest.path.clone();
         let at_the_guard: SnapshotSlotV1 = SnapshotSlotV1::default();
         let (stored_state, spent) = (at_the_guard.clone(), std::cell::Cell::new(false));
@@ -27231,7 +27262,8 @@ fn b2c_a_deadline_spent_before_the_call_refuses_before_any_child_starts() {
     let capsule = captured(CustodyGitObjectFormatV1::Sha1);
     let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
     let route = RouteV1::recorder();
-    let ran = run_plane(input, &route, Instant::now());
+    let _clock = DeadlineClockV1::freeze();
+    let ran = run_plane(input, &route, deadline_now_for_test());
     let failure = ran.failure("a spent deadline");
     assert!(is_timeout(&failure.cause), "{:?}", failure.cause);
     assert_eq!(route.children(), Vec::<String>::new());
@@ -27293,7 +27325,8 @@ fn b2c_a_deadline_spent_before_a_childs_digest_refuses_before_the_child_starts()
     let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
     let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
     let route = RouteV1::recorder();
-    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let _clock = DeadlineClockV1::freeze();
+    let deadline = far_deadline();
     let _hook = install_git_hook_for_test(GitHookPointV1::BeforeFinalChildCensus, move |event| {
         if event.label == "rev-list --missing=print" {
             pass_the_deadline(deadline);
@@ -27513,7 +27546,8 @@ fn slow_return_row(
     ];
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let route = RouteV1::recorder();
-    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let _clock = DeadlineClockV1::freeze();
+    let deadline = far_deadline();
     let log: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::default();
     let closing = std::rc::Rc::new(std::cell::Cell::new(false));
     let slowed_at: std::rc::Rc<std::cell::Cell<Option<usize>>> = std::rc::Rc::default();
@@ -27720,7 +27754,8 @@ fn b2c_a_deadline_spent_in_a_runner_callback_is_reconciled_beside_what_the_child
             Some(shell) => RouteV1::new(&[("fsck --strict", &final_only(shell))]),
             None => RouteV1::recorder(),
         };
-        let deadline = Instant::now() + B2C_DEADLINE_V1;
+        let _clock = DeadlineClockV1::freeze();
+        let deadline = far_deadline();
         let at_the_hook: SnapshotSlotV1 = SnapshotSlotV1::default();
         let (slot, planted, hooked_root) = (at_the_hook.clone(), row.plant, root.clone());
         let _hook = install_git_hook_for_test(row.point, move |event| {
@@ -27918,16 +27953,9 @@ fn bracket_row(
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
     let route = RouteV1::recorder();
-    let clock = matches!(slow, HowSlowV1::WithHeadroom).then(DeadlineClockV1::freeze);
-    let deadline = if clock.is_some() {
-        far_deadline()
-    } else {
-        Instant::now() + B2C_DEADLINE_V1
-    };
-    if clock.is_some() {
-        // Keep the original logical headroom; real child launches retain a bounded watchdog.
-        DeadlineClockV1::advance_to(deadline - B2C_DEADLINE_V1);
-    }
+    let _clock = DeadlineClockV1::freeze();
+    let deadline = far_deadline();
+    DeadlineClockV1::advance_to(deadline - B2C_DEADLINE_V1);
     let log: std::rc::Rc<std::cell::RefCell<Vec<SeenV1>>> = std::rc::Rc::default();
     let armed = std::rc::Rc::new(std::cell::Cell::new(false));
     let window: WindowV1 = WindowV1::default();
@@ -28592,17 +28620,13 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
     let name = row.name;
     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
     let root = input.dest.path.clone();
-    let spends_the_deadline = row.timed_out
-        || matches!(
-            row.when,
-            KnownWhenV1::SlowSettlement(_, HowSlowV1::PastTheDeadline)
-        );
     let body = row.shell.map(final_only);
     let route = match &body {
         Some(body) => RouteV1::new(&[("fsck --strict", body.as_str())]),
         None => RouteV1::recorder(),
     };
-    let deadline = if spends_the_deadline {
+    let _clock = (!row.timed_out).then(DeadlineClockV1::freeze);
+    let deadline = if row.timed_out {
         Instant::now() + B2C_DEADLINE_V1
     } else {
         far_deadline()
@@ -28677,7 +28701,9 @@ fn known_row(capsule: &CustomCapsuleV1, clean: &FinalShapeV1, row: &KnownRowV1) 
                     *at_known.borrow_mut() = Some(snapshot(&root));
                     match slow {
                         HowSlowV1::PastTheDeadline => pass_the_deadline(deadline),
-                        HowSlowV1::WithHeadroom => std::thread::sleep(HEADROOM_SLOW_V1),
+                        HowSlowV1::WithHeadroom => {
+                            DeadlineClockV1::advance_to(deadline_now_for_test() + HEADROOM_SLOW_V1)
+                        }
                     }
                 }
             }
@@ -30477,7 +30503,8 @@ fn b2c_a_returned_slow_census_call_is_counted_once_and_every_unattempted_unit_st
                     let input = PlaneInV1::rich(capsule, CustodyGitObjectFormatV1::Sha1);
                     let git = input.dest.path.join("repository/.git");
                     let route = RouteV1::recorder();
-                    let deadline = Instant::now() + B2C_DEADLINE_V1;
+                    let _clock = DeadlineClockV1::freeze();
+                    let deadline = far_deadline();
                     let acted: RcCellV2<bool> = RcCellV2::default();
                     let done = acted.clone();
                     let (point, regular_only, make) = (row.point, row.regular_only, row.make);
@@ -30681,7 +30708,8 @@ fn b2c_a_timeout_after_the_paced_digest_bytes_returned_does_not_reread_them() {
         let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
         let head = input.dest.path.join("repository/.git/HEAD");
         let route = RouteV1::new(&[("fsck --strict", &final_only(&format!("\"$REAL\" \"$@\"; {REWRITE_HEAD_V1}")))]);
-        let deadline = Instant::now() + B2C_DEADLINE_V1;
+        let _clock = DeadlineClockV1::freeze();
+        let deadline = far_deadline();
         let original: RcCellV2<Option<u8>> = RcCellV2::default();
         let slowed: RcCellV2<bool> = RcCellV2::default();
         let (remember, done) = (original.clone(), slowed.clone());
@@ -30956,7 +30984,8 @@ fn b2c_a_gate_stopped_between_an_admitted_files_two_calls_does_not_repeat_the_fi
     let clean = clean_final_shape(&capsule, CustodyGitObjectFormatV1::Sha1, true);
     let input = PlaneInV1::rich(&capsule, CustodyGitObjectFormatV1::Sha1);
     let route = RouteV1::recorder();
-    let deadline = Instant::now() + B2C_DEADLINE_V1;
+    let _clock = DeadlineClockV1::freeze();
+    let deadline = far_deadline();
     let slowed: RcCellV2<bool> = RcCellV2::default();
     let done = slowed.clone();
     let act = move |log: &[EvV2]| {
@@ -31363,10 +31392,8 @@ fn run_raw_row_v3(row: &RawRowV3, capsule: &CustomCapsuleV1, clean: &FinalShapeV
     let root = input.dest.path.clone();
     let (_area, outside) = external_dir_with(&["decoy"]);
     let route = RouteV1::recorder();
-    let deadline = match row.stop {
-        RawStopV3::Never => far_deadline(),
-        RawStopV3::AfterGitListing | RawStopV3::AtFirstStat => Instant::now() + B2C_DEADLINE_V1,
-    };
+    let _clock = DeadlineClockV1::freeze();
+    let deadline = far_deadline();
     // The first added entry beneath a retained directory, in byte order: the one a first-stat stop slows.
     let first_stat = row
         .adds
@@ -32025,3 +32052,30 @@ fn b2c_lossless_regular_link_and_special_aliases_are_classified_independently_an
 // without widening any of them.
 #[path = "custody_restore_payload_tests.rs"]
 mod payload_tests;
+
+#[test]
+fn event_clock_ignores_elapsed_wall_time_before_the_selected_guard() {
+    let capsule = captured(CustodyGitObjectFormatV1::Sha1);
+    let mut case = MetaCaseV1::of(&capsule, CustodyGitObjectFormatV1::Sha1);
+    let deadline = Instant::now();
+    {
+        let (labels, _record) = record_guards();
+        let failure = timed_out_metadata("unarmed wall clock", case.attempt_by(deadline));
+        assert_eq!(*labels.borrow(), ["metadata-entry"]);
+        assert_eq!(failure.partial.charged.entries, 0);
+    }
+    let _clock = DeadlineClockV1::freeze();
+    DeadlineClockV1::advance_to(deadline - B2B_DEADLINE_V1);
+    let labels = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = labels.clone();
+    let _expire = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
+        seen.borrow_mut().push(event.label);
+        if event.label == "metadata-final" {
+            DeadlineClockV1::expire(deadline);
+        }
+    });
+    let failure = timed_out_metadata("elapsed wall time", case.attempt_by(deadline));
+    assert_eq!(labels.borrow().last(), Some(&"metadata-final"));
+    assert_eq!(failure.partial.charged.entries, 13);
+    assert_metadata_partial_is_the_disk("elapsed wall time", &case, &failure, 0);
+}

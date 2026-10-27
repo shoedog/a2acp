@@ -1761,14 +1761,14 @@ fn halting_row(
 ) {
     let row = format!("{label} #{nth}");
     let case = PCaseV1::with_frames(capsule, frames);
-    let deadline = Instant::now() + P_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_DEADLINE_V1);
     let count = StdCell::new(0_usize);
     let fired = StdRc::new(StdCell::new(false));
     let marked = fired.clone();
     let _guard = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
         if event.label == label {
             if count.get() == nth {
-                marked.set(Instant::now() < deadline);
+                marked.set(deadline_now_for_test() < deadline);
                 pass_the_deadline(deadline);
             }
             count.set(count.get() + 1);
@@ -1812,7 +1812,8 @@ fn c2a_the_one_deadline_is_kept_before_every_step_and_entry() {
     let case = PCaseV1::with_frames(&capsule, &frames);
     let labels = StdRc::new(StdRefCell::new(Vec::new()));
     let spent = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, guard_labels(&labels));
-    let failure = case.refused_within("spent", Instant::now(), P_TABLE_BOUND_V1);
+    let _clock = DeadlineClockV1::freeze();
+    let failure = case.refused_within("spent", deadline_now_for_test(), P_TABLE_BOUND_V1);
     assert!(
         matches!(failure.cause, PayloadPlaneErrorV1::Timeout),
         "{:?}",
@@ -1831,7 +1832,7 @@ fn c2a_the_one_deadline_is_kept_before_every_step_and_entry() {
 
     // Spent while one entry is judged.
     let case = PCaseV1::with_frames(&capsule, &frames);
-    let deadline = Instant::now() + P_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_DEADLINE_V1);
     let entries = StdRc::new(StdRefCell::new(Vec::<String>::new()));
     let seen = entries.clone();
     let judged =
@@ -1896,9 +1897,9 @@ fn c2a_the_one_deadline_is_kept_before_every_step_and_entry() {
     });
 
     let case = PCaseV1::with_frames(&capsule, &frames);
-    let deadline = Instant::now() + P_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_DEADLINE_V1);
     let _brief = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(2));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(2));
     });
     let (_dest, outcome) = case.run("brief delays", deadline, P_TABLE_BOUND_V1);
     assert!(outcome.is_ok(), "brief delays leave the deadline headroom");
@@ -3186,7 +3187,7 @@ fn spend(deadline: Instant, fired: &FiredV1) -> impl Fn() + 'static {
     let fired = fired.clone();
     move || {
         if fired.get().is_none() {
-            fired.set(Some(Instant::now() < deadline));
+            fired.set(Some(deadline_now_for_test() < deadline));
             pass_the_deadline(deadline);
         }
     }
@@ -3305,7 +3306,7 @@ fn c2b_the_deadline_expiring_mid_frame_or_mid_step_halts_with_the_partial_kept()
                     let row = format!("{spent:?}");
                     let case = PCaseV1::with_frames(capsule, frames);
                     let _chunk = override_object_copy_chunk_for_test(4);
-                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
                     let fired: FiredV1 = StdRc::new(StdCell::new(None));
                     let act = spend(deadline, &fired);
                     let _guard: Box<dyn std::any::Any> = match spent {
@@ -3387,9 +3388,9 @@ fn c2b_the_deadline_expiring_mid_frame_or_mid_step_halts_with_the_partial_kept()
     });
 
     let case = PCaseV1::with_frames(&capsule, &frames);
-    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
     let _brief = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, |_| {
-        std::thread::sleep(Duration::from_millis(2));
+        DeadlineClockV1::advance_to(deadline_now_for_test() + Duration::from_millis(2));
     });
     let written = case.write_within("brief delays", deadline);
     let _ = written.success("brief delays leave the deadline headroom");
@@ -3406,7 +3407,7 @@ fn halting_write(
 ) {
     let row = format!("{label} #{nth}");
     let case = PCaseV1::with_frames(capsule, frames);
-    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
     let fired: FiredV1 = StdRc::new(StdCell::new(None));
     let act = spend(deadline, &fired);
     let count = StdCell::new(0_usize);
@@ -3616,7 +3617,7 @@ fn c2b_a_create_returning_after_the_deadline_is_never_followed_by_another() {
                 let capsule = &capsule;
                 scope.spawn(move || {
                     let case = PCaseV1::with_frames(capsule, frames);
-                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
                     let fired: FiredV1 = StdRc::new(StdCell::new(None));
                     let act = spend(deadline, &fired);
                     let count = StdCell::new(0_usize);
@@ -6382,7 +6383,7 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
                 scope.spawn(move || {
                     let case = PCaseV1::with_frames(capsule, frames);
                     let root = case.dest.path.clone();
-                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
                     let fired: FiredV1 = StdRc::new(StdCell::new(None));
                     let act = StdRc::new(spend(deadline, &fired));
                     // Every terminal event in order, and how many had run when the deadline was spent.
@@ -6473,11 +6474,7 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
                 scope.spawn(move || {
                     let case = PCaseV1::with_frames(capsule, frames);
                     let root = case.dest.path.clone();
-                    let deadline = if late {
-                        Instant::now() + P_WRITE_DEADLINE_V1
-                    } else {
-                        far_deadline()
-                    };
+                    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
                     let fired: FiredV1 = StdRc::new(StdCell::new(None));
                     let act = spend(deadline, &fired);
                     let looked: StdRc<StdRefCell<Vec<PathBuf>>> = StdRc::default();
@@ -6617,7 +6614,7 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
                 scope.spawn(move || {
                     let row = format!("{label} #{nth}");
                     let case = PCaseV1::with_frames(capsule, frames);
-                    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+                    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
                     let fired: FiredV1 = StdRc::new(StdCell::new(None));
                     let act = spend(deadline, &fired);
                     let count = StdCell::new(0_usize);
@@ -6660,7 +6657,7 @@ fn c3_the_one_deadline_is_kept_before_every_entry_and_every_seal() {
         &captured_capsule,
         CustodyGitObjectFormatV1::Sha1,
     ));
-    let deadline = Instant::now() + P_WRITE_DEADLINE_V1;
+    let (_clock, deadline) = DeadlineClockV1::with_headroom(P_WRITE_DEADLINE_V1);
     let fired: FiredV1 = StdRc::new(StdCell::new(None));
     let act = spend(deadline, &fired);
     let guard = install_git_hook_for_test(GitHookPointV1::DeadlineObserved, move |event| {
