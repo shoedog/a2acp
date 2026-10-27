@@ -10,7 +10,7 @@ const ALLOWED: &[&str] = &[
     "bridge-a2a-inbound/src/server.rs:spawn_local_producer",
     "bridge-a2a-inbound/src/server.rs:local_kiro_source",
     "bridge-a2a-inbound/src/server.rs:spawn_fanout_producer",
-    "bridge-a2a-inbound/src/server.rs:unary_message",
+    "bridge-a2a-inbound/src/server.rs:run_admitted_message",
     "bridge-a2a-inbound/src/server.rs:unary_fanout_message",
     "bridge-a2a-inbound/src/server.rs:session_compact",
     "bridge-mcp/src/server.rs:dispatch",
