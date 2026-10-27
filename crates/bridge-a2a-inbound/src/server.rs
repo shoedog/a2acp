@@ -2488,6 +2488,53 @@ async fn stream_message(
         return durable_workflow_a2a_sse_response(&srv, &locator.task_id, id).await;
     }
 
+    if routed.context_id.is_none() && matches!(routed.target, RouteTarget::Local(_)) {
+        let agent = local_agent_id(&srv, &routed.target);
+        if let Some(routing) = srv.coordinator().freeze_direct_fallback(
+            &agent,
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        ) {
+            let (fingerprint, complete) = srv.coordinator().direct_workload_fingerprint(
+                &agent,
+                routed.overrides.as_ref(),
+                "a2a_local",
+            );
+            let history = match srv
+                .coordinator()
+                .admit_direct_attempt(
+                    stream_owner.clone(),
+                    bridge_core::workflow_history::ExecutionSurface::Other,
+                    "a2a_stream",
+                    fingerprint,
+                    complete,
+                )
+                .await
+            {
+                Ok(history) => history,
+                Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            };
+            let task = routed.task.as_str().to_owned();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(async move {
+                let output = ServedEventOutput {
+                    tx: Some(tx.clone()),
+                    routing: Some(routing),
+                    exposed: false,
+                };
+                // Dropping the driver drops pending-cold ownership and its exact binding guard.
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {},
+                    _ = run_admitted_message(srv, id, params, routed, stream_owner, Some(history), output) => {},
+                }
+            });
+            return Sse::new(sse_event_stream(rx, task.clone(), task))
+                .keep_alive(KeepAlive::default())
+                .into_response();
+        }
+    }
+
     let governed = srv.coordinator().has_budget_policy();
     let mut history = None;
     let preparation = if matches!(routed.target, RouteTarget::Fanout) {
@@ -4894,6 +4941,76 @@ async fn unary_message(
         routed.default_route_deferred = false;
     }
 
+    run_admitted_message(
+        srv,
+        id,
+        params,
+        routed,
+        supplied_identity,
+        direct_history,
+        ServedEventOutput::default(),
+    )
+    .await
+}
+
+/// SSE commits events immediately; exposure remains sticky after the receiver drains.
+#[derive(Default)]
+struct ServedEventOutput {
+    tx: Option<tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
+    routing: Option<bridge_core::fallback_runtime::FrozenFallbackInvocationV1>,
+    exposed: bool,
+}
+impl ServedEventOutput {
+    async fn forward(&mut self, event: Event) {
+        if let Some(tx) = &self.tx {
+            if tx.send(Ok(event)).await.is_ok() {
+                self.exposed = true;
+            }
+        }
+    }
+    async fn terminal(&self, outcome: TaskOutcome) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        }
+    }
+    async fn error(&self, id: Value, error: &BridgeError) -> Response {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Err(error.clone())).await;
+            self.terminal(TaskOutcome::Failed).await;
+        }
+        bridge_err_to_jsonrpc(id, error)
+    }
+    fn transition(
+        &self,
+        run: bridge_core::fallback_runtime::FrozenFallbackInvocationV1,
+        failure: bridge_core::translator::AccountingFailureV1,
+        canceled: bool,
+        admit: impl FnOnce(
+            &bridge_core::routing::FallbackCandidateV1,
+        ) -> Result<bridge_core::routing::FallbackCandidateV1, BridgeError>,
+    ) -> Result<
+        (
+            bridge_core::fallback_runtime::FrozenFallbackInvocationV1,
+            bridge_core::routing::FallbackCandidateV1,
+        ),
+        bridge_core::translator::AccountingFailureV1,
+    > {
+        if self.exposed {
+            return Err(failure);
+        }
+        run.transition(failure, canceled, admit)
+    }
+}
+
+async fn run_admitted_message(
+    srv: Arc<InboundServer>,
+    id: Value,
+    params: Value,
+    mut routed: RoutedCall,
+    supplied_identity: bridge_core::ids::AttemptIdentity,
+    mut direct_history: Option<bridge_coordinator::DirectAttemptHandle>,
+    mut output: ServedEventOutput,
+) -> Response {
     let mut cleanup_disposition = "unknown";
     let mut detached_cleanup: Option<bridge_coordinator::dispatch::DetachedWarmCleanup> = None;
     let mut child_liveness = bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
@@ -4920,11 +5037,15 @@ async fn unary_message(
         && !srv.bindings().lock().await.contains_key(&routed.task)
         && matches!(srv.store.session_for(&routed.task).await, Ok(None))
     {
-        srv.coordinator().freeze_direct_fallback(
-            &candidate_agent,
-            &routed.overrides.clone().unwrap_or_default(),
-            routed.session_cwd.as_ref(),
-        )
+        if output.tx.is_some() {
+            output.routing.take()
+        } else {
+            srv.coordinator().freeze_direct_fallback(
+                &candidate_agent,
+                &routed.overrides.clone().unwrap_or_default(),
+                routed.session_cwd.as_ref(),
+            )
+        }
     } else {
         None
     };
@@ -4962,6 +5083,7 @@ async fn unary_message(
             if fallback_control
                 .as_ref()
                 .is_some_and(|control| control.token.is_cancelled())
+                || output.tx.as_ref().is_some_and(|tx| tx.is_closed())
             {
                 break preceding.take().map_or_else(
                     || vec![Ok(Event::terminal(TaskOutcome::Canceled))],
@@ -4985,7 +5107,7 @@ async fn unary_message(
                 &routed,
                 diagnostic.clone(),
                 supplied_identity.clone(),
-                None,
+                output.tx.as_ref(),
                 admission.as_ref(),
             )
             .await;
@@ -5008,6 +5130,7 @@ async fn unary_message(
                         == bridge_core::translator::AccountingPreparationExitV1::Canceled
                         && e.persistence.is_none()
                     {
+                        output.terminal(TaskOutcome::Canceled).await;
                         return jsonrpc_ok(
                             id,
                             json!({
@@ -5021,7 +5144,7 @@ async fn unary_message(
                             }),
                         );
                     }
-                    return bridge_err_to_jsonrpc(id, &e.surfaced_error());
+                    return output.error(id, &e.surfaced_error()).await;
                 }
             };
             let observation = if fallback_active {
@@ -5091,7 +5214,7 @@ async fn unary_message(
                 dispatch.backend.as_ref(),
                 &dispatch.session,
                 turn_meta.clone(),
-                served_turn_liveness(&routed, true),
+                served_turn_liveness(&routed, output.tx.is_none()),
             )
             .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
@@ -5136,7 +5259,7 @@ async fn unary_message(
                                 .settle(dispatch.usage)
                                 .await
                                 .surfaced_error();
-                            return bridge_err_to_jsonrpc(id, &error);
+                            return output.error(id, &error).await;
                         }
                         match capability {
                             bridge_core::terminal_evidence::EvidenceCapability::V1 => {
@@ -5269,7 +5392,11 @@ async fn unary_message(
                     }
                 }
                 turn_metrics.observe_content();
-                collected.push(ev);
+                if output.tx.is_some() && matches!(&ev, Ok(e) if e.kind() != &EventKind::Terminal) {
+                    output.forward(ev.unwrap()).await;
+                } else {
+                    collected.push(ev);
+                }
             }
             turn_metrics.finish(&UnaryTurnMetrics::outcome(&collected));
             drop(events);
@@ -5327,6 +5454,7 @@ async fn unary_message(
                         routing = None;
                     }
                     let canceled = abort.is_cancelled()
+                        || output.tx.as_ref().is_some_and(|tx| tx.is_closed())
                         || srv
                             .store
                             .cancel_requested(&routed.task)
@@ -5340,7 +5468,7 @@ async fn unary_message(
                         .retain_replay_effects(&mut failure);
                     let mut next_entry = None;
                     let transition = routing.take().ok_or(failure.clone()).and_then(|run| {
-                        run.transition(failure.clone(), canceled, |next| {
+                        output.transition(run, failure.clone(), canceled, |next| {
                             let overrides = AgentOverride {
                                 model: Some(next.model.clone()),
                                 ..routed.overrides.clone().unwrap_or_default()
@@ -5496,7 +5624,7 @@ async fn unary_message(
                     };
                     jsonrpc_ok(id, json!({ "task": working, "locator": locator }))
                 }
-                Err(e) => bridge_err_to_jsonrpc(id, &e),
+                Err(e) => output.error(id, &e).await,
             };
         }
     };
@@ -5528,12 +5656,12 @@ async fn unary_message(
                 let mut original = e.surfaced_error();
                 if let BridgeError::BudgetRefused { refusal } = &mut original {
                     refusal.persistence = Some(Box::new(terminal_error));
-                    return bridge_err_to_jsonrpc(id, &original);
+                    return output.error(id, &original).await;
                 }
-                return bridge_err_to_jsonrpc(id, &terminal_error);
+                return output.error(id, &terminal_error).await;
             }
         }
-        return bridge_err_to_jsonrpc(id, &e.surfaced_error());
+        return output.error(id, &e.surfaced_error()).await;
     }
     let events: Vec<Event> = collected.into_iter().filter_map(|r| r.ok()).collect();
     // Local unary responses intentionally keep BOTH the `status` chunks and
@@ -5592,7 +5720,7 @@ async fn unary_message(
             .await
         {
             Ok(terminal) => terminal,
-            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            Err(error) => return output.error(id, &error).await,
         };
         state = match terminal.outcome.as_str() {
             "completed" => "TASK_STATE_COMPLETED",
@@ -5601,6 +5729,13 @@ async fn unary_message(
         };
     }
 
+    output
+        .terminal(match state {
+            "TASK_STATE_CANCELED" => TaskOutcome::Canceled,
+            "TASK_STATE_FAILED" => TaskOutcome::Failed,
+            _ => TaskOutcome::Completed,
+        })
+        .await;
     let metadata = attempt_identity_metadata(&supplied_identity, None);
     let result = json!({
         "task": {
@@ -7066,6 +7201,94 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn sse_exposure_independently_blocks_prompt_open_rejection() {
+        use bridge_core::{fallback_runtime::FrozenFallbackInvocationV1, routing::*};
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let candidate = |agent: &str| FallbackCandidateV1 {
+            agent: AgentId::parse(agent).unwrap(),
+            model: "model".into(),
+            posture: CandidatePostureV1 {
+                kind: "acp".into(),
+                cmd: Some("fake".into()),
+                cwd: dir.display().to_string(),
+                session_cwd: dir.display().to_string(),
+                ..Default::default()
+            },
+        };
+        let chain = FrozenFallbackChainV1 {
+            id: "capacity".into(),
+            source: candidate("source"),
+            causes: [FallbackCauseV1::QuotaExhausted].into(),
+            steps: vec![candidate("target")],
+        };
+        let backend = WarmErrorBackend {
+            error: BridgeError::AgentFailure { diagnostic: Box::new(serde_json::from_value(json!({
+                "schema_version":1, "failed_phase":"prompt_start", "class":"quota_exhausted",
+                "disposition":"fatal", "code":"test.rejected", "summary":"original rejection",
+                "causes":[], "stderr_observed":false, "stderr_line_count":0,
+                "prompt_may_have_been_accepted":false
+            })).unwrap()) },
+            prompt_open: true, releases: AtomicUsize::new(0), release_gate: Mutex::new(None),
+            release_completed: Default::default(), cancels: AtomicUsize::new(0), cancel_completed: Default::default(),
+        };
+        let session = SessionId::parse("source").unwrap();
+        let task = TaskId::parse("task").unwrap();
+        let store = FakeStore::default();
+        let mut events = Translator::new().run(
+            &backend,
+            &store,
+            &AutoApprove,
+            &task,
+            &session,
+            vec![Part {
+                text: "input".into(),
+            }],
+        );
+        // A real prompt-open rejection supplies affirmative replay evidence, independent
+        // of source stream/text/activity guards. Checked cleanup is real as well.
+        let failure = events
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .with_checked_cleanup(backend.release_session_checked(&session).await);
+        assert!(events.next().await.is_none());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut output = ServedEventOutput {
+            tx: Some(tx),
+            ..Default::default()
+        };
+        output.forward(Event::status("source status only")).await;
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap().text(),
+            "source status only"
+        );
+        assert!(
+            rx.is_empty(),
+            "draining the outgoing channel cannot erase exposure"
+        );
+        for exposed in [true, false] {
+            output.exposed = exposed;
+            let run = FrozenFallbackInvocationV1::freeze(vec![chain.clone()], chain.source.clone())
+                .unwrap();
+            let prepared = AtomicUsize::new(0);
+            let result = output.transition(run, failure.clone(), false, |next| {
+                prepared.fetch_add(1, Ordering::SeqCst);
+                Ok(next.clone())
+            });
+            assert_eq!(
+                result.is_ok(),
+                !exposed,
+                "exposure is an independent barrier"
+            );
+            assert_eq!(prepared.load(Ordering::SeqCst), usize::from(!exposed));
+            if let Err(retained) = result {
+                assert_eq!(retained, failure);
+            }
+        }
+    }
 
     // ---- inline fakes ----
 

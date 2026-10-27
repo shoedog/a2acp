@@ -37,7 +37,7 @@ pub(crate) struct Provider {
     pub(crate) forgets: AtomicUsize,
     cleaned: Arc<AtomicUsize>,
     pub(crate) inputs: Mutex<Vec<Vec<Part>>>,
-    pub(crate) cleanup: (tokio::sync::Notify, tokio::sync::Notify),
+    pub(crate) cleanup: Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
     pub(crate) configure: (tokio::sync::Notify, tokio::sync::Notify),
     pub(crate) sessions: Mutex<Vec<SessionId>>,
     activity: Mutex<Option<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>>>,
@@ -114,6 +114,17 @@ impl AgentBackend for Provider {
         );
         match self.behavior {
             "parked" => Ok(Box::pin(futures::stream::pending())),
+            "status-reject" => {
+                use futures::StreamExt;
+                let gate = self.cleanup.clone();
+                Ok(Box::pin(
+                    futures::stream::once(async { Ok(Update::Text("source-status".repeat(100))) })
+                        .chain(futures::stream::once(async move {
+                            gate.1.notified().await;
+                            Err(error)
+                        })),
+                ))
+            }
             "reject" | "shared-reject" | "accepted" | "billing" | "billing-match" | "region"
             | "rate" | "cleanup" | "blocked-cleanup" | "cleanup-effect" => Err(error),
             "tool" => {

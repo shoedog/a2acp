@@ -20904,6 +20904,7 @@ async fn production_billing_per_visited_candidate() {
     use bridge_core::{ids::AttemptIdentity, routing::BillingModeV1, task_store::TaskStore};
     for (surface, target, mapped) in [
         ("SendMessage", "success", true),
+        ("SendStreamingMessage", "success", true),
         ("Mcp", "success", true),
         ("SendMessage", "setup", true),
         ("SendMessage", "success", false),
@@ -21005,6 +21006,16 @@ async fn production_billing_per_visited_candidate() {
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].id, rows[1].id);
         for row in &rows {
+            if surface == "SendStreamingMessage" {
+                assert_eq!(
+                    row.attribution.run_attempt.as_deref(),
+                    Some(owner.attempt_id.as_str())
+                );
+                assert_eq!(
+                    row.attribution.execution.as_deref(),
+                    Some(owner.execution_id.as_str())
+                );
+            }
             assert_eq!(row.attribution.effective_model.as_deref(), Some("shared"));
             let name = row.attribution.agent.as_str();
             assert_eq!(row.dispatched, name == "source" || target == "success");
