@@ -690,6 +690,14 @@ impl ColdTurnClaim {
         &self,
     ) -> tokio::task::JoinHandle<Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError>>
     {
+        self.start_cleanup_with(false)
+    }
+
+    fn start_cleanup_with(
+        &self,
+        forget: bool,
+    ) -> tokio::task::JoinHandle<Result<bridge_core::ports::BackendCleanupDispositionV1, BridgeError>>
+    {
         self.cleaned
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (bindings, task, lease, backend, session) = (
@@ -700,25 +708,38 @@ impl ColdTurnClaim {
             self.session.clone(),
         );
         tokio::spawn(async move {
-            let mut bindings = bindings.lock().await;
-            let owns_binding = bindings
-                .get(&task)
-                .is_some_and(|b| Arc::ptr_eq(&b.lease, &lease) && b.session == session);
-            // Session keys identify incarnations independently of the task's current binding.
-            let result = backend.release_session_checked(&session).await;
-            if let Some(binding) = bindings.get_mut(&task).filter(|_| owns_binding) {
-                // Retain uncertain resources and refuse their reuse without forgetting their stash.
-                binding.lease = Arc::new(FailedColdLease {
-                    _lease: binding.lease.clone(),
-                });
-            }
-            if owns_binding
-                && matches!(
-                    result,
-                    Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
-                )
+            let retired: Arc<dyn Lease> = Arc::new(FailedColdLease {
+                _lease: lease.clone(),
+            });
             {
-                bindings.remove(&task);
+                let mut bindings = bindings.lock().await;
+                if let Some(binding) = bindings
+                    .get_mut(&task)
+                    .filter(|b| Arc::ptr_eq(&b.lease, &lease) && b.session == session)
+                {
+                    // Refuse reuse while cleanup is in flight or its outcome is uncertain.
+                    binding.lease = retired.clone();
+                } else if forget {
+                    return Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete);
+                }
+            }
+            // Unique incarnation keys let the backend run without the bindings lock.
+            let result = if forget {
+                backend.forget_session_checked(&session).await
+            } else {
+                backend.release_session_checked(&session).await
+            };
+            if matches!(
+                result,
+                Ok(bridge_core::ports::BackendCleanupDispositionV1::Complete)
+            ) {
+                let mut bindings = bindings.lock().await;
+                if bindings
+                    .get(&task)
+                    .is_some_and(|b| Arc::ptr_eq(&b.lease, &retired) && b.session == session)
+                {
+                    bindings.remove(&task);
+                }
             }
             result
         })
@@ -744,27 +765,8 @@ impl Drop for ColdTurnClaim {
         if self.cleaned.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        if self.applying.load(std::sync::atomic::Ordering::SeqCst) {
-            drop(self.start_cleanup());
-            return;
-        }
-        let (bindings, task, lease, backend, session) = (
-            self.bindings.clone(),
-            self.task.clone(),
-            self.lease.clone(),
-            self.backend.clone(),
-            self.session.clone(),
-        );
-        tokio::spawn(async move {
-            let mut bindings = bindings.lock().await;
-            if bindings
-                .get(&task)
-                .is_some_and(|b| Arc::ptr_eq(&b.lease, &lease))
-            {
-                bindings.remove(&task);
-                backend.forget_session(&session).await;
-            }
-        });
+        // Checked forget can also be uncertain, so it uses the same retirement protocol.
+        drop(self.start_cleanup_with(!self.applying.load(std::sync::atomic::Ordering::SeqCst)));
     }
 }
 
@@ -13275,9 +13277,13 @@ mod tests {
         configured: ConfiguredSessions,
         configure_gate: Mutex<Option<oneshot::Receiver<()>>>,
         configure_entered: tokio::sync::Notify,
+        stream_gate: Mutex<Option<oneshot::Receiver<()>>>,
+        forget_gate: Mutex<Option<oneshot::Receiver<()>>>,
+        forget_entered: tokio::sync::Notify,
         prompted_parts: Arc<Mutex<Vec<Vec<String>>>>,
         release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         release_started: Arc<tokio::sync::Notify>,
+        release_finished: tokio::sync::Notify,
         release_started_count: AtomicUsize,
         diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
@@ -13291,9 +13297,13 @@ mod tests {
                 configured: Arc::new(Mutex::new(Vec::new())),
                 configure_gate: Mutex::new(None),
                 configure_entered: tokio::sync::Notify::new(),
+                stream_gate: Mutex::new(None),
+                forget_gate: Mutex::new(None),
+                forget_entered: tokio::sync::Notify::new(),
                 prompted_parts: Arc::new(Mutex::new(Vec::new())),
                 release_gate: Arc::new(Mutex::new(None)),
                 release_started: Arc::new(tokio::sync::Notify::new()),
+                release_finished: tokio::sync::Notify::new(),
                 release_started_count: AtomicUsize::new(0),
                 diagnostics: Mutex::new(Vec::new()),
             })
@@ -13370,7 +13380,15 @@ mod tests {
                     prefix_attestation: Default::default(),
                 }),
             ];
-            Ok(Box::pin(tokio_stream::iter(updates)))
+            let gate = self.stream_gate.lock().unwrap().take();
+            Ok(Box::pin(async_stream::stream! {
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                for update in updates {
+                    yield update;
+                }
+            }))
         }
 
         async fn prompt_with_observers(
@@ -13407,6 +13425,11 @@ mod tests {
         }
 
         async fn forget_session(&self, session: &SessionId) {
+            let gate = self.forget_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                self.forget_entered.notify_one();
+                let _ = gate.await;
+            }
             self.forgotten
                 .lock()
                 .unwrap()
@@ -13424,6 +13447,7 @@ mod tests {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
+            self.release_finished.notify_one();
         }
     }
 
@@ -17545,53 +17569,258 @@ mod tests {
         build_registry_store(registry, Arc::new(FakeStore::default()), "a")
     }
 
-    #[tokio::test]
-    async fn cold_cleanup_releases_old_session_after_successor_publication() {
+    // Exercise the governed claim directly, including Drop while apply is in flight.
+    async fn bound_cold_claim(srv: &Arc<InboundServer>, task: &str) -> ColdTurnClaim {
+        let agent = AgentId::parse("a").unwrap();
+        let resolved = srv.registry().resolve(&agent).await.unwrap();
+        let claim = ColdTurnClaim {
+            registry: srv.registry().clone(),
+            entry: resolved.entry,
+            backend: resolved.backend,
+            lease: Arc::from(resolved.lease),
+            bindings: srv.bindings().clone(),
+            task: TaskId::parse(task).unwrap(),
+            session: mint_cold_session().unwrap(),
+            cleaned: Default::default(),
+            applying: Default::default(),
+        };
+        srv.bindings().lock().await.insert(
+            claim.task.clone(),
+            TaskBinding {
+                session: claim.session.clone(),
+                agent,
+                backend: claim.backend.clone(),
+                eff: Default::default(),
+                lease: claim.lease.clone(),
+            },
+        );
+        claim
+    }
+
+    async fn capped_cleanup_case(drop_applying: Option<bool>) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let backend = WarmRecordingBackend::new();
-            let srv = cold_configure_server(backend.clone());
-            let agent = AgentId::parse("a").unwrap();
-            let resolved = srv.registry().resolve(&agent).await.unwrap();
-            let task = TaskId::parse("cleanup-race").unwrap();
-            let session = mint_cold_session().unwrap();
-            let claim = ColdTurnClaim {
-                registry: srv.registry().clone(),
-                entry: resolved.entry,
-                backend: backend.clone(),
-                lease: Arc::from(resolved.lease),
-                bindings: srv.bindings().clone(),
-                task: task.clone(),
-                session: session.clone(),
-                cleaned: Default::default(),
-                applying: Default::default(),
+            let running = TrackingBackend::new("b", true);
+            let registry = CountingRegistry::new("a", vec![
+                (bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>),
+                (bare_entry("b"), running.clone() as Arc<dyn AgentBackend>),
+            ]);
+            let srv = build_registry_store(registry, Arc::new(FakeStore::default()), "a");
+            let response_b = router(srv.clone()).oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({"taskId":"cleanup-b", "message":{"text":"go", "metadata":{"a2a-bridge.agent":"b"}}}),
+                "1.0",
+            )).await.unwrap();
+            await_binding(&srv, "cleanup-b", true).await;
+            let (finish_c, gate) = oneshot::channel();
+            *backend.stream_gate.lock().unwrap() = Some(gate);
+            let response_c = router(srv.clone()).oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({"taskId":"cleanup-c", "message":{"text":"go"}}), "1.0",
+            )).await.unwrap();
+            wait_until(|| backend.sessions.lock().unwrap().len() == 1).await;
+            let session_c = backend.sessions.lock().unwrap()[0].clone();
+            let claim = bound_cold_claim(&srv, "cleanup-a").await;
+            let session_a = claim.session.clone();
+            let (release_a, gate) = oneshot::channel();
+            let forget = drop_applying == Some(false);
+            if forget {
+                *backend.forget_gate.lock().unwrap() = Some(gate);
+            } else {
+                *backend.release_gate.lock().unwrap() = Some(gate);
+            }
+            let cleanup = if let Some(applying) = drop_applying {
+                claim.applying.store(applying, Ordering::SeqCst);
+                drop(claim);
+                None
+            } else {
+                let cleanup = claim.start_cleanup();
+                assert!(claim.cleaned.load(Ordering::SeqCst));
+                drop(claim);
+                Some(cleanup)
             };
-            // Publish a successor while old cleanup waits for the bindings lock.
-            let mut bindings = srv.bindings().lock().await;
+            if forget {
+                backend.forget_entered.notified().await;
+            } else {
+                backend.wait_release_started().await;
+            }
+
+            // All three operations must finish BEFORE the parked cleanup is released.
+            let canceled = spawn_cancel(&srv, "cleanup-b").await.unwrap().unwrap();
+            assert!(body_string(canceled).await.contains("TASK_STATE_CANCELED"));
+            assert!(running.cancelled.load(Ordering::SeqCst));
+            let independent = router(srv.clone()).oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({"taskId":"cleanup-d", "message":{"text":"go"}}), "1.0",
+            )).await.unwrap();
+            assert!(body_string(independent).await.contains("TASK_STATE_COMPLETED"));
+            finish_c.send(()).unwrap();
+            assert!(body_string(response_c).await.contains("TASK_STATE_COMPLETED"));
+            await_binding(&srv, "cleanup-c", false).await;
+            wait_until(|| backend.forgotten().contains(&session_c)).await;
+            assert!(srv.bindings().lock().await[&TaskId::parse("cleanup-a").unwrap()].lease.is_retired());
+
+            release_a.send(()).unwrap();
+            if let Some(cleanup) = cleanup {
+                assert_eq!(cleanup.await.unwrap().unwrap(), BackendCleanupDispositionV1::Complete);
+            }
+            if forget {
+                wait_until(|| backend.forgotten().contains(&session_a.as_str().to_owned())).await;
+            } else {
+                backend.release_finished.notified().await;
+            }
+            await_binding(&srv, "cleanup-a", false).await;
+            assert_eq!(backend.forgotten().iter().filter(|s| *s == session_a.as_str()).count(), 1);
+            drop(response_b);
+        }).await.expect("cancel, bind and eviction must finish while capped cleanup is parked");
+    }
+
+    #[tokio::test]
+    async fn capped_cleanup_does_not_block_others() {
+        capped_cleanup_case(None).await;
+    }
+
+    #[tokio::test]
+    async fn capped_drop_fallback_does_not_block_others() {
+        for applying in [false, true] {
+            capped_cleanup_case(Some(applying)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_in_progress_refuses_same_task() {
+        use bridge_core::{accounting::AccountingV1, governance::*};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let backend = WarmRecordingBackend::new();
+            let server = Arc::try_unwrap(cold_configure_server(backend.clone()))
+                .ok()
+                .unwrap();
+            let coordinator = Arc::try_unwrap(server.coordinator).ok().unwrap();
+            let accounting = AccountingV1 {
+                budget_policy: Some(Arc::new(
+                    BudgetPolicyV1::new(
+                        vec![BudgetRuleV1 {
+                            id: "cap".into(),
+                            selector: BudgetSelectorV1::EachRequest,
+                            limits: BudgetLimitsV1 {
+                                turns: Some(10),
+                                terminal_tokens: None,
+                            },
+                        }],
+                        vec![],
+                    )
+                    .unwrap(),
+                )),
+                ..AccountingV1::new(coordinator.task_store())
+            };
+            let srv = Arc::new(InboundServer {
+                coordinator: Arc::new(coordinator.with_accounting(accounting)),
+                ..server
+            });
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let task = identity.execution_id.as_str();
+            let claim = bound_cold_claim(&srv, task).await;
+            let (release, gate) = oneshot::channel();
+            *backend.release_gate.lock().unwrap() = Some(gate);
             let cleanup = claim.start_cleanup();
-            let successor = mint_cold_session().unwrap();
-            let lease: Arc<dyn Lease> = Arc::new(NoopLease);
-            bindings.insert(
-                task.clone(),
-                TaskBinding {
-                    session: successor.clone(),
-                    agent,
-                    backend: backend.clone(),
-                    eff: Default::default(),
-                    lease: lease.clone(),
-                },
-            );
-            drop(bindings);
-            assert_eq!(
-                cleanup.await.unwrap().unwrap(),
-                bridge_core::ports::BackendCleanupDispositionV1::Complete
-            );
-            assert_eq!(backend.forgotten(), [session.as_str()]);
-            let bindings = srv.bindings().lock().await;
-            assert_eq!(bindings[&task].session, successor);
-            assert!(Arc::ptr_eq(&bindings[&task].lease, &lease));
+            backend.wait_release_started().await;
+            assert!(srv.bindings().lock().await[&claim.task].lease.is_retired());
+            for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+                let response = router(srv.clone())
+                    .oneshot(post_request(
+                        method,
+                        liveness_unary_msg(&identity, json!({})),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap();
+                let body = body_string(response).await;
+                assert!(body.contains("budget refused"), "{body}");
+                assert!(backend.configured.lock().unwrap().is_empty());
+            }
+            // An unrelated binding can still publish while release is parked.
+            drop(bound_cold_claim(&srv, "cleanup-other").await);
+            release.send(()).unwrap();
+            cleanup.await.unwrap().unwrap();
+            await_binding(&srv, task, false).await;
         })
         .await
-        .expect("old cleanup must finish without disturbing its successor");
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_never_releases_successor() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for forget in [false, true] {
+                for publish_before in [false, true] {
+                    let backend = WarmRecordingBackend::new();
+                    let srv = cold_configure_server(backend.clone());
+                    let claim = bound_cold_claim(&srv, "cleanup-race").await;
+                    let task = claim.task.clone();
+                    let session = claim.session.clone();
+                    // Reuse the lease deliberately: the session check must also protect A'.
+                    let successor_session = mint_cold_session().unwrap();
+                    let successor_lease = claim.lease.clone();
+                    let successor = || TaskBinding {
+                        session: successor_session.clone(),
+                        agent: AgentId::parse("a").unwrap(),
+                        backend: backend.clone(),
+                        eff: Default::default(),
+                        lease: successor_lease.clone(),
+                    };
+                    let (release, gate) = oneshot::channel();
+                    if forget {
+                        *backend.forget_gate.lock().unwrap() = Some(gate);
+                    } else {
+                        *backend.release_gate.lock().unwrap() = Some(gate);
+                    }
+                    let mut bindings = srv.bindings().lock().await;
+                    if publish_before {
+                        bindings.insert(task.clone(), successor());
+                    }
+                    let cleanup = if forget {
+                        drop(claim);
+                        None
+                    } else {
+                        Some(claim.start_cleanup())
+                    };
+                    drop(bindings);
+                    if forget && publish_before {
+                        // The unowned Drop path must skip forgetting altogether.
+                        wait_until(|| Arc::strong_count(&successor_lease) == 2).await;
+                        assert!(backend.forgotten().is_empty());
+                        let bindings = srv.bindings().lock().await;
+                        assert_eq!(bindings[&task].session, successor_session);
+                        assert!(Arc::ptr_eq(&bindings[&task].lease, &successor_lease));
+                        continue;
+                    }
+                    if forget {
+                        backend.forget_entered.notified().await;
+                    } else {
+                        backend.wait_release_started().await;
+                    }
+                    if !publish_before {
+                        srv.bindings()
+                            .lock()
+                            .await
+                            .insert(task.clone(), successor());
+                    }
+                    release.send(()).unwrap();
+                    if let Some(cleanup) = cleanup {
+                        assert_eq!(
+                            cleanup.await.unwrap().unwrap(),
+                            BackendCleanupDispositionV1::Complete
+                        );
+                    }
+                    wait_until(|| backend.forgotten() == [session.as_str()]).await;
+                    let bindings = srv.bindings().lock().await;
+                    assert_eq!(bindings[&task].session, successor_session);
+                    assert!(Arc::ptr_eq(&bindings[&task].lease, &successor_lease));
+                }
+            }
+        })
+        .await
+        .expect("old cleanup must leave its successor binding and session untouched");
     }
 
     async fn cold_configure_case(method: &'static str, cancel: bool, successor: bool) {
