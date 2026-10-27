@@ -41,9 +41,17 @@ pub(crate) struct Provider {
     pub(crate) configure: (tokio::sync::Notify, tokio::sync::Notify),
     pub(crate) sessions: Mutex<Vec<SessionId>>,
     activity: Mutex<Option<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>>>,
+    pub(crate) liveness: Mutex<Vec<bridge_core::turn_liveness::TurnLivenessRequestV1>>,
 }
 #[async_trait::async_trait]
 impl AgentBackend for Provider {
+    async fn configure_turn_liveness(
+        &self,
+        _: &SessionId,
+        value: bridge_core::turn_liveness::TurnLivenessRequestV1,
+    ) {
+        self.liveness.lock().unwrap().push(value);
+    }
     fn terminal_evidence_capability(&self) -> EvidenceCapability {
         if self.behavior.starts_with("evidence-") {
             EvidenceCapability::V1
@@ -113,6 +121,9 @@ impl AgentBackend for Provider {
             },
         );
         match self.behavior {
+            "local-cancel" => Ok(Box::pin(futures::stream::iter([Ok(Update::done(
+                "cancelled",
+            ))]))),
             "parked" => Ok(Box::pin(futures::stream::pending())),
             "status-reject" => {
                 use futures::StreamExt;
@@ -269,7 +280,7 @@ impl Fixture {
     pub(crate) fn new(source: &'static str, target: &'static str, chain: bool) -> Self {
         Self::with_dispatch_failure(source, target, chain, false)
     }
-    fn with_dispatch_failure(
+    pub(crate) fn with_dispatch_failure(
         source: &'static str,
         target: &'static str,
         chain: bool,
@@ -320,6 +331,7 @@ impl Fixture {
                     configure: Default::default(),
                     sessions: Default::default(),
                     activity: Default::default(),
+                    liveness: Default::default(),
                 })
             })
             .collect();
@@ -519,20 +531,42 @@ impl Fixture {
     }
     #[allow(dead_code)] // Shared with served and production-composition witnesses.
     pub(crate) fn server(&self) -> Arc<bridge_a2a_inbound::server::InboundServer> {
-        struct Route;
+        self.served_server(false, Arc::new(bridge_a2a_outbound::StubDelegation))
+    }
+    #[allow(dead_code)]
+    pub(crate) fn served_server(
+        &self,
+        fanout: bool,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<bridge_a2a_inbound::server::InboundServer> {
+        struct Route(bool);
         impl RouteDecision for Route {
+            fn route_before_default(
+                &self,
+                meta: &TaskMeta,
+            ) -> Result<Option<RouteTarget>, BridgeError> {
+                if self.0 {
+                    self.route(meta).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
             fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-                Ok(RouteTarget::Local(
-                    meta.agent.clone().unwrap_or(AgentId::parse("source")?),
-                ))
+                if self.0 && meta.agent.is_none() {
+                    Ok(RouteTarget::Fanout)
+                } else {
+                    Ok(RouteTarget::Local(
+                        meta.agent.clone().unwrap_or(AgentId::parse("source")?),
+                    ))
+                }
             }
         }
         Arc::new(bridge_a2a_inbound::server::InboundServer::from_coordinator(
             self.coordinator.clone(),
-            Arc::new(Route),
+            Arc::new(Route(fanout)),
             Arc::new(bridge_policy::auth::AlwaysGrant),
             "http://localhost",
-            Arc::new(bridge_a2a_outbound::StubDelegation),
+            delegation,
             "source",
         ))
     }
