@@ -37,7 +37,7 @@ pub(crate) struct Provider {
     pub(crate) forgets: AtomicUsize,
     cleaned: Arc<AtomicUsize>,
     pub(crate) inputs: Mutex<Vec<Vec<Part>>>,
-    pub(crate) cleanup: (tokio::sync::Notify, tokio::sync::Notify),
+    pub(crate) cleanup: Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
     pub(crate) configure: (tokio::sync::Notify, tokio::sync::Notify),
     pub(crate) sessions: Mutex<Vec<SessionId>>,
     activity: Mutex<Option<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>>>,
@@ -114,6 +114,17 @@ impl AgentBackend for Provider {
         );
         match self.behavior {
             "parked" => Ok(Box::pin(futures::stream::pending())),
+            "status-reject" => {
+                use futures::StreamExt;
+                let gate = self.cleanup.clone();
+                Ok(Box::pin(
+                    futures::stream::once(async { Ok(Update::Text("source-status".repeat(100))) })
+                        .chain(futures::stream::once(async move {
+                            gate.1.notified().await;
+                            Err(error)
+                        })),
+                ))
+            }
             "reject" | "shared-reject" | "accepted" | "billing" | "billing-match" | "region"
             | "rate" | "cleanup" | "blocked-cleanup" | "cleanup-effect" => Err(error),
             "tool" => {
@@ -187,10 +198,15 @@ struct SecondDispatchFailure(
     Arc<bridge_store::sqlite::SqliteStore>,
     AtomicUsize,
     Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 );
 #[async_trait::async_trait]
 impl WorkflowHistoryStore for SecondDispatchFailure {
     async fn reserve(&self, r: &AttemptReservation) -> Result<(), LedgerError> {
+        if let Some(gate) = &self.3 {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
         self.0.reserve(r).await
     }
     async fn mark_prompt_acceptance(&self, id: &AttemptId, a: &str) -> Result<(), LedgerError> {
@@ -385,6 +401,7 @@ impl Fixture {
             )
             .unwrap(),
         );
+        let admission_gate = target == "admission-gate";
         let coordinator = bridge_coordinator::Coordinator::new(
             Arc::new(bridge_coordinator::session_manager::SessionManager::new(
                 registry.clone(),
@@ -402,11 +419,12 @@ impl Fixture {
             Arc::new(bridge_observ::NoopObserver),
             3,
         )
-        .with_workflow_history(Ok(if fail || target == "ledger-gate" {
+        .with_workflow_history(Ok(if fail || target == "ledger-gate" || admission_gate {
             Arc::new(SecondDispatchFailure(
                 store.clone(),
                 AtomicUsize::new(0),
                 (target == "ledger-gate").then(|| dispatch_gate.clone()),
+                admission_gate.then(|| dispatch_gate.clone()),
             ))
         } else {
             store.clone()
