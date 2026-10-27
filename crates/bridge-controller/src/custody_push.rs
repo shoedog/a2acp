@@ -540,7 +540,6 @@ impl Drop for SnapshotIndex {
 }
 
 fn snapshot(clone: &Path, task_id: &str) -> Result<String, String> {
-    use std::io::Write;
     let path = clone
         .join(".git")
         .join(format!("a2a-snapshot-{}", crate::implement::nonce(16)));
@@ -555,10 +554,17 @@ fn snapshot(clone: &Path, task_id: &str) -> Result<String, String> {
         .open(&path)
         .map_err(|_| "snapshot index creation failed")?;
     let index = SnapshotIndex(path);
-    match std::fs::read(clone.join(".git/index")) {
-        Ok(bytes) => file
-            .write_all(&bytes)
-            .map_err(|_| "snapshot index copy failed")?,
+    match std::fs::File::open(clone.join(".git/index")) {
+        Ok(mut source) => {
+            std::io::copy(&mut source, &mut file).map_err(|_| "snapshot index copy failed")?;
+            // A newer copy timestamp would suppress Git's racy-clean content checks.
+            let modified = source
+                .metadata()
+                .and_then(|m| m.modified())
+                .map_err(|_| "snapshot index timestamp failed")?;
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .map_err(|_| "snapshot index timestamp failed")?;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Git interprets an absent index as empty; a zero-byte index is invalid.
             std::fs::remove_file(&index.0).map_err(|_| "snapshot index removal failed")?;
@@ -1238,6 +1244,68 @@ mod tests {
             .unwrap();
         assert_ne!(state.dirty.last_pushed_sha, Some(sha));
         assert!(state.normal.last_pushed_sha.is_none());
+    }
+
+    #[test]
+    fn snapshot_preserves_racy_index_content_checks() {
+        for contents in ["original", "modified"] {
+            let f = Fixture::new();
+            let _policy = crate::clone_config::ClonePolicyScope::install(
+                &f.clone,
+                crate::clone_config::CloneConfigPolicy {
+                    extra_keys: vec!["core.trustctime".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            run(&f.clone, &["config", "core.trustctime", "false"]);
+            let tracked = f.clone.join("tracked");
+            let stamp =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+            std::fs::write(&tracked, "original").unwrap();
+            std::fs::write(f.clone.join("stable"), "unchanged").unwrap();
+            std::fs::File::open(&tracked)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            run(&f.clone, &["add", "tracked", "stable"]);
+            std::fs::write(&tracked, contents).unwrap();
+            std::fs::File::open(&tracked)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            // Model a coarse stat clock: only the original index's racy timestamp
+            // forces Git to reconsider the same-size, tracked-but-ignored file.
+            std::fs::File::open(f.clone.join(".git/index"))
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            std::fs::write(f.clone.join(".gitignore"), "tracked\nignored\n").unwrap();
+            std::fs::write(f.clone.join("ignored"), "excluded").unwrap();
+            let index = std::fs::read(f.clone.join(".git/index")).unwrap();
+            let refs = run(&f.clone, &["show-ref"]);
+            let sha = snapshot(&f.clone, "impl-test").unwrap();
+            assert_eq!(
+                run(&f.clone, &["show", &format!("{sha}:tracked")]),
+                contents
+            );
+            assert_eq!(
+                run(&f.clone, &["show", &format!("{sha}:stable")]),
+                "unchanged"
+            );
+            assert_eq!(
+                run(&f.clone, &["ls-tree", "--name-only", &sha]),
+                ".gitignore\nstable\ntracked"
+            );
+            assert_eq!(std::fs::read(f.clone.join(".git/index")).unwrap(), index);
+            assert_eq!(run(&f.clone, &["show-ref"]), refs);
+            assert_eq!(std::fs::read_to_string(&tracked).unwrap(), contents);
+            assert_eq!(
+                std::fs::read_to_string(f.clone.join("ignored")).unwrap(),
+                "excluded"
+            );
+            assert_no_snapshot_index(&f.clone);
+        }
     }
 
     fn assert_no_snapshot_index(clone: &Path) {
