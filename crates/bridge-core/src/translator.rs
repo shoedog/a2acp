@@ -186,6 +186,12 @@ pub struct PreparedAccountingTurnV1 {
     attribution: crate::accounting::UsageAttributionV1,
 }
 impl PreparedAccountingTurnV1 {
+    /// The coordinator's provider-poll decorator supplies the sole dispatch observation.
+    pub fn with_provider_poll(mut self, observed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.attempt.provider_poll = Some(observed);
+        self
+    }
+
     pub fn attribution(&self) -> &crate::accounting::UsageAttributionV1 {
         &self.attribution
     }

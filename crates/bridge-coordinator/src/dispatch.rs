@@ -10,12 +10,31 @@ use tokio::sync::Mutex;
 
 use crate::session_manager::{ExpiryClaim, SessionManager, WarmExpiryIntent};
 
+pub struct ColdAbortControl {
+    pub token: tokio_util::sync::CancellationToken,
+    pub first_poll: Arc<Mutex<()>>,
+}
+impl ColdAbortControl {
+    pub fn new(token: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            token,
+            first_poll: Arc::new(Mutex::new(())),
+        }
+    }
+    pub async fn cancel(&self) {
+        let _permit = self.first_poll.lock().await;
+        self.token.cancel();
+    }
+}
+
 /// A task's binding to its resolved registry instance, created on the FIRST local
 /// message. Holds the backend driving the task, the effective config applied to its
 /// session, and the registry [`Lease`] keeping the slot alive for the task's
 /// lifetime. Eviction removes the map's lease reference; active holders retain
 /// the slot and configuration stash until their backend work finishes.
 pub struct TaskBinding {
+    /// Retained cancellation for replay-eligible cold turns; legacy bindings keep None.
+    pub abort: Option<Arc<ColdAbortControl>>,
     /// Opaque backend session identity owned by this cold binding incarnation.
     pub session: SessionId,
     pub agent: bridge_core::ids::AgentId,

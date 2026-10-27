@@ -84,15 +84,76 @@ type ProviderLeg = (
     Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
     Arc<dyn TerminalEvidenceSink>,
 );
-struct ProviderPollBackend {
+type ProviderPollPermit = Option<tokio::sync::OwnedMutexGuard<()>>;
+type ProviderPollGuard = Arc<dyn Fn() -> Result<ProviderPollPermit, BridgeError> + Send + Sync>;
+pub struct ProviderPollBackend {
+    guard: std::sync::Mutex<Option<ProviderPollGuard>>,
     inner: Arc<dyn AgentBackend>,
     observed: Arc<AtomicBool>,
     pending: std::sync::Mutex<Option<Box<dyn FnOnce() -> ProviderLeg + Send>>>,
     leg: std::sync::OnceLock<ProviderLeg>,
+    served_binding: Option<(EvidenceCapability, TurnEvidenceBinding)>,
     evidence: Arc<dyn TerminalEvidenceSink>,
     effects: Arc<AtomicBool>,
 }
 impl ProviderPollBackend {
+    pub fn set_poll_guard(&self, guard: ProviderPollGuard) {
+        *self.guard.lock().unwrap() = Some(guard);
+    }
+    pub fn poll_observation(&self) -> Arc<AtomicBool> {
+        self.observed.clone()
+    }
+    fn validate(&self) -> Result<ProviderPollPermit, BridgeError> {
+        self.guard
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(Ok(None), |guard| guard())
+    }
+    pub fn resolve_terminal(&self) -> Option<TerminalResolution> {
+        if !self.observed() || self.capability() != EvidenceCapability::V1 {
+            return None;
+        }
+        self.close();
+        let (completeness, producer, final_presence, drained) = self.observation();
+        Some(resolve_terminal(TerminalObservation {
+            capability: self.capability(),
+            completeness,
+            producer,
+            final_presence,
+            prompt_rpc: PromptRpcObservation::Resolved,
+            ordered_notifications_drained: drained,
+            deliverable_final_present: self.deliverable_final_present(),
+            child_liveness: self.child_liveness(),
+        }))
+    }
+
+    pub fn observed(&self) -> bool {
+        self.observed.load(Ordering::Acquire)
+    }
+    pub fn retain_replay_effects(&self, failure: &mut AccountingFailureV1) {
+        if self.effects.load(Ordering::Relaxed) {
+            failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
+        }
+    }
+    async fn poll_provider<F>(&self, future: F) -> Result<BackendStream, BridgeError>
+    where
+        F: std::future::Future<Output = Result<BackendStream, BridgeError>> + Send,
+    {
+        let permit = self.validate()?;
+        self.observe();
+        let mut future = Box::pin(future);
+        let first = futures::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx))
+        })
+        .await;
+        drop(permit); // No yielding await holds the cancellation permit.
+        match first {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => future.await,
+        }
+    }
+
     fn observe(&self) {
         if !self.observed.swap(true, Ordering::AcqRel) {
             if let Some(register) = self.pending.lock().unwrap().take() {
@@ -114,8 +175,7 @@ impl AgentBackend for ProviderPollBackend {
         session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
-        self.observe();
-        self.inner.prompt(session, parts).await
+        self.poll_provider(self.inner.prompt(session, parts)).await
     }
     async fn prompt_with_observers(
         &self,
@@ -123,20 +183,22 @@ impl AgentBackend for ProviderPollBackend {
         parts: Vec<Part>,
         mut observers: BackendObservers,
     ) -> Result<BackendStream, BridgeError> {
-        self.observe();
-        if let Some((activity, sink)) = self.leg.get() {
-            // Preserve the source recorder when no multi-provider leg is armed.
-            observers.activity = Arc::new(ReplayActivity {
-                inner: activity.clone(),
-                effects: self.effects.clone(),
-            });
-            observers.terminal_evidence = sink.clone();
-        } else {
-            observers.terminal_evidence = self.evidence.clone();
-        }
-        self.inner
-            .prompt_with_observers(session, parts, observers)
-            .await
+        self.poll_provider(async {
+            if let Some((activity, sink)) = self.leg.get() {
+                // Preserve the source recorder when no multi-provider leg is armed.
+                observers.activity = Arc::new(ReplayActivity {
+                    inner: activity.clone(),
+                    effects: self.effects.clone(),
+                });
+                observers.terminal_evidence = sink.clone();
+            } else {
+                observers.terminal_evidence = self.evidence.clone();
+            }
+            self.inner
+                .prompt_with_observers(session, parts, observers)
+                .await
+        })
+        .await
     }
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
         self.inner.cancel(session).await
@@ -405,6 +467,53 @@ impl DirectAttemptHandle {
         Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
     ) {
         self.barrier.multi_provider_leg(capability, binding)
+    }
+
+    /// Served unary uses the same actual-provider-poll authority as MCP.
+    pub fn served_provider_observation(
+        &self,
+        backend: Arc<dyn AgentBackend>,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<
+        (
+            Arc<ProviderPollBackend>,
+            Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+        ),
+        BridgeError,
+    > {
+        let binding = self.multi_provider_leg_binding(0, session, turn)?;
+        let capability = backend.terminal_evidence_capability();
+        let effects = Arc::new(AtomicBool::new(false));
+        let activity = Arc::new(ReplayActivity {
+            inner: self.activity_recorder(),
+            effects: effects.clone(),
+        });
+        Ok((
+            Arc::new(ProviderPollBackend {
+                guard: Default::default(),
+                inner: backend,
+                observed: Default::default(),
+                pending: Default::default(),
+                served_binding: Some((capability, binding)),
+                leg: Default::default(),
+                evidence: self.terminal_evidence_sink(),
+                effects,
+            }),
+            activity,
+        ))
+    }
+
+    pub fn retain_provider_resolution(&mut self, resolution: TerminalResolution) {
+        self.barrier_mut().retain_provider_resolution(resolution);
+    }
+
+    pub fn arm_served_provider(&self, backend: &ProviderPollBackend) {
+        let (capability, binding) = backend.served_binding.clone().unwrap();
+        let barrier = self.barrier.clone();
+        *backend.pending.lock().unwrap() = Some(Box::new(move || {
+            barrier.multi_provider_leg(capability, Some(binding))
+        }));
     }
 
     pub fn multi_provider_leg_dispatch_observer(
@@ -883,12 +992,56 @@ impl Coordinator {
         self
     }
 
-    fn bind_fallback_candidate(
+    /// Caller must also exclude retained contexts and existing task/session state.
+    pub fn freeze_direct_fallback(
+        &self,
+        agent: &AgentId,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<bridge_core::fallback_runtime::FrozenFallbackInvocationV1> {
+        if self.has_budget_policy() || !self.registry.supports_admitted_resolution() {
+            return None;
+        }
+        let source = self
+            .mcp_fallback
+            .iter()
+            .find(|c| &c.source.agent == agent)
+            .and_then(|c| self.bind_fallback_candidate(&c.source, overrides, cwd))?;
+        bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(
+            self.mcp_fallback.clone(),
+            source,
+        )
+    }
+
+    pub fn bind_fallback_candidate(
         &self,
         declared: &bridge_core::routing::FallbackCandidateV1,
         overrides: &AgentOverride,
         cwd: Option<&SessionCwd>,
     ) -> Option<bridge_core::routing::FallbackCandidateV1> {
+        self.bind_fallback_entry(declared, overrides, cwd)
+            .map(|(_, effective)| effective)
+    }
+    pub fn admit_served_candidate(
+        &self,
+        declared: &bridge_core::routing::FallbackCandidateV1,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<Arc<bridge_core::domain::AgentEntry>> {
+        self.bind_fallback_entry(declared, overrides, cwd)
+            .filter(|(_, effective)| effective == declared)
+            .map(|(entry, _)| entry)
+    }
+
+    fn bind_fallback_entry(
+        &self,
+        declared: &bridge_core::routing::FallbackCandidateV1,
+        overrides: &AgentOverride,
+        cwd: Option<&SessionCwd>,
+    ) -> Option<(
+        Arc<bridge_core::domain::AgentEntry>,
+        bridge_core::routing::FallbackCandidateV1,
+    )> {
         let frozen = self.fallback_entries.get(&declared.agent)?;
         let current = self.registry.entry_snapshot(&declared.agent)?;
         // Refuse authority drift since composition, without resolving the adapter.
@@ -914,7 +1067,7 @@ impl Coordinator {
         if let Some(cwd) = cwd {
             effective.posture.session_cwd = cwd.as_str().to_string();
         }
-        Some(effective)
+        Some((current, effective))
     }
 
     pub async fn prepare_usage(
@@ -1967,9 +2120,11 @@ impl Coordinator {
             effects: Arc::new(AtomicBool::new(false)),
         });
         let backend = Arc::new(ProviderPollBackend {
+            guard: Default::default(),
             inner: turn.backend.clone(),
             observed,
             pending: std::sync::Mutex::new(None),
+            served_binding: None,
             leg: std::sync::OnceLock::new(),
             evidence: terminal_evidence,
             effects: replay_activity.effects.clone(),
@@ -2183,31 +2338,16 @@ impl Coordinator {
                 TurnOutcome::Failed(_) => ("failed", "prompt_failed", true),
             };
             // Resolve this provider's contract before the attempt-wide count projection.
-            let leg_resolution = if attempt.fallback_pending
-                && terminal_evidence.capability()
-                    == bridge_core::terminal_evidence::EvidenceCapability::V1
-            {
-                use bridge_core::terminal_evidence::*;
-                terminal_evidence.close();
-                let (completeness, producer, final_presence, drained) =
-                    terminal_evidence.observation();
-                let resolved = resolve_terminal(TerminalObservation {
-                    capability: terminal_evidence.capability(),
-                    completeness,
-                    producer,
-                    final_presence,
-                    prompt_rpc: PromptRpcObservation::Resolved,
-                    ordered_notifications_drained: drained,
-                    deliverable_final_present: terminal_evidence.deliverable_final_present(),
-                    child_liveness: terminal_evidence.child_liveness(),
-                });
+            let leg_resolution = attempt
+                .fallback_pending
+                .then(|| backend.resolve_terminal())
+                .flatten();
+            if let Some(resolved) = leg_resolution {
+                attempt.retain_provider_resolution(resolved);
                 terminal_outcome = resolved.outcome.as_str();
                 terminal_reason = resolved.reason.as_str();
                 degraded |= terminal_outcome != "completed";
-                Some(resolved)
-            } else {
-                None
-            };
+            }
             let terminal = attempt
                 .finish_resolved(terminal_outcome, terminal_reason, degraded, "complete")
                 .await?;

@@ -1490,6 +1490,15 @@ fn turn_log_observer_enabled(
     traces_cfg.enabled || (metrics_cfg.enabled && metrics_cfg.turn_log)
 }
 
+fn build_served_coordinator(
+    cfg: &RegistryConfig,
+    assemble: impl FnOnce(
+        Vec<bridge_core::routing::FrozenFallbackChainV1>,
+    ) -> Arc<bridge_coordinator::Coordinator>,
+) -> Result<Arc<bridge_coordinator::Coordinator>, config::ConfigError> {
+    Ok(assemble(cfg.fallback_chains_v1()?))
+}
+
 /// #10 slice 7 (refinement b): the ONE Coordinator construction shape, shared by the
 /// `serve` and `mcp` entry points. They differ ONLY in `allowed_cwd_root` — serve passes
 /// `None` (the wire cwd-gate stays on the adapter's `Option<String>` root; wiring the real
@@ -11540,30 +11549,31 @@ async fn main() -> Result<(), BoxError> {
         &[],
         &[],
     )?;
-    let coordinator = build_coordinator(
-        Vec::new(), // Served paths remain inactive until C2b3.
-        budget_policy.clone(),
-        billing,
-        session_manager,
-        executor,
-        wf_map,
-        task_store,
-        Arc::clone(&session_store),
-        Arc::clone(&policy),
-        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
-        clock,
-        None,
-        batch,
-        Arc::clone(&observer),
-        resume_cap,
-        traces_cfg.enabled,
-        traces_cfg.max_task_turns,
-        workflow_history,
-        workflow_admission,
-        Arc::clone(&perm_registry),
-        warm_ttl,
-    );
-
+    let coordinator = build_served_coordinator(&cfg, |chains| {
+        build_coordinator(
+            chains,
+            budget_policy.clone(),
+            billing,
+            session_manager,
+            executor,
+            wf_map,
+            task_store,
+            Arc::clone(&session_store),
+            Arc::clone(&policy),
+            Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+            clock,
+            None,
+            batch,
+            Arc::clone(&observer),
+            resume_cap,
+            traces_cfg.enabled,
+            traces_cfg.max_task_turns,
+            workflow_history,
+            workflow_admission,
+            Arc::clone(&perm_registry),
+            warm_ttl,
+        )
+    })?;
     // The inbound server is a thin adapter over the ONE Coordinator (#10 slice 7):
     // the Coordinator owns the registry/policy/stores/session-manager/workflow maps/
     // batch; the adapter keeps only wire state (route/auth/base_url/delegation/label/
@@ -20891,5 +20901,156 @@ cmd = "cargo build --locked"
         super::apply_warm_writer_env(&mut cold_cmd, &mut cold_args, Some(&p), None);
         assert_eq!(cold_cmd, "codex-acp");
         assert_eq!(cold_args, vec!["--flag"]);
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/fallback_direct.rs"]
+mod fallback_billing_fixture;
+#[cfg(test)]
+#[tokio::test]
+async fn production_billing_per_visited_candidate() {
+    use bridge_core::{ids::AttemptIdentity, routing::BillingModeV1, task_store::TaskStore};
+    for (surface, target, mapped) in [
+        ("SendMessage", "success", true),
+        ("Mcp", "success", true),
+        ("SendMessage", "setup", true),
+        ("SendMessage", "success", false),
+    ] {
+        let identities: Vec<_> = ["source", "target"]
+            .into_iter()
+            .filter(|name| mapped || *name == "source")
+            .map(|name| bridge_core::routing::BillingIdentityV1 {
+                agent: bridge_core::ids::AgentId::parse(name).unwrap(),
+                effective_model: "shared".into(),
+                account_group: name.into(),
+                billing_mode: if name == "source" {
+                    BillingModeV1::Metered
+                } else {
+                    BillingModeV1::Subscription
+                },
+            })
+            .collect();
+        let billing = Arc::new(config::BillingProviderV1::new(identities.clone()));
+        let mut f = fallback_billing_fixture::Fixture::with_billing(
+            "shared-reject",
+            target,
+            false,
+            false,
+            false,
+            billing.clone(),
+        );
+        let agents = ["source", "target", "last"]
+            .map(|id| {
+                format!(
+                    "[[agents]]\nid={id:?}\ncmd=\"test-cmd\"\nmodel=\"shared\"\ncwd={:?}\n",
+                    f.dir.path().join("scope").to_str().unwrap()
+                )
+            })
+            .join("");
+        let cfg = RegistryConfig::parse(&format!("default=\"source\"\n{agents}[registry]\nallowed_cmds=[\"test-cmd\"]\n[[routing.chains]]\nid=\"capacity\"\nsource={{agent=\"source\",model=\"shared\"}}\ncauses=[\"quota_exhausted\"]\nsteps=[{{agent=\"target\",model=\"shared\"}},{{agent=\"last\",model=\"shared\"}}]\n[server]\n")).unwrap();
+        let registry = f.coordinator.registry();
+        let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+            registry.clone(),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse(f.dir.path().to_str().unwrap()).unwrap(),
+            None,
+        ));
+        f.coordinator = build_served_coordinator(&cfg, |chains| {
+            build_coordinator(
+                chains,
+                None,
+                billing.clone(),
+                f.coordinator.session_manager.clone(),
+                Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
+                    registry.clone(),
+                )),
+                Default::default(),
+                f.store.clone(),
+                f.store.clone(),
+                f.coordinator.policy(),
+                registry,
+                Arc::new(bridge_coordinator::clock::SystemClock),
+                None,
+                None,
+                Arc::new(bridge_observ::NoopObserver),
+                3,
+                false,
+                512,
+                Ok(f.store.clone()),
+                admission,
+                PermissionRegistry::new(),
+                60,
+            )
+        })
+        .unwrap();
+        let owner = AttemptIdentity::initial().unwrap();
+        let call = async {
+            if surface == "Mcp" {
+                f.call("run", None).await.to_string()
+            } else {
+                f.served(surface, &owner, None).await
+            }
+        };
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            _ = f.providers[0].cleanup.0.notified() => {},
+            body = &mut call => panic!("returned before cleanup: {body}"),
+        }
+        assert_eq!(f.rows().len(), 1);
+        // Reload the source mapping after its attempt start; the persisted identity is frozen.
+        let registry = f.coordinator.registry();
+        let mut changed = identities;
+        changed[0].account_group = "changed".into();
+        let mut snapshot = f.snapshot();
+        snapshot.billing_identities = changed;
+        billing.apply(registry.as_ref(), snapshot).await.unwrap();
+        f.providers[0].cleanup.1.notify_one();
+        let body = call.await;
+        assert_eq!(body.contains("answer"), target == "success", "{body}");
+        let rows = f.rows();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+        for row in &rows {
+            assert_eq!(row.attribution.effective_model.as_deref(), Some("shared"));
+            let name = row.attribution.agent.as_str();
+            assert_eq!(row.dispatched, name == "source" || target == "success");
+            assert_eq!(
+                row.attribution
+                    .billing
+                    .as_ref()
+                    .map(|b| b.account_group.as_str()),
+                (name == "source" || mapped).then_some(name)
+            );
+            if name == "target" && mapped {
+                assert_eq!(
+                    row.attribution.billing.as_ref().unwrap().billing_mode,
+                    "subscription"
+                );
+            }
+        }
+        let reopened = bridge_store::sqlite::SqliteStore::open_history_read_only(
+            &f.dir.path().join("tasks.sqlite"),
+        )
+        .unwrap();
+        let summary = reopened
+            .usage_summary_v1(&Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            summary
+                .buckets
+                .iter()
+                .map(|b| b.total_tokens.reported_sum)
+                .sum::<u64>(),
+            if target == "success" { 15 } else { 0 }
+        );
+        assert_eq!(
+            f.providers[2]
+                .setup
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }

@@ -1078,6 +1078,7 @@ async fn route_matrix_exactly_once() {
                     f.coordinator.bindings().lock().await.insert(
                         TaskId::parse(identity.execution_id.as_str()).unwrap(),
                         bridge_coordinator::dispatch::TaskBinding {
+                            abort: Default::default(),
                             session: SessionId::parse("control").unwrap(),
                             agent: resolved.entry.id.clone(),
                             backend: resolved.backend,
