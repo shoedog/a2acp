@@ -6086,6 +6086,65 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         Ok(seq)
     }
 
+    async fn complete_candidate_v1(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        expected: &bridge_core::task_store::CandidateProgressV1,
+        next: &bridge_core::task_store::CandidateProgressV1,
+        operation: &OperationId,
+        ts: i64,
+    ) -> Result<bridge_core::task_store::CandidatePublicationV1, BridgeError> {
+        use bridge_core::task_store::CandidatePublicationV1;
+        next.validate()?;
+        let output = next
+            .terminal
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let bytes = serde_json::to_string(next).map_err(|_| BridgeError::StoreFailure)?;
+        self.with_usage_conn(|usage| {
+            let usage = immediate_transaction(usage)?;
+            let conn = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
+            let tx = immediate_transaction(&conn)?;
+            let stored: String = tx.query_row(
+                "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+                rusqlite::params![task.as_str(), node.as_str()], |r| r.get(0),
+            ).map_err(|_| BridgeError::StoreFailure)?;
+            let old = serde_json::from_str(&stored).map_err(|_| BridgeError::StoreFailure)?;
+            candidate_evidence_v1(&tx, &usage, task, node, &old)?;
+            if old == *next { return Ok(CandidatePublicationV1::Replayed); }
+            if old != *expected { return Err(BridgeError::InvalidStateTransition); }
+            next.follows(&old)?;
+            if next.visits != expected.visits { return Err(BridgeError::InvalidStateTransition); }
+            let seq: i64 = tx.query_row(
+                "UPDATE tasks SET last_event_seq=last_event_seq+1,
+                 last_artifact_ms=MAX(COALESCE(last_artifact_ms,?2),?2) WHERE id=?1 RETURNING last_event_seq",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())], |r| r.get(0),
+            ).map_err(|_| BridgeError::StoreFailure)?;
+            let usage_json = output.usage.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|_| BridgeError::StoreFailure)?;
+            tx.execute(
+                "INSERT INTO task_node_checkpoints(task_id,node_id,output,ok,ts,seq,usage_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![task.as_str(),node.as_str(),output.output,i64::from(output.ok),ts,seq,usage_json],
+            ).map_err(|_| BridgeError::StoreFailure)?;
+            tx.execute("DELETE FROM task_node_starts WHERE task_id=?1 AND node_id=?2",
+                rusqlite::params![task.as_str(),node.as_str()]).map_err(|_| BridgeError::StoreFailure)?;
+            insert_journal_event(&tx, task, &bridge_core::orch::OrchEvent {
+                v: bridge_core::orch::ORCH_V, seq, ts_ms: ts, operation_id: operation.clone(),
+                session: None, source: None,
+                kind: bridge_core::orch::OrchEventKind::NodeFinished {
+                    node: node.as_str().into(), ok: output.ok, output: output.output.clone(),
+                    usage: output.usage.clone(), terminal_json: None, policy_trigger_json: None,
+                },
+            })?;
+            tx.execute("UPDATE task_candidate_progress_v1 SET progress_json=?3 WHERE task_id=?1 AND node_id=?2",
+                rusqlite::params![task.as_str(),node.as_str(),bytes]).map_err(|_| BridgeError::StoreFailure)?;
+            candidate_evidence_v1(&tx, &usage, task, node, next)?;
+            tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+            Ok(CandidatePublicationV1::Applied)
+        })
+    }
+
     async fn candidate_progress_v1(
         &self,
         task: &TaskId,
@@ -19265,6 +19324,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_candidate_atomic_completion() {
+        use bridge_core::task_store::{CandidateOutputV1, CandidatePublicationV1};
+        let (dir, store, task, node, progress) = candidate_prerequisite_fixture().await;
+        let mut completed = progress.clone();
+        completed.terminal = Some(CandidateOutputV1 {
+            output: "quota".into(),
+            ok: false,
+            usage: Some(Default::default()),
+        });
+        store.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE ON task_candidate_progress_v1 BEGIN SELECT RAISE(ABORT,'publication fault'); END;").unwrap();
+        let op = OperationId::parse("finish").unwrap();
+        assert!(store
+            .complete_candidate_v1(&task, &node, &progress, &completed, &op, 2)
+            .await
+            .is_err());
+        drop(store);
+        let store = SqliteStore::open(&dir.path().join("progress.db")).unwrap();
+        assert_eq!(
+            store.candidate_progress_v1(&task, &node).await.unwrap(),
+            Some(progress.clone())
+        );
+        assert!(store.node_checkpoints(&task).await.unwrap().is_empty());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_completion")
+            .unwrap();
+        for expected in [
+            CandidatePublicationV1::Applied,
+            CandidatePublicationV1::Replayed,
+        ] {
+            assert_eq!(
+                store
+                    .complete_candidate_v1(&task, &node, &progress, &completed, &op, 2)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        drop(store);
+        let store = SqliteStore::open(&dir.path().join("progress.db")).unwrap();
+        assert_eq!(
+            store.candidate_progress_v1(&task, &node).await.unwrap(),
+            Some(completed)
+        );
+        assert_eq!(store.node_checkpoints(&task).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn workflow_candidate_completion_reconciles_checkpoint() {
         use bridge_core::task_store::CandidateOutputV1;
         let (dir, store, task, node, progress) = candidate_prerequisite_fixture().await;
@@ -19413,6 +19522,46 @@ mod tests {
             prepare(replayed);
         }
         assert_eq!(preparations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_duplicate_preparation_publication_replays_without_second_preparation() {
+        use bridge_core::task_store::{CandidatePhaseV1, CandidatePublicationV1};
+        let (dir, store, task, node, progress) = candidate_prerequisite_fixture().await;
+        let mut next = progress.clone();
+        let mut visit = progress.visits[0].clone();
+        visit.position = 1;
+        visit.accounting_id = AttemptId::mint().unwrap().as_str().into();
+        visit.cold_context = ContextId::parse("replay-preparation").unwrap();
+        visit.phase = CandidatePhaseV1::Preparing;
+        visit.rejection = None;
+        next.visits.push(visit);
+        let mut preparations = 0;
+        for expected in [
+            CandidatePublicationV1::Applied,
+            CandidatePublicationV1::Replayed,
+        ] {
+            let publication = store
+                .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+                .await
+                .unwrap();
+            assert_eq!(publication, expected);
+            if publication == CandidatePublicationV1::Applied {
+                preparations += 1;
+            }
+        }
+        assert_eq!(preparations, 1, "replay grants no second preparation");
+        // Inspect raw stored bytes: an unprepared replay is deliberately not recoverable.
+        drop(store);
+        let conn = rusqlite::Connection::open(dir.path().join("progress.db")).unwrap();
+        let stored: String = conn.query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<bridge_core::task_store::CandidateProgressV1>(&stored).unwrap(),
+            next
+        );
     }
 
     #[tokio::test]

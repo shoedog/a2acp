@@ -27,6 +27,7 @@ use bridge_core::execution_policy::{
     PolicyNodeRefV1, PolicyTriggerV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
     SynthesisModeV1, EXECUTION_POLICY_SCHEMA_V1,
 };
+use bridge_core::fallback_runtime::FrozenFallbackInvocationV1;
 use bridge_core::fixed_grace_timer::FixedGraceTimerV1;
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
@@ -45,6 +46,8 @@ use bridge_core::ports::{
 };
 use bridge_core::resource_flight::BoundedRecoveryReasonV1;
 use bridge_core::retained_resource_flight::CleanupDeadlineTransferV1;
+use bridge_core::routing::FallbackCandidateV1;
+use bridge_core::task_store::{CandidateOutputV1, CandidateProgressV1, TaskStore};
 use bridge_core::translator::{AccountingFailureV1, PreparedAccountingTurnV1};
 use bridge_core::turn_liveness::{TurnLivenessRequestV1, TurnLivenessValueV1};
 use bridge_core::SessionCwd;
@@ -1802,10 +1805,218 @@ pub struct WorkflowExecutor {
     preflight_metadata_fault: std::sync::atomic::AtomicBool,
 }
 
+/// Dormant execution boundary for explicitly admitted, cold candidates. No
+/// production scheduler constructs this; activation and recovery belong to later slices.
+#[doc(hidden)]
+pub struct WorkflowCandidateRunV1 {
+    store: Arc<dyn TaskStore>,
+    task: bridge_core::ids::TaskId,
+    node: NodeId,
+    pub progress: CandidateProgressV1,
+    pub before_poll: Option<PromptDispatchBarrier>,
+    routing: Option<FrozenFallbackInvocationV1>,
+    position: usize,
+    preceding: Option<AccountingFailureV1>,
+}
+impl WorkflowCandidateRunV1 {
+    pub fn new(
+        store: Arc<dyn TaskStore>,
+        task: bridge_core::ids::TaskId,
+        node: NodeId,
+        routing: FrozenFallbackInvocationV1,
+    ) -> Self {
+        let progress = routing.progress();
+        Self {
+            store,
+            task,
+            node,
+            progress,
+            routing: Some(routing),
+            position: 0,
+            preceding: None,
+            before_poll: None,
+        }
+    }
+
+    /// The shared transition remains the sole advancement authority. The next
+    /// visit is not prepared until its own exclusive durable publication succeeds.
+    pub fn transition(
+        &mut self,
+        failure: AccountingFailureV1,
+        cancel: &CancellationToken,
+        admit: impl FnOnce(&FallbackCandidateV1) -> Result<FallbackCandidateV1, BridgeError>,
+    ) -> Result<FallbackCandidateV1, AccountingFailureV1> {
+        let routing = self.routing.take().ok_or_else(|| failure.clone())?;
+        let (routing, candidate) =
+            routing.transition(failure.clone(), cancel.is_cancelled(), admit)?;
+        self.routing = Some(routing);
+        self.preceding = Some(failure);
+        self.position += 1;
+        Ok(candidate)
+    }
+
+    async fn publish(&mut self, next: CandidateProgressV1) -> Result<(), BridgeError> {
+        self.store
+            .put_candidate_progress_v1(&self.task, &self.node, Some(&self.progress), &next)
+            .await?;
+        self.progress = next;
+        Ok(())
+    }
+}
+
+// Prompt-only view: lifecycle operations stay with the exact bound backend and lease.
+struct CandidatePollV1 {
+    backend: Arc<dyn AgentBackend>,
+    observed: Arc<std::sync::atomic::AtomicBool>,
+    cancel: CancellationToken,
+    scope: Arc<dyn Fn() -> bool + Send + Sync>,
+    first_poll: Arc<tokio::sync::Mutex<()>>,
+}
+#[async_trait::async_trait]
+impl AgentBackend for CandidatePollV1 {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+        let _ = (session, parts);
+        Err(BridgeError::InvalidStateTransition)
+    }
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observers: BackendObservers,
+    ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+        bridge_core::provider_poll::poll_provider_v1(
+            self.backend
+                .prompt_with_observers(session, parts, observers),
+            &self.observed,
+            || {
+                let permit = self
+                    .first_poll
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| BridgeError::SessionExpired)?;
+                if !(self.scope)() {
+                    return Err(BridgeError::ConfigMismatch {
+                        field: "fallback_scope",
+                    });
+                }
+                // Scope validation may block synchronously. Linearize cancellation
+                // with the first-poll permit only after that validation finishes.
+                if self.cancel.is_cancelled() {
+                    return Err(BridgeError::SessionExpired);
+                }
+                Ok(permit)
+            },
+            || {},
+        )
+        .await
+    }
+    async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
+        self.backend.cancel(session).await
+    }
+}
+
 struct FrozenBoundEntryUse {
     bound: BoundEntryUseV1,
     provider_effect: Arc<BoundProviderEffectV1>,
     config: EffectiveConfig,
+}
+
+// Compare the declaration with the exact entry and effective cwd already bound
+// to this admission, before accounting, resolution or configuration can escape.
+fn candidate_matches_admission(
+    candidate: &FallbackCandidateV1,
+    frozen: &FrozenBoundEntryUse,
+) -> bool {
+    use bridge_core::domain::{AgentKind, EgressPolicy, MountAccess};
+    use bridge_core::mcp::{McpDelivery, McpEnvValueSourceV1};
+    use bridge_core::routing::{CandidatePostureV1, McpPostureV1, SandboxPostureV1};
+    let entry = &frozen.bound.entry;
+    let posture = CandidatePostureV1 {
+        kind: match entry.kind {
+            AgentKind::Acp => "acp",
+            AgentKind::Api => "api",
+            AgentKind::ContainerRw => "container_rw",
+        }
+        .into(),
+        sandbox: entry.sandbox.as_ref().map(|sandbox| {
+            let (egress, network, proxy, no_proxy) = match &sandbox.egress {
+                EgressPolicy::Open => ("open", None, None, None),
+                EgressPolicy::Locked {
+                    network,
+                    proxy,
+                    no_proxy,
+                } => (
+                    "locked",
+                    Some(network.clone()),
+                    Some(proxy.clone()),
+                    no_proxy.clone(),
+                ),
+            };
+            SandboxPostureV1 {
+                runtime: sandbox.runtime().into(),
+                image: sandbox.image.clone(),
+                mount: sandbox.mount.clone(),
+                access: match sandbox.access {
+                    MountAccess::Ro => "ro",
+                    MountAccess::Rw => "rw",
+                }
+                .into(),
+                egress: egress.into(),
+                network,
+                proxy,
+                no_proxy,
+                volumes: sandbox.volumes.clone(),
+            }
+        }),
+        cwd: entry.cwd.clone().unwrap_or_else(|| ".".into()),
+        session_cwd: frozen
+            .provider_effect
+            .frozen()
+            .effect
+            .effective_session_cwd
+            .as_str()
+            .into(),
+        cmd: entry.cmd.clone(),
+        args: entry.args.clone(),
+        mode: frozen.config.mode.clone(),
+        mcp_delivery: match entry.mcp_delivery {
+            McpDelivery::Acp => "acp",
+            McpDelivery::CodexNative => "codex_native",
+            McpDelivery::KiroNative => "kiro_native",
+        }
+        .into(),
+        mcp: entry
+            .mcp
+            .iter()
+            .map(|server| McpPostureV1 {
+                name: server.name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server
+                    .env
+                    .iter()
+                    .map(|(name, source)| {
+                        let (literal, variable) = match source {
+                            McpEnvValueSourceV1::PublicLiteral(value) => {
+                                (Some(value.clone()), None)
+                            }
+                            McpEnvValueSourceV1::SecretFromEnv { variable, .. } => {
+                                (None, Some(variable.clone()))
+                            }
+                        };
+                        (name.clone(), literal, variable)
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    candidate.agent == entry.id
+        && frozen.config.model.as_ref() == Some(&candidate.model)
+        && candidate.posture == posture
 }
 
 struct FrozenAttemptUse {
@@ -2174,6 +2385,343 @@ impl WorkflowExecutor {
             accounting: None,
             #[cfg(test)]
             preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Execute exactly one durable candidate through frozen admission. This seam
+    /// has no scheduler/CLI callers and does not automatically consume a chain.
+    #[doc(hidden)]
+    pub async fn run_durable_candidate_v1(
+        &self,
+        run: &mut WorkflowCandidateRunV1,
+        accounting: &WorkflowAccountingInvocationV1,
+        admitted: &crate::admission::AdmittedWorkflowRunV1,
+        parts: Vec<Part>,
+        cancel: &CancellationToken,
+        mut observers: BackendObservers,
+    ) -> Result<CandidateOutputV1, AccountingFailureV1> {
+        use bridge_core::attempt_activity::AttemptRecorder;
+        use bridge_core::task_store::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let observed = Arc::new(AtomicBool::new(false));
+        let persistence = |error: BridgeError| AccountingFailureV1 {
+            persistence: Some(error.clone()),
+            ..error.into()
+        };
+        let result = async {
+            if run
+                .progress
+                .visits
+                .last()
+                .is_some_and(|visit| visit.position >= run.position)
+            {
+                return Err(BridgeError::InvalidStateTransition.into());
+            }
+            admitted
+                .run_spec
+                .validate()
+                .map_err(|_| BridgeError::InvalidStateTransition)?;
+            let node = admitted
+                .run_spec
+                .graph
+                .nodes
+                .iter()
+                .find(|n| n.id == run.node)
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            let candidate = if run.position == 0 {
+                &run.progress.source
+            } else {
+                &run.progress.chains[run
+                    .routing
+                    .as_ref()
+                    .ok_or(BridgeError::InvalidStateTransition)?
+                    .progress()
+                    .selected_chain
+                    .ok_or(BridgeError::InvalidStateTransition)?]
+                .steps[run.position - 1]
+            };
+            let authority = FrozenWorkflowAuthority {
+                run_spec: admitted.run_spec.clone(),
+                provider_effect_key: admitted.provider_effect_key.clone(),
+                r2f1b: admitted.r2f1b.clone(),
+            };
+            let frozen = self.bind_frozen_entry(
+                &authority,
+                node,
+                FrozenProviderLogicalSessionV1::Execute {
+                    candidate_ordinal: 0,
+                },
+            )?;
+            if !candidate_matches_admission(candidate, &frozen) {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "fallback_candidate",
+                }
+                .into());
+            }
+            if cancel.is_cancelled() {
+                return Err(AccountingFailureV1::canceled_before_prompt());
+            }
+            let selection = accounting.select(&node.id, &node.agent, "node", &frozen.config)?;
+            if selection.selection().owner.attempt_id != admitted.run_spec.attempt_id {
+                return Err(BridgeError::InvalidStateTransition.into());
+            }
+            let context = ContextId::parse(bridge_core::ids::AttemptId::mint()?.as_str())?;
+            let session = SessionId::parse(context.as_str())?;
+            let selected_chain = run
+                .routing
+                .as_ref()
+                .ok_or(BridgeError::InvalidStateTransition)?
+                .progress()
+                .selected_chain;
+            let mut prepared = Some(
+                selection
+                    .prepare_candidate(
+                        &*run.store,
+                        &run.task,
+                        &run.node,
+                        &mut run.progress,
+                        selected_chain,
+                        run.position,
+                        context,
+                    )
+                    .await?,
+            );
+            let effects =
+                Arc::new(bridge_core::attempt_activity::ReplayEffectRecorderV1::default());
+            let first_poll = Arc::new(tokio::sync::Mutex::new(()));
+            let cancellation_failure = || {
+                if observed.load(Ordering::Acquire) {
+                    AccountingFailureV1::from(BridgeError::SessionExpired)
+                } else {
+                    AccountingFailureV1::canceled_before_prompt()
+                }
+            };
+            observers.activity = effects.clone();
+            let scope = run
+                .routing
+                .as_ref()
+                .ok_or(BridgeError::InvalidStateTransition)?
+                .scope_guard();
+            let mut current = None;
+            let result: Result<_, AccountingFailureV1> = async {
+                // Resolution is joined even after cancellation: its returned backend
+                // and binding retain cleanup ownership of this exact cold incarnation.
+                let resolved = self
+                    .resolve_frozen_entry(frozen, observers.diagnostic.clone())
+                    .await
+                    .map_err(|(error, _)| error)?;
+                current = Some(WorkflowAttemptUse::Bound(resolved));
+                let attempt = current.as_ref().unwrap();
+                if cancel.is_cancelled() {
+                    return Err(AccountingFailureV1::canceled_before_prompt());
+                }
+                attempt.configure_session(&session, None).await?;
+                attempt
+                    .backend()
+                    .configure_turn(
+                        &session,
+                        TurnMeta {
+                            context_id: ContextId::parse(session.as_str())?,
+                            generation: run.progress.visits.len() as u64,
+                            op: OperationId::parse(session.as_str())?,
+                            turn_id: bridge_core::ids::TurnId::parse(
+                                run.progress.visits.last().unwrap().accounting_id.clone(),
+                            )?,
+                            requested_mode: HarvestSanitizationMode::default(),
+                            prefix_attestation_request: Default::default(),
+                            liveness: Default::default(),
+                        },
+                    )
+                    .await;
+                let mut next = run.progress.clone();
+                next.visits.last_mut().unwrap().phase = CandidatePhaseV1::Prepared;
+                run.publish(next).await.map_err(persistence)?;
+                if cancel.is_cancelled() {
+                    return Err(AccountingFailureV1::canceled_before_prompt());
+                }
+                let mut next = run.progress.clone();
+                next.visits.last_mut().unwrap().phase = CandidatePhaseV1::PollFenced;
+                run.publish(next).await.map_err(persistence)?;
+                if let Some(barrier) = &run.before_poll {
+                    barrier().await;
+                }
+                let backend = Arc::new(CandidatePollV1 {
+                    backend: attempt.backend().clone(),
+                    observed: observed.clone(),
+                    cancel: cancel.clone(),
+                    scope,
+                    first_poll: first_poll.clone(),
+                });
+                let prompt = bridge_core::accounting_backend::AccountingBackendV1::new(backend);
+                let opening = prompt.prompt_prepared_v1(
+                    &session,
+                    parts,
+                    prepared
+                        .take()
+                        .unwrap()
+                        .with_provider_poll(observed.clone())
+                        .into_attempt(),
+                    Some(observers.clone()),
+                );
+                tokio::pin!(opening);
+                let opened = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _permit = first_poll.lock().await;
+                        Err(cancellation_failure())
+                    },
+                    result = &mut opening => result,
+                };
+                if observed.load(Ordering::Acquire) {
+                    let mut next = run.progress.clone();
+                    next.visits.last_mut().unwrap().phase = CandidatePhaseV1::Polled;
+                    if let Err(error) = run.publish(next).await {
+                        let mut failure = opened.err().unwrap_or_else(|| error.clone().into());
+                        failure.persistence = Some(error);
+                        return Err(failure);
+                    }
+                }
+                let mut stream = opened?;
+                let mut output = CandidateOutputV1 {
+                    output: String::new(),
+                    ok: true,
+                    usage: None,
+                };
+                loop {
+                    let item = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(cancellation_failure()),
+                        item = stream.next() => item,
+                    };
+                    match item {
+                        Some(Ok(Update::Text(text) | Update::FinalAnswer(text))) => {
+                            effects.record(AttemptPhase::Provider, ActivityReason::MessageDelta, 1);
+                            output.output.push_str(&text);
+                        }
+                        Some(Ok(Update::Usage(mut usage))) => {
+                            if let Some(previous) = &output.usage {
+                                usage.merge_missing_from(previous);
+                            }
+                            output.usage = Some(usage);
+                        }
+                        Some(Ok(Update::Done { stop_reason, .. }))
+                            if stop_reason != STOP_REASON_CANCELLED =>
+                        {
+                            return Ok(output)
+                        }
+                        Some(Ok(Update::Done { .. })) => {
+                            cancel.cancel();
+                            return Err(cancellation_failure());
+                        }
+                        Some(Ok(_)) => {
+                            effects.record(AttemptPhase::Provider, ActivityReason::MessageDelta, 1);
+                        }
+                        Some(Err(error)) => return Err(error.into()),
+                        None => return Err(BridgeError::MissingTerminal.into()),
+                    }
+                }
+            }
+            .await;
+            let cleanup = if let Some(current) = &current {
+                if cancel.is_cancelled() || result.is_err() {
+                    preserve_checkout_before_signal(
+                        current.backend(),
+                        &run.node,
+                        &session,
+                        if cancel.is_cancelled() {
+                            ColdExitV1::Cancellation
+                        } else {
+                            ColdExitV1::Failure
+                        },
+                    )
+                    .await;
+                    let _ = current
+                        .backend()
+                        .cancel_observed(&session, observers.diagnostic.clone())
+                        .await;
+                }
+                current
+                    .backend()
+                    .release_session_observed(&session, observers.diagnostic.clone())
+                    .await
+            } else {
+                Ok(BackendCleanupDispositionV1::Complete)
+            };
+            match result {
+                Ok(output) if !cancel.is_cancelled() => {
+                    if cleanup != Ok(BackendCleanupDispositionV1::Complete) {
+                        return Err(BridgeError::StoreFailure.into());
+                    }
+                    let mut next = run.progress.clone();
+                    next.terminal = Some(output.clone());
+                    run.store
+                        .complete_candidate_v1(
+                            &run.task,
+                            &run.node,
+                            &run.progress,
+                            &next,
+                            &OperationId::parse(format!("candidate-{}", session.as_str()))?,
+                            bridge_core::task_store::system_wall_now_ms(),
+                        )
+                        .await
+                        .map_err(persistence)?;
+                    run.progress = next;
+                    Ok(output)
+                }
+                result => {
+                    let mut failure = result
+                        .err()
+                        .unwrap_or_else(cancellation_failure)
+                        .settle(prepared)
+                        .await
+                        .with_checked_cleanup(cleanup);
+                    if effects.has_effects() {
+                        failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
+                    }
+                    if let BridgeError::AgentFailure { diagnostic } = &failure.original {
+                        let mut next = run.progress.clone();
+                        next.visits.last_mut().unwrap().rejection = Some(CandidateRejectionV1 {
+                            diagnostic: diagnostic.clone(),
+                            non_acceptance: failure.replay.prompt_acceptance
+                                == bridge_core::routing::ExclusionEvidenceV1::Excluded,
+                            no_effects: failure.replay.effects
+                                == bridge_core::routing::ExclusionEvidenceV1::Excluded,
+                            cleanup_complete: failure.replay.cleanup_completed,
+                            persistence_error: failure.persistence.as_ref().map(|_| {
+                                ep::BoundedReasonV1::parse("candidate persistence failed").unwrap()
+                            }),
+                            canceled: cancel.is_cancelled(),
+                        });
+                        if let Err(error) = run.publish(next).await {
+                            failure.persistence = Some(error);
+                        }
+                    }
+                    Err(failure)
+                }
+            }
+        }
+        .await;
+        if let Err(mut failure) = result {
+            if cancel.is_cancelled() {
+                failure.preparation_exit =
+                    bridge_core::translator::AccountingPreparationExitV1::Canceled;
+            }
+            if !observed.load(Ordering::Acquire) {
+                // An earlier provider diagnostic remains authoritative, but its
+                // replay permission cannot authorize advancement past this visit.
+                run.routing = None;
+                if let Some(preceding) = run.preceding.take() {
+                    failure.original = preceding.original;
+                    failure.persistence = failure.persistence.or(preceding.persistence);
+                    failure.replay = Default::default();
+                }
+            }
+            if failure.persistence.is_some() || cancel.is_cancelled() {
+                run.routing = None;
+            }
+            Err(failure)
+        } else {
+            result
         }
     }
 
@@ -18505,5 +19053,70 @@ mod accounting_settlement_regression {
         );
         assert_eq!(failure.cleanup, BackendCleanupDispositionV1::Unknown);
         assert!(PreflightFailure::Accounting(failure).retain_in_run_cache());
+    }
+}
+
+#[cfg(test)]
+mod candidate_poll_regression {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct CountingProvider(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl AgentBackend for CountingProvider {
+        async fn prompt(
+            &self,
+            _: &SessionId,
+            _: Vec<Part>,
+        ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::ModelNotAvailable)
+        }
+        async fn cancel(&self, _: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_scope_validation_never_polls_provider() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let release = gate.clone();
+        let thread = std::thread::spawn(move || {
+            release.wait();
+            stop.cancel();
+            release.wait();
+        });
+        let observed = Arc::new(AtomicBool::new(false));
+        let backend = CandidatePollV1 {
+            backend: Arc::new(CountingProvider(polls.clone())),
+            observed: observed.clone(),
+            cancel,
+            first_poll: Arc::new(tokio::sync::Mutex::new(())),
+            scope: Arc::new(move || {
+                gate.wait();
+                gate.wait();
+                true
+            }),
+        };
+        let result = backend
+            .prompt_with_observers(
+                &SessionId::parse("scope-cancel").unwrap(),
+                vec![],
+                BackendObservers::diagnostic_only(Arc::new(
+                    bridge_core::diagnostics::NoopDiagnosticObserver::default(),
+                )),
+            )
+            .await;
+        thread.join().unwrap();
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "canceled scope validation dispatched a provider poll"
+        );
+        assert!(!observed.load(Ordering::SeqCst));
+        assert!(matches!(result, Err(BridgeError::SessionExpired)));
     }
 }
