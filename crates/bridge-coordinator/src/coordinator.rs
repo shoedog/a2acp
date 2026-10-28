@@ -140,26 +140,17 @@ impl ProviderPollBackend {
     where
         F: std::future::Future<Output = Result<BackendStream, BridgeError>> + Send,
     {
-        let permit = self.validate()?;
-        self.observe();
-        let mut future = Box::pin(future);
-        let first = futures::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx))
-        })
-        .await;
-        drop(permit); // No yielding await holds the cancellation permit.
-        match first {
-            std::task::Poll::Ready(result) => result,
-            std::task::Poll::Pending => future.await,
-        }
-    }
-
-    fn observe(&self) {
-        if !self.observed.swap(true, Ordering::AcqRel) {
-            if let Some(register) = self.pending.lock().unwrap().take() {
-                let _ = self.leg.set(register());
-            }
-        }
+        bridge_core::provider_poll::poll_provider_v1(
+            future,
+            &self.observed,
+            || self.validate(),
+            || {
+                if let Some(register) = self.pending.lock().unwrap().take() {
+                    let _ = self.leg.set(register());
+                }
+            },
+        )
+        .await
     }
 
     fn evidence(&self) -> &dyn TerminalEvidenceSink {

@@ -2751,6 +2751,12 @@ impl SqliteStore {
                 PRIMARY KEY (task_id, node_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS task_candidate_progress_v1 (
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL,
+                progress_json TEXT NOT NULL,
+                PRIMARY KEY (task_id, node_id)
+            );
             CREATE TABLE IF NOT EXISTS task_node_starts (
                 task_id TEXT NOT NULL,
                 node_id TEXT NOT NULL,
@@ -5984,6 +5990,63 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
+    }
+
+    async fn candidate_progress_v1(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+    ) -> Result<Option<bridge_core::task_store::CandidateProgressV1>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Option<String> = conn.query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()], |row| row.get(0),
+        ).optional().map_err(|_| BridgeError::StoreFailure)?;
+        bytes
+            .map(|bytes| {
+                let progress: bridge_core::task_store::CandidateProgressV1 =
+                    serde_json::from_str(&bytes).map_err(|_| BridgeError::StoreFailure)?;
+                progress.validate()?;
+                Ok(progress)
+            })
+            .transpose()
+    }
+
+    async fn put_candidate_progress_v1(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        expected: Option<&bridge_core::task_store::CandidateProgressV1>,
+        next: &bridge_core::task_store::CandidateProgressV1,
+    ) -> Result<(), BridgeError> {
+        next.validate()?;
+        let encode = |value| serde_json::to_string(value).map_err(|_| BridgeError::StoreFailure);
+        let bytes = encode(next)?;
+        let expected = expected.map(encode).transpose()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = immediate_transaction(&conn)?;
+        let old: Option<String> = tx.query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()], |row| row.get(0),
+        ).optional().map_err(|_| BridgeError::StoreFailure)?;
+        if old.as_ref() == Some(&bytes) {
+            return Ok(());
+        }
+        if old != expected {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        if let Some(old) = old {
+            next.follows(&serde_json::from_str(&old).map_err(|_| BridgeError::StoreFailure)?)?;
+        } else if !next.visits.is_empty() || next.terminal.is_some() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        tx.execute(
+            "INSERT INTO task_candidate_progress_v1(task_id,node_id,progress_json) VALUES(?1,?2,?3)
+            ON CONFLICT(task_id,node_id) DO UPDATE SET progress_json=excluded.progress_json",
+            rusqlite::params![task.as_str(), node.as_str(), bytes],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18877,6 +18940,250 @@ mod tests {
             bridge_core::workflow_history::LedgerUnavailableReason::ReadOnlyParent
         );
         assert!(!base.exists(), "refusal must not create the missing parent");
+    }
+
+    #[tokio::test]
+    async fn workflow_resume_candidate_boundaries() {
+        use bridge_core::fallback_runtime::{CandidateRecoveryV1, FrozenFallbackInvocationV1};
+        use bridge_core::routing::*;
+        use bridge_core::task_store::*;
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap().to_owned();
+        let source = FallbackCandidateV1 {
+            agent: AgentId::parse("a").unwrap(),
+            model: "one".into(),
+            posture: CandidatePostureV1 {
+                cwd: cwd.clone(),
+                session_cwd: cwd,
+                ..Default::default()
+            },
+        };
+        let mut target = source.clone();
+        target.agent = AgentId::parse("b").unwrap();
+        let chain = FrozenFallbackChainV1 {
+            id: "chain".into(),
+            source: source.clone(),
+            causes: BTreeSet::from([FallbackCauseV1::QuotaExhausted]),
+            steps: vec![target.clone()],
+        };
+        let frozen =
+            || FrozenFallbackInvocationV1::freeze(vec![chain.clone()], source.clone()).unwrap();
+        let path = dir.path().join("progress.db");
+        let task = TaskId::parse("candidates").unwrap();
+        let node = NodeId::parse("node").unwrap();
+        let store = SqliteStore::open(&path).unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        // Recreate the immediately preceding schema, then reopen through migration.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE task_candidate_progress_v1", [])
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store
+            .candidate_progress_v1(&task, &node)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM task_candidate_progress_v1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let mut progress = frozen().progress();
+        store
+            .put_candidate_progress_v1(&task, &node, None, &progress)
+            .await
+            .unwrap();
+        let owner = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let visit = |position, owner| CandidateVisitV1 {
+            position,
+            owner,
+            accounting_id: format!("accounting-{position}"),
+            cold_context: ContextId::parse(format!("cold-{position}")).unwrap(),
+            phase: CandidatePhaseV1::Preparing,
+            rejection: None,
+        };
+        let mut next = progress.clone();
+        next.visits.push(visit(0, owner.clone()));
+        store
+            .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+            .await
+            .unwrap();
+        progress = next;
+        for phase in [
+            CandidatePhaseV1::Prepared,
+            CandidatePhaseV1::PollFenced,
+            CandidatePhaseV1::Polled,
+        ] {
+            let mut next = progress.clone();
+            next.visits[0].phase = phase;
+            store
+                .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+                .await
+                .unwrap();
+            progress = next;
+            assert_eq!(
+                phase.dispatched(),
+                phase == CandidatePhaseV1::Polled,
+                "pre-poll fences never claim dispatch"
+            );
+            assert!(
+                frozen().restore(&progress, |c| Ok(c.clone())).is_err(),
+                "uncertain source interrupts"
+            );
+        }
+        let mut next = progress.clone();
+        next.selected_chain = Some(0);
+        next.visits[0].rejection = Some(CandidateRejectionV1 {
+            cause: bridge_core::diagnostics::DiagnosticFailureClass::QuotaExhausted,
+            non_acceptance: true,
+            no_effects: true,
+            cleanup_complete: true,
+            persistence_failed: false,
+            canceled: false,
+        });
+        store
+            .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+            .await
+            .unwrap();
+        progress = next;
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.candidate_progress_v1(&task, &node).await.unwrap(),
+            Some(progress.clone())
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frozen().restore(&progress, |c| Ok(c.clone())).unwrap().1,
+                CandidateRecoveryV1::Continue(target.clone())
+            );
+        }
+        let mut drift = progress.clone();
+        drift.chains[0].id = "drift".into();
+        assert!(frozen().restore(&drift, |c| Ok(c.clone())).is_err());
+        for missing in 0..5 {
+            let mut unsafe_progress = progress.clone();
+            let rejection = unsafe_progress.visits[0].rejection.as_mut().unwrap();
+            match missing {
+                0 => rejection.non_acceptance = false,
+                1 => rejection.no_effects = false,
+                2 => rejection.cleanup_complete = false,
+                3 => rejection.persistence_failed = true,
+                _ => rejection.canceled = true,
+            }
+            assert!(frozen()
+                .restore(&unsafe_progress, |c| Ok(c.clone()))
+                .is_err());
+        }
+        let settled = progress.clone();
+        let mut next = progress.clone();
+        next.visits.push(visit(1, owner.resume().unwrap()));
+        store
+            .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+            .await
+            .unwrap();
+        progress = next;
+        store
+            .put_candidate_progress_v1(&task, &node, Some(&settled), &progress)
+            .await
+            .unwrap(); // exact duplicate
+        assert!(store
+            .put_candidate_progress_v1(&task, &node, Some(&settled), &settled)
+            .await
+            .is_err());
+        drop(store);
+        for phase in [
+            CandidatePhaseV1::Preparing,
+            CandidatePhaseV1::Prepared,
+            CandidatePhaseV1::PollFenced,
+            CandidatePhaseV1::Polled,
+        ] {
+            let store = SqliteStore::open(&path).unwrap();
+            let durable = store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut next = durable.clone();
+            next.visits[1].phase = phase;
+            store
+                .put_candidate_progress_v1(&task, &node, Some(&durable), &next)
+                .await
+                .unwrap();
+            drop(store);
+            let store = SqliteStore::open(&path).unwrap();
+            progress = store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+            for _ in 0..2 {
+                assert!(frozen()
+                    .restore(&progress, |_| panic!("never re-prepare or poll B"))
+                    .is_err());
+            }
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let mut next = progress.clone();
+        next.terminal = Some(CandidateOutputV1 {
+            output: "B answer".into(),
+            ok: true,
+            usage: None,
+        });
+        store
+            .put_candidate_progress_v1(&task, &node, Some(&progress), &next)
+            .await
+            .unwrap();
+        progress = next;
+        store
+            .put_node_checkpoint(&task, &node, "B answer", true, 3)
+            .await
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        let completed = store
+            .candidate_progress_v1(&task, &node)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                frozen()
+                    .restore(&completed, |_| panic!(
+                        "completed output has no provider effects"
+                    ))
+                    .unwrap()
+                    .1,
+                CandidateRecoveryV1::Completed(completed.terminal.clone().unwrap())
+            );
+            store
+                .put_candidate_progress_v1(&task, &node, None, &completed)
+                .await
+                .unwrap();
+        }
+        let mut conflict = completed.clone();
+        conflict.terminal.as_mut().unwrap().output = "changed".into();
+        assert!(store
+            .put_candidate_progress_v1(&task, &node, Some(&completed), &conflict)
+            .await
+            .is_err());
+        assert_eq!(
+            store.node_checkpoints(&task).await.unwrap()[0].1,
+            "B answer"
+        );
+        assert_eq!(completed.visits.len(), 2);
+        assert_eq!(completed.visits[0].owner, owner);
+        assert_eq!(completed, progress);
     }
 
     #[tokio::test]

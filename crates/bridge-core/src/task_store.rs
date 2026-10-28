@@ -12,6 +12,61 @@ use crate::ids::{AttemptId, BatchId, ContextId, NodeId, OperationId, TaskId, Tur
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Workflow fallback durability, unused by production execution until C2c2.
+/// A fence records uncertainty BEFORE polling; only Polled affirms dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CandidatePhaseV1 {
+    Preparing,
+    Prepared,
+    PollFenced,
+    Polled,
+}
+impl CandidatePhaseV1 {
+    pub fn dispatched(self) -> bool {
+        self == Self::Polled
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateRejectionV1 {
+    pub cause: crate::diagnostics::DiagnosticFailureClass,
+    pub non_acceptance: bool,
+    pub no_effects: bool,
+    pub cleanup_complete: bool,
+    pub persistence_failed: bool,
+    pub canceled: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateVisitV1 {
+    /// Zero is the source; successors retain their original chain ordinal + 1.
+    pub position: usize,
+    pub accounting_id: String,
+    pub owner: crate::ids::AttemptIdentity,
+    pub cold_context: ContextId,
+    pub phase: CandidatePhaseV1,
+    pub rejection: Option<CandidateRejectionV1>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateOutputV1 {
+    pub output: String,
+    pub ok: bool,
+    pub usage: Option<crate::orch::UsageSnapshot>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProgressV1 {
+    pub schema_version: u16,
+    pub chains: Vec<crate::routing::FrozenFallbackChainV1>,
+    pub source: crate::routing::FallbackCandidateV1,
+    pub scope: Vec<crate::fs_custody::DirectoryIdentityV1>,
+    pub selected_chain: Option<usize>,
+    pub retries_consumed: u32,
+    pub visits: Vec<CandidateVisitV1>,
+    pub terminal: Option<CandidateOutputV1>,
+}
+
 pub const RETENTION_NEVER_ELIGIBLE_MS: i64 = i64::MAX;
 
 pub type PersistenceClock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -803,6 +858,27 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         ts: i64,
         usage: Option<&crate::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError>;
+
+    /// Compare-and-swap the complete candidate record atomically. None requires
+    /// an absent row. Exact duplicate publication is idempotent; completion is
+    /// write-once. Unsupported stores fail closed before preparation can escape.
+    async fn put_candidate_progress_v1(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _expected: Option<&CandidateProgressV1>,
+        _next: &CandidateProgressV1,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn candidate_progress_v1(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+    ) -> Result<Option<CandidateProgressV1>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
 
     /// V2 write-once checkpoint. Exact byte-for-byte replay is idempotent and
     /// returns the original sequence; any changed output, usage, terminal, or

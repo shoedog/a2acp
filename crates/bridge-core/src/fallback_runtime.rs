@@ -132,3 +132,247 @@ impl FrozenFallbackInvocationV1 {
         Ok((self, *candidate))
     }
 }
+
+use crate::task_store::{CandidatePhaseV1, CandidateProgressV1, CandidateRejectionV1};
+
+pub fn validate_fallback_authority_v1(
+    chains: &[FrozenFallbackChainV1],
+    source: &FallbackCandidateV1,
+) -> Result<(), BridgeError> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut causes = std::collections::BTreeSet::new();
+    if chains.is_empty()
+        || chains.iter().any(|chain| {
+            chain.id.is_empty()
+                || !ids.insert(&chain.id)
+                || chain.source != *source
+                || chain.causes.is_empty()
+                || chain.steps.is_empty()
+                || chain.causes.iter().any(|cause| !causes.insert(*cause))
+                || matches!(
+                    decide_fallback(
+                        Some(chain),
+                        crate::diagnostics::DiagnosticFailureClass::QuotaExhausted,
+                        ReplayEvidenceV1::default(),
+                        FallbackPositionV1::Source
+                    ),
+                    RoutingDecisionV1::PolicyViolation
+                )
+        })
+    {
+        return Err(BridgeError::InvalidStateTransition);
+    }
+    Ok(())
+}
+impl CandidateRejectionV1 {
+    fn replay(&self) -> ReplayEvidenceV1 {
+        ReplayEvidenceV1 {
+            prompt_acceptance: if self.non_acceptance {
+                ExclusionEvidenceV1::Excluded
+            } else {
+                ExclusionEvidenceV1::Unknown
+            },
+            effects: if self.no_effects {
+                ExclusionEvidenceV1::Excluded
+            } else {
+                ExclusionEvidenceV1::Unknown
+            },
+            cleanup_completed: self.cleanup_complete && !self.persistence_failed && !self.canceled,
+        }
+    }
+}
+impl CandidateProgressV1 {
+    /// Structural validation never grants authority: restore also revalidates the
+    /// operator's current frozen policy, effective source and pinned scope.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        validate_fallback_authority_v1(&self.chains, &self.source)?;
+        let invalid = || BridgeError::InvalidStateTransition;
+        if self.schema_version != 1
+            || self.scope.is_empty()
+            || self.selected_chain.is_some_and(|i| i >= self.chains.len())
+        {
+            return Err(invalid());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut contexts = std::collections::BTreeSet::new();
+        let mut retries = 0u32;
+        for (i, visit) in self.visits.iter().enumerate() {
+            if visit.accounting_id.is_empty()
+                || !ids.insert(&visit.accounting_id)
+                || !contexts.insert(visit.cold_context.as_str())
+                || (i == 0 && visit.position != 0)
+            {
+                return Err(invalid());
+            }
+            if i == 0 {
+                continue;
+            }
+            let prior = &self.visits[i - 1];
+            if visit.owner.execution_id != prior.owner.execution_id {
+                return Err(invalid());
+            }
+            let rejection = prior.rejection.as_ref().ok_or_else(invalid)?;
+            if visit.position == prior.position {
+                retries = retries.checked_add(1).ok_or_else(invalid)?;
+                if !rejection.cleanup_complete || rejection.canceled || rejection.persistence_failed
+                {
+                    return Err(invalid());
+                }
+            } else {
+                let chain = self.selected_chain.map(|index| &self.chains[index]);
+                let position = if prior.position == 0 {
+                    FallbackPositionV1::Source
+                } else {
+                    FallbackPositionV1::Step(prior.position - 1)
+                };
+                if visit.position != prior.position + 1
+                    || !prior.phase.dispatched()
+                    || !matches!(
+                        decide_fallback(chain, rejection.cause, rejection.replay(), position),
+                        RoutingDecisionV1::Next(_)
+                    )
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        if retries != self.retries_consumed
+            || self.terminal.is_some()
+                && !self
+                    .visits
+                    .last()
+                    .is_some_and(|visit| visit.phase.dispatched() && visit.rejection.is_none())
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    /// Legal publication preserves prior owners/evidence and cannot unprepare a
+    /// candidate. The store additionally compares the expected bytes under a transaction.
+    pub fn follows(&self, old: &Self) -> Result<(), BridgeError> {
+        self.validate()?;
+        let mut previous = old.clone();
+        previous.selected_chain = self.selected_chain;
+        previous.retries_consumed = self.retries_consumed;
+        previous.terminal = self.terminal.clone();
+        if old.terminal.is_some()
+            || old.selected_chain.is_some() && old.selected_chain != self.selected_chain
+            || self.visits.len() < old.visits.len()
+            || self.visits.len() > old.visits.len() + 1
+        {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        if let Some(last) = previous.visits.last_mut() {
+            let next = &self.visits[old.visits.len() - 1];
+            if (next.phase as u8) < (last.phase as u8)
+                || (next.phase as u8) > (last.phase as u8) + 1
+                || last.rejection.is_some() && last.rejection != next.rejection
+            {
+                return Err(BridgeError::InvalidStateTransition);
+            }
+            last.phase = next.phase;
+            last.rejection = next.rejection.clone();
+        }
+        if self.visits.len() > old.visits.len() {
+            let next = self.visits.last().unwrap();
+            if next.phase != CandidatePhaseV1::Preparing || next.rejection.is_some() {
+                return Err(BridgeError::InvalidStateTransition);
+            }
+            previous.visits.push(next.clone());
+        }
+        if previous != *self {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CandidateRecoveryV1 {
+    Continue(FallbackCandidateV1),
+    Completed(crate::task_store::CandidateOutputV1),
+}
+impl FrozenFallbackInvocationV1 {
+    pub fn progress(&self) -> CandidateProgressV1 {
+        CandidateProgressV1 {
+            schema_version: 1,
+            chains: self.chains.clone(),
+            source: self.source.clone(),
+            scope: self
+                .scope
+                .0
+                .iter()
+                .map(|(_, pin)| pin.identity().clone())
+                .collect(),
+            selected_chain: self.selected,
+            retries_consumed: 0,
+            visits: vec![],
+            terminal: None,
+        }
+    }
+
+    /// Any error interrupts recovery. This is a read-only decision: the caller
+    /// must CAS-publish a Preparing visit before allowing preparation to escape.
+    /// A second recovery of that visit refuses rather than repeating preparation.
+    pub fn restore(
+        mut self,
+        progress: &CandidateProgressV1,
+        admit: impl FnOnce(&FallbackCandidateV1) -> Result<FallbackCandidateV1, BridgeError>,
+    ) -> Result<(Self, CandidateRecoveryV1), BridgeError> {
+        progress.validate()?;
+        let frozen = self.progress();
+        if frozen.chains != progress.chains
+            || frozen.source != progress.source
+            || frozen.scope != progress.scope
+            || !self.scope.unchanged()
+        {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        if let Some(output) = &progress.terminal {
+            return Ok((self, CandidateRecoveryV1::Completed(output.clone())));
+        }
+        let last = progress
+            .visits
+            .last()
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let rejection = last
+            .rejection
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        if !last.phase.dispatched() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        self.selected = progress.selected_chain.or_else(|| {
+            select_fallback_chain(
+                &self.chains,
+                &self.source.agent,
+                &self.source.model,
+                rejection.cause,
+            )
+            .and_then(|chain| self.chains.iter().position(|entry| entry == chain))
+        });
+        self.position = if last.position == 0 {
+            FallbackPositionV1::Source
+        } else {
+            FallbackPositionV1::Step(last.position - 1)
+        };
+        let RoutingDecisionV1::Next(candidate) = decide_fallback(
+            self.selected.map(|i| &self.chains[i]),
+            rejection.cause,
+            rejection.replay(),
+            self.position,
+        ) else {
+            return Err(BridgeError::InvalidStateTransition);
+        };
+        if admit(&candidate)? != *candidate || !self.scope.unchanged() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        self.position = if last.position == 0 {
+            FallbackPositionV1::Step(0)
+        } else {
+            FallbackPositionV1::Step(last.position)
+        };
+        Ok((self, CandidateRecoveryV1::Continue(*candidate)))
+    }
+}
