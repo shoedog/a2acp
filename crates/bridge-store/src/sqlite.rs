@@ -12069,7 +12069,12 @@ fn validate_persisted_reservation(
         || row.authority_execution_id != Some(row.execution_id)
         || row.authority_ordinal != Some(row.ordinal)
         || row.authority_task_id != row.task_id
-        || row.authority_surface != Some(row.surface)
+        || (row.authority_surface != Some(row.surface)
+            && !(row.surface == "offline"
+                && row.authority_surface == Some("served_task")
+                && row.task_id == Some(row.execution_id)
+                && row.ordinal == 0
+                && row.parent_attempt_id.is_none()))
         || row.authority_history_disposition != Some(1)
     {
         return Err(corruption());
@@ -13573,8 +13578,12 @@ impl SqliteStore {
                 {
                     return Err(LedgerError::new(R::Schema));
                 }
-                let served =
-                    row.surface == bridge_core::workflow_history::ExecutionSurface::ServedTask;
+                // A local candidate run also owns a primary task/locator. Reuse
+                // its exact identity admission without changing its public surface.
+                let served = row.surface == bridge_core::workflow_history::ExecutionSurface::ServedTask
+                    || (row.surface == bridge_core::workflow_history::ExecutionSurface::Offline
+                        && row.task_id.is_some() && row.identity.ordinal == 0
+                        && row.identity.parent_attempt_id.is_none());
                 let admitted: Option<(String, i64, Option<String>, String, i64)> = tx
                     .query_row(
                         "SELECT execution_id, ordinal, task_id, owner_surface, history_disposition

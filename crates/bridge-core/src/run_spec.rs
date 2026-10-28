@@ -428,6 +428,26 @@ fn validate_critical_path_retry_budget(
 }
 
 impl WorkflowRunSpecV1 {
+    pub fn with_fallback_chains(
+        mut self,
+        chains: std::collections::BTreeMap<
+            crate::ids::NodeId,
+            Vec<crate::routing::FrozenFallbackChainV1>,
+        >,
+    ) -> Result<Self, RunSpecError> {
+        if !chains.is_empty() {
+            self.fallback_chains = Some(chains);
+            self.workload_fingerprint = workload_fingerprint(
+                &self.graph,
+                &self.controls_fingerprint,
+                &self.node_execution_identities,
+                self.fallback_chains.as_ref(),
+            );
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         attempt_id: AttemptId,

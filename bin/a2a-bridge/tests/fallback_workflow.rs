@@ -17,7 +17,7 @@ struct Calls {
     cleaned: Mutex<Vec<SessionId>>,
     preserved: Mutex<Vec<CheckoutPreservationReasonV1>>,
 }
-struct BoundFixture(Arc<direct::Provider>, Arc<Calls>);
+struct BoundFixture(Arc<direct::Provider>, Arc<Calls>, bool);
 #[async_trait::async_trait]
 impl AgentBackend for BoundFixture {
     async fn configure_bound_session(
@@ -49,6 +49,16 @@ impl AgentBackend for BoundFixture {
         parts: Vec<Part>,
         obs: BackendObservers,
     ) -> Result<BackendStream> {
+        if self.0.behavior.starts_with("retry") {
+            let first = self.0.prompts.fetch_add(1, Ordering::SeqCst) == 0;
+            self.0.inputs.lock().unwrap().push(parts);
+            return Err(BridgeError::AgentFailure { diagnostic: Box::new(serde_json::from_value(serde_json::json!({
+                "schema_version":1, "failed_phase":if first { "spawn" } else { "prompt_start" },
+                "class":if first { "overloaded" } else { "quota_exhausted" },
+                "disposition":if first { "retry_same_target" } else { "fatal" }, "code":"fixture.rejected", "summary":"original rejection",
+                "causes":[], "stderr_observed":false, "stderr_line_count":0, "prompt_may_have_been_accepted":false
+            })).unwrap()) });
+        }
         if self.0.behavior == "lifecycle-reject" {
             use bridge_core::attempt_activity::{ActivityReason, AttemptPhase};
             self.0.prompts.fetch_add(1, Ordering::SeqCst);
@@ -63,10 +73,12 @@ impl AgentBackend for BoundFixture {
                 })).unwrap()),
             });
         }
-        if matches!(
-            self.0.behavior,
-            "final-only" | "mixed-final" | "merged-usage"
-        ) {
+        if self.2
+            || matches!(
+                self.0.behavior,
+                "final-only" | "mixed-final" | "merged-usage"
+            )
+        {
             self.0.prompts.fetch_add(1, Ordering::SeqCst);
             self.0.inputs.lock().unwrap().push(parts);
             let mut updates = vec![];
@@ -169,6 +181,7 @@ impl CandidateFixture {
             )
             .unwrap();
         let progress = routing.progress();
+        let source_behavior = source;
         let source = progress.source;
         let routing = bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(
             progress
@@ -207,7 +220,11 @@ impl CandidateFixture {
                     backend.configure.0.notify_one();
                     backend.configure.1.notified().await;
                 }
-                Ok(Arc::new(BoundFixture(backend, record)) as Arc<dyn AgentBackend>)
+                Ok(Arc::new(BoundFixture(
+                    backend,
+                    record,
+                    i == 2 && source_behavior == "retry",
+                )) as Arc<dyn AgentBackend>)
             })
         });
         let registry =
@@ -706,4 +723,134 @@ async fn workflow_lifecycle_only_rejection_allows_successor() {
         .unwrap();
     assert_eq!(h.execute("target", &cancel).await.unwrap().output, "answer");
     assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+}
+
+#[allow(dead_code)] // Also compiled as a standalone integration fixture.
+pub(crate) async fn local_activation<F, Fut>(run: F)
+where
+    F: Fn(Vec<String>, Arc<dyn AgentRegistry>, Arc<bridge_store::sqlite::SqliteStore>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), String>>,
+{
+    for (source, target, governed) in [
+        ("reject", "merged-usage", false),
+        ("region", "merged-usage", false),
+        ("billing-match", "merged-usage", false),
+        ("rate", "merged-usage", false),
+        ("retry", "exhaust", false),
+        ("retry-exhaust", "exhaust", false),
+        ("reject", "setup", false),
+        ("reject", "merged-usage", true),
+    ] {
+        let h = CandidateFixture::new(source, target).await;
+        let root = h.f.dir.path();
+        let scope = root.join("scope");
+        let mut cfg = format!("default='source'\n[store]\npath={:?}\n[registry]\nallowed_cmds=['test-cmd']\n[server]\n", root.join("tasks.sqlite"));
+        for agent in ["source", "target", "last"] {
+            cfg += &format!("[[agents]]\nid='{agent}'\ncmd='test-cmd'\nmodel='{agent}'\ncwd={scope:?}\nsession_cwd={scope:?}\n[[billing_identities]]\nagent='{agent}'\nmodel='{agent}'\naccount_group='{agent}'\nbilling_mode='metered'\n");
+        }
+        cfg += "[[routing.chains]]\nid='original'\nsource={agent='source',model='source'}\ncauses=['quota_exhausted','region_restricted','billing_failure','rate_limited']\nsteps=[{agent='target',model='target'},{agent='last',model='last'}]\n[[routing.chains]]\nid='unused'\nsource={agent='target',model='target'}\ncauses=['quota_exhausted']\nsteps=[{agent='last',model='last'}]\n[[workflows]]\nid='workflow'\n[[workflows.nodes]]\nid='node'\nagent='source'\nprompt_text='{{input}}'\ninputs=[]\nretry={max_attempts=2,backoff_ms=0}\n";
+        let downstream = source == "reject" && target == "merged-usage" && !governed;
+        if downstream {
+            cfg += "[[workflows.nodes]]\nid='downstream'\nagent='target'\nprompt_text='{{node}}'\ninputs=['node']\n";
+        }
+        if governed {
+            cfg += "[[governance.rules]]\nid='headroom'\nselector='each_request'\nlimits={turns=100}\n";
+        }
+        std::fs::write(root.join("config.toml"), cfg).unwrap();
+        std::fs::write(
+            root.join("input"),
+            "---\ntask-type: freeform\n---\nidentical input",
+        )
+        .unwrap();
+        let args = vec![
+            "workflow".into(),
+            "--config".into(),
+            root.join("config.toml").display().to_string(),
+            "--input".into(),
+            root.join("input").display().to_string(),
+            "--out".into(),
+            root.join("output").display().to_string(),
+            "--no-heartbeat".into(),
+        ];
+        let result = run(args, h.registry.clone(), h.f.store.clone()).await;
+        assert_eq!(
+            result.is_ok(),
+            source != "retry-exhaust" && target != "setup" && !governed,
+            "{source}: {result:?}"
+        );
+        let rows = h.f.rows();
+        let expected = if governed {
+            vec!["source"]
+        } else if downstream {
+            vec!["source", "target", "target"]
+        } else if source.starts_with("retry") {
+            vec!["source", "source", "target", "last"]
+        } else {
+            vec!["source", "target"]
+        };
+        assert_eq!(rows.len(), expected.len(), "{source}");
+        let mut rows = rows;
+        rows.sort_by_key(|row| row.started_ms);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.attribution.agent.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(rows.iter().all(|r| r.dispatched
+            == (r.attribution.agent != "target" || target != "setup")
+            && (r.finalized || governed)
+            && matches!(r.attribution.node.as_deref(), Some("node" | "downstream"))
+            && r.attribution.billing.as_ref().unwrap().account_group == r.attribution.agent));
+        assert!(
+            h.f.providers[2].prompts.load(Ordering::SeqCst)
+                == usize::from(source.starts_with("retry"))
+        );
+        if target != "setup" && !governed {
+            assert_eq!(
+                h.f.providers[0].inputs.lock().unwrap()[0],
+                h.f.providers[1].inputs.lock().unwrap()[0]
+            );
+        }
+        if downstream {
+            assert_eq!(h.f.providers[1].inputs.lock().unwrap()[1][0].text, "answer");
+        }
+        if source != "retry-exhaust" && target != "setup" && !governed {
+            assert_eq!(
+                std::fs::read_to_string(root.join("output")).unwrap(),
+                "answer"
+            );
+            assert!(rows[0].usage.terminal.is_none());
+            let task = TaskId::parse(rows[0].attribution.execution.clone().unwrap()).unwrap();
+            let progress =
+                h.f.store
+                    .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                progress.retries_consumed,
+                u32::from(source.starts_with("retry"))
+            );
+            assert_eq!(
+                h.f.store.node_checkpoints(&task).await.unwrap().len(),
+                1 + usize::from(downstream)
+            );
+            let history = bridge_core::workflow_history::WorkflowHistoryStore::attempt(
+                h.f.store.as_ref(),
+                &progress.visits[0].owner.attempt_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                history.reservation.surface,
+                bridge_core::workflow_history::ExecutionSurface::Offline
+            );
+            assert_eq!(
+                history.terminal.unwrap().node_counts.completed,
+                1 + u32::from(downstream)
+            );
+        }
+    }
 }
