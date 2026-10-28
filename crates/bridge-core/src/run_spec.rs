@@ -64,6 +64,11 @@ pub struct WorkflowRunSpecV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_session_cwd: Option<SessionCwd>,
     pub node_execution_identities: Vec<FrozenNodeExecutionIdentityV1>,
+    /// Operator authority only; parsed and validated, production execution inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_chains: Option<
+        std::collections::BTreeMap<crate::ids::NodeId, Vec<crate::routing::FrozenFallbackChainV1>>,
+    >,
     pub ledger_admission: LedgerAdmissionV1,
     pub controls_fingerprint: String,
     pub workload_fingerprint: String,
@@ -294,6 +299,9 @@ fn workload_fingerprint(
     graph: &WorkflowGraph,
     controls_fingerprint: &str,
     identities: &[FrozenNodeExecutionIdentityV1],
+    chains: Option<
+        &std::collections::BTreeMap<crate::ids::NodeId, Vec<crate::routing::FrozenFallbackChainV1>>,
+    >,
 ) -> String {
     let mut canonical = Vec::new();
     push_bytes(&mut canonical, b"a2a-bridge/workflow-run-spec/v1");
@@ -350,6 +358,13 @@ fn workload_fingerprint(
         push_bytes(
             &mut canonical,
             identity.identity_fingerprint.as_str().as_bytes(),
+        );
+    }
+    if let Some(chains) = chains {
+        push_bytes(&mut canonical, b"workflow_fallback_v1");
+        push_bytes(
+            &mut canonical,
+            &serde_json::to_vec(chains).expect("chains serialize"),
         );
     }
     digest_with_prefix("shape-", &canonical)
@@ -424,8 +439,12 @@ impl WorkflowRunSpecV1 {
     ) -> Result<Self, RunSpecError> {
         node_execution_identities.sort_by_key(|identity| identity.node.sorted_ordinal);
         let controls_fingerprint = controls_fingerprint(&controls)?;
-        let workload_fingerprint =
-            workload_fingerprint(&graph, &controls_fingerprint, &node_execution_identities);
+        let workload_fingerprint = workload_fingerprint(
+            &graph,
+            &controls_fingerprint,
+            &node_execution_identities,
+            None,
+        );
         let spec = Self {
             schema_version: EXECUTION_POLICY_SCHEMA_V1,
             attempt_id,
@@ -433,6 +452,7 @@ impl WorkflowRunSpecV1 {
             controls,
             requested_session_cwd,
             node_execution_identities,
+            fallback_chains: None,
             ledger_admission,
             controls_fingerprint,
             workload_fingerprint,
@@ -486,11 +506,47 @@ impl WorkflowRunSpecV1 {
             }
         }
 
+        if let Some(nodes) = &self.fallback_chains {
+            if nodes.is_empty() {
+                return Err(RunSpecError::InvalidNodeIdentity);
+            }
+            for (node, chains) in nodes {
+                let identity = self
+                    .node_execution_identities
+                    .iter()
+                    .find(|identity| {
+                        self.graph.nodes.iter().any(|entry| {
+                            entry.id == *node
+                                && identity.node
+                                    == PolicyNodeRefV1::from_node_id(
+                                        identity.node.sorted_ordinal,
+                                        node.as_str(),
+                                    )
+                        })
+                    })
+                    .ok_or(RunSpecError::InvalidNodeIdentity)?;
+                let source = &chains
+                    .first()
+                    .ok_or(RunSpecError::InvalidNodeIdentity)?
+                    .source;
+                if source.agent != identity.selection.agent
+                    || Some(&source.model) != identity.selection.effective_model.as_ref()
+                    || source.posture.mode.as_deref()
+                        != identity.selection.effective_mode.as_deref()
+                    || crate::fallback_runtime::validate_fallback_authority_v1(chains, source)
+                        .is_err()
+                {
+                    return Err(RunSpecError::InvalidNodeIdentity);
+                }
+            }
+        }
+
         let controls_fingerprint = controls_fingerprint(&self.controls)?;
         let workload_fingerprint = workload_fingerprint(
             &self.graph,
             &controls_fingerprint,
             &self.node_execution_identities,
+            self.fallback_chains.as_ref(),
         );
         if self.controls_fingerprint != controls_fingerprint
             || self.workload_fingerprint != workload_fingerprint
