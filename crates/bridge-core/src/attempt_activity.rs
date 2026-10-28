@@ -139,6 +139,51 @@ impl<C: MonotonicClock> AttemptRecorder for SharedAttemptRecorder<C> {
     }
 }
 
+/// Replay-effect recorder using the direct coordinator's existing closed
+/// MessageDelta/ThoughtDelta/ToolTransition classification. Lifecycle,
+/// usage and heartbeat observations alone do not establish provider effects.
+/// The sticky bit also retains effects recorded during cleanup.
+pub struct ReplayEffectRecorderV1 {
+    inner: SharedAttemptRecorder<SystemMonotonicClock>,
+    effects: std::sync::atomic::AtomicBool,
+}
+
+impl Default for ReplayEffectRecorderV1 {
+    fn default() -> Self {
+        Self {
+            inner: SharedAttemptRecorder::new(SystemMonotonicClock::start()),
+            effects: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl ReplayEffectRecorderV1 {
+    pub fn has_effects(&self) -> bool {
+        self.effects.load(std::sync::atomic::Ordering::Acquire)
+            || self.inner.tally().is_none_or(|t| t.overflowed)
+    }
+}
+impl AttemptRecorder for ReplayEffectRecorderV1 {
+    fn record(
+        &self,
+        phase: AttemptPhase,
+        reason: ActivityReason,
+        advance: u64,
+    ) -> Option<AttemptActivity> {
+        use ActivityReason::*;
+        if matches!(reason, MessageDelta | ThoughtDelta | ToolTransition) {
+            self.effects
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.inner.record(phase, reason, advance)
+    }
+    fn tally(&self) -> Option<ActivityTally> {
+        self.inner.tally()
+    }
+    fn mark_overflowed(&self) {
+        self.inner.mark_overflowed();
+    }
+}
+
 pub trait MonotonicClock: Send + Sync {
     fn elapsed_ms(&self) -> u64;
 }
