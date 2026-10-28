@@ -15,6 +15,10 @@ struct Peer {
     fail: bool,
     hold: bool,
     late: bool,
+    pending: bool,
+    opened: tokio::sync::Notify,
+    delegated: tokio::sync::Notify,
+    finished: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
     prompts: AtomicUsize,
     cancels: AtomicUsize,
@@ -29,6 +33,10 @@ impl DelegationPort for Peer {
     ) -> Result<Delegation, BridgeError> {
         self.prompts.fetch_add(1, Ordering::SeqCst);
         assert_eq!(parts[0].text, "original input");
+        if self.pending {
+            self.opened.notify_one();
+            self.delegated.notified().await;
+        }
         let (peer_tx, peer_task) =
             tokio::sync::watch::channel((!self.late).then(|| PeerTaskId("peer-task".into())));
         Ok(Delegation {
@@ -37,17 +45,26 @@ impl DelegationPort for Peer {
                 let fail = self.fail;
                 let hold = self.hold;
                 let release = self.release.clone();
-                Box::pin(futures::stream::once(async move {
-                    if hold {
-                        release.notified().await;
-                    }
-                    let _ = peer_tx.send(Some(PeerTaskId("peer-task".into())));
-                    if fail {
-                        Err(BridgeError::UpstreamA2aError)
-                    } else {
-                        Ok(Event::artifact("peer answer"))
-                    }
-                }))
+                let finished = self.finished.clone();
+                use futures::StreamExt;
+                Box::pin(
+                    futures::stream::iter([
+                        Ok(Event::status("peer first")),
+                        Ok(Event::status("peer second")),
+                    ])
+                    .chain(futures::stream::once(async move {
+                        if hold {
+                            release.notified().await;
+                        }
+                        let _ = peer_tx.send(Some(PeerTaskId("peer-task".into())));
+                        finished.notify_one();
+                        if fail {
+                            Err(BridgeError::UpstreamA2aError)
+                        } else {
+                            Ok(Event::artifact("peer answer"))
+                        }
+                    })),
+                )
             },
         })
     }
@@ -58,21 +75,30 @@ impl DelegationPort for Peer {
 }
 #[tokio::test]
 async fn fanout_safe_rejection_routes_local_only() {
-    for cause in ["reject", "region", "rate", "billing-match"] {
+    for (method, cause) in ["SendMessage", "SendStreamingMessage"]
+        .into_iter()
+        .flat_map(|method| {
+            ["reject", "region", "rate", "billing-match"].map(move |cause| (method, cause))
+        })
+    {
         let f = Fixture::new(cause, "success", true);
         let peer = Arc::new(Peer::default());
         let owner = AttemptIdentity::initial().unwrap();
         let body = Fixture::served_on(
             f.served_server(true, peer.clone()).router(),
-            "SendMessage",
+            method,
             &owner,
             None,
         )
         .await;
-        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let reply = normalized(&body, method);
         assert_eq!(
             reply["result"]["status"]["state"], "TASK_STATE_COMPLETED",
             "{body}"
+        );
+        assert!(
+            !body.contains("agent crashed"),
+            "recovered failure leaked: {body}"
         );
         let arts = reply["result"]["artifacts"].as_array().unwrap();
         assert!(
@@ -105,23 +131,90 @@ async fn fanout_safe_rejection_routes_local_only() {
         assert_eq!(terminal.terminal_evidence_counts.reached, 3);
     }
 }
+
+fn normalized(body: &str, method: &str) -> serde_json::Value {
+    if method == "SendMessage" {
+        return serde_json::from_str(body).unwrap();
+    }
+    let frames: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| serde_json::from_str(line.trim()).unwrap())
+        .collect();
+    let terminals: Vec<_> = frames
+        .iter()
+        .filter(|v| {
+            v["statusUpdate"]["status"]["state"]
+                .as_str()
+                .is_some_and(|s| s != "TASK_STATE_WORKING")
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "{body}");
+    let artifacts: Vec<_> = frames
+        .iter()
+        .filter_map(|v| v["artifactUpdate"].get("artifact").cloned())
+        .collect();
+    serde_json::json!({"result":{"status":terminals[0]["statusUpdate"]["status"],"artifacts":artifacts}})
+}
+
+async fn open_sse(router: axum::Router, owner: &AttemptIdentity) -> axum::body::Body {
+    use tower::ServiceExt;
+    router.oneshot(axum::http::Request::builder().method("POST").uri("/").header("content-type","application/json").header("A2A-Version","1.0").body(axum::body::Body::from(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"text":"original input","taskId":owner.execution_id.as_str(),"metadata":{"a2a-bridge.execution_id":owner.execution_id.as_str(),"a2a-bridge.attempt_id":owner.attempt_id.as_str()}}}}).to_string())).unwrap()).await.unwrap().into_body()
+}
+
 #[tokio::test]
-async fn fanout_sse_keeps_original_failure() {
-    let f = Fixture::new("reject", "success", true);
-    let body = Fixture::served_on(
-        f.served_server(true, Arc::new(Peer::default())).router(),
-        "SendStreamingMessage",
-        &AttemptIdentity::initial().unwrap(),
-        None,
-    )
-    .await;
-    assert!(
-        body.contains("agent crashed"),
-        "original local failure missing: {body}"
-    );
-    assert!(!body.contains("\"text\":\"answer\""), "{body}");
-    assert_eq!(*f.spawns.lock().unwrap(), ["source"]);
-    assert_eq!(f.rows().len(), 1);
+async fn fanout_exposure_is_per_leg() {
+    use futures::StreamExt;
+    for local_exposed in [false, true] {
+        let f = Fixture::new(
+            if local_exposed {
+                "status-reject"
+            } else {
+                "blocked-cleanup"
+            },
+            "success",
+            true,
+        );
+        let peer = Arc::new(Peer::default());
+        let owner = AttemptIdentity::initial().unwrap();
+        let mut stream = open_sse(f.served_server(true, peer.clone()).router(), &owner)
+            .await
+            .into_data_stream();
+        let mut body = String::new();
+        while !body.contains("peer answer") || (local_exposed && !body.contains("source-status")) {
+            body.push_str(std::str::from_utf8(&stream.next().await.unwrap().unwrap()).unwrap());
+        }
+        // The client consumed the publication before permitting the safe rejection.
+        f.providers[0].cleanup.1.notify_one();
+        while let Some(bytes) = stream.next().await {
+            body.push_str(std::str::from_utf8(&bytes.unwrap()).unwrap());
+        }
+        let reply = normalized(&body, "SendStreamingMessage");
+        assert_eq!(reply["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(body.matches("peer answer").count(), 1, "{body}");
+        assert!(body.find("peer first").unwrap() < body.find("peer second").unwrap());
+        assert!(body.find("peer second").unwrap() < body.find("peer answer").unwrap());
+        assert_eq!(
+            body.contains("agent crashed"),
+            local_exposed,
+            "original failure: {body}"
+        );
+        assert_eq!(
+            body.contains("\"text\":\"answer\""),
+            !local_exposed,
+            "{body}"
+        );
+        assert_eq!(
+            f.providers[1].prompts.load(Ordering::SeqCst),
+            usize::from(!local_exposed)
+        );
+        assert_eq!(
+            f.providers[1].setup.load(Ordering::SeqCst),
+            usize::from(!local_exposed)
+        );
+        assert_eq!(f.rows().len(), if local_exposed { 1 } else { 2 });
+        assert_eq!(peer.prompts.load(Ordering::SeqCst), 1);
+    }
 }
 
 async fn call(f: &Fixture, peer: Arc<Peer>, owner: &AttemptIdentity) -> serde_json::Value {
@@ -226,24 +319,41 @@ async fn fanout_governed_never_routes() {
 }
 #[tokio::test]
 async fn fanout_aggregate_waits_for_logical_legs() {
-    for (source, target, peer_fails, succeeds) in [
-        ("blocked-cleanup", "success", true, true),
-        ("reject", "reject", false, true),
-        ("reject", "reject", true, false),
-    ] {
+    for (method, source, target, peer_fails, succeeds) in ["SendMessage", "SendStreamingMessage"]
+        .into_iter()
+        .flat_map(|method| {
+            [
+                ("blocked-cleanup", "success", true, true),
+                ("reject", "blocked-resolve", false, true),
+                ("reject", "reject", false, true),
+                ("reject", "reject", true, false),
+            ]
+            .map(move |(source, target, peer_fails, succeeds)| {
+                (method, source, target, peer_fails, succeeds)
+            })
+        })
+    {
         let f = Fixture::new(source, target, true);
         let peer = Arc::new(Peer {
             fail: peer_fails,
             ..Default::default()
         });
         let owner = AttemptIdentity::initial().unwrap();
-        let call = call(&f, peer.clone(), &owner);
+        let call = Fixture::served_on(
+            f.served_server(true, peer.clone()).router(),
+            method,
+            &owner,
+            None,
+        );
         tokio::pin!(call);
-        if source == "blocked-cleanup" {
-            tokio::select! { _ = f.providers[0].cleanup.0.notified() => {}, body = &mut call => panic!("premature aggregate: {body}") }
+        if source == "blocked-cleanup" || target == "blocked-resolve" {
+            tokio::select! { _ = async { if source == "blocked-cleanup" { f.providers[0].cleanup.0.notified().await; } else { f.providers[1].configure.0.notified().await; } } => {}, body = &mut call => panic!("premature aggregate: {body}") }
+            tokio::select! { _ = peer.finished.notified() => {}, body = &mut call => panic!("aggregate before local leg settled: {body}") }
             f.providers[0].cleanup.1.notify_one();
+            f.providers[1].configure.1.notify_one();
         }
-        let body = call.await;
+        let raw = call.await;
+        let body = normalized(&raw, method);
         assert_eq!(
             body["result"]["status"]["state"],
             if succeeds {
@@ -397,25 +507,48 @@ async fn fanout_cancel_before_peer_dispatch_and_positive_control() {
 }
 #[tokio::test]
 async fn fanout_cancellation_tracks_current_candidate() {
-    for boundary in ["cleanup", "blocked-resolve", "blocked-setup", "ledger-gate"] {
+    for (method, disconnect, boundary) in [
+        ("SendMessage", false),
+        ("SendStreamingMessage", false),
+        ("SendStreamingMessage", true),
+    ]
+    .into_iter()
+    .flat_map(|(method, disconnect)| {
+        ["cleanup", "blocked-resolve", "blocked-setup", "ledger-gate"]
+            .map(move |boundary| (method, disconnect, boundary))
+    }) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let f = Fixture::new(if boundary == "cleanup" {"blocked-cleanup"} else {"reject"}, if boundary == "cleanup" {"success"} else {boundary}, true);
             let peer = Arc::new(Peer { hold:boundary != "cleanup", fail: boundary == "cleanup", late: boundary == "blocked-resolve", ..Default::default() });
             let router = f.served_server(true, peer.clone()).router();
             let owner = AttemptIdentity::initial().unwrap();
-            let call = Fixture::served_on(router.clone(), "SendMessage", &owner, None);
+            let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+            let call = async {
+                if disconnect {
+                    let body = open_sse(router.clone(), &owner).await;
+                    drop_rx.await.unwrap();
+                    drop(body);
+                    String::new()
+                } else { Fixture::served_on(router.clone(), method, &owner, None).await }
+            };
             tokio::pin!(call);
             tokio::select! {
                 _ = async { match boundary { "cleanup" => f.providers[0].cleanup.0.notified().await, "ledger-gate" => f.dispatch_gate.0.notified().await, _ => f.providers[1].configure.0.notified().await } } => {},
                 body = &mut call => panic!("early {boundary}: {body}"),
             }
-            cancel(&router, &owner).await;
+            if disconnect {
+                drop_tx.send(()).unwrap();
+                // Drive the client drop before unblocking any successor work.
+                (&mut call).await;
+                while !f.store.cancel_requested(&TaskId::parse(owner.execution_id.as_str()).unwrap()).await.unwrap() { tokio::task::yield_now().await; }
+            } else { cancel(&router, &owner).await; }
             if peer.late { peer.release.notify_one(); }
             f.providers[0].cleanup.1.notify_one();
             f.providers[1].configure.1.notify_one();
             f.dispatch_gate.1.notify_one();
-            let body = call.await;
-            assert!(body.contains("TASK_STATE_CANCELED"), "{boundary}: {body}");
+            let body = if disconnect { String::new() } else { call.await };
+            while f.store.attempt(&owner.attempt_id).await.unwrap().and_then(|a| a.terminal).is_none() { tokio::task::yield_now().await; }
+            assert!(disconnect || body.contains("TASK_STATE_CANCELED"), "{boundary}: {body}");
             assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
             assert_eq!(peer.cancels.load(Ordering::SeqCst), usize::from(boundary != "cleanup"));
             assert_eq!(f.providers[0].cancels.load(Ordering::SeqCst), usize::from(boundary == "cleanup"));
@@ -455,11 +588,14 @@ async fn fanout_cancellation_tracks_current_candidate() {
 async fn fanout_bounds_follow_local_candidates() {
     use bridge_core::turn_liveness::TurnLivenessValueV1;
     use tower::ServiceExt;
-    for watching in [false, true] {
+    for (method, watching) in ["SendMessage", "SendStreamingMessage"]
+        .into_iter()
+        .flat_map(|method| [false, true].map(move |watching| (method, watching)))
+    {
         let f = Fixture::new("reject", "success", true);
         let owner = AttemptIdentity::initial().unwrap();
         let router = f.served_server(true, Arc::new(Peer::default())).router();
-        let response = router.oneshot(axum::http::Request::builder().method("POST").uri("/").header("content-type","application/json").header("A2A-Version","1.0").body(axum::body::Body::from(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"text":"original input","taskId":owner.execution_id.as_str(),"metadata":{"a2a-bridge.execution_id":owner.execution_id.as_str(),"a2a-bridge.attempt_id":owner.attempt_id.as_str(),"a2a-bridge.silence_cutoff_secs":"17","a2a-bridge.work_cutoff_secs":"23","a2a-bridge.client_watching":watching.to_string()}}}}).to_string())).unwrap()).await.unwrap();
+        let response = router.oneshot(axum::http::Request::builder().method("POST").uri("/").header("content-type","application/json").header("A2A-Version","1.0").body(axum::body::Body::from(serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"message":{"text":"original input","taskId":owner.execution_id.as_str(),"metadata":{"a2a-bridge.execution_id":owner.execution_id.as_str(),"a2a-bridge.attempt_id":owner.attempt_id.as_str(),"a2a-bridge.silence_cutoff_secs":"17","a2a-bridge.work_cutoff_secs":"23","a2a-bridge.client_watching":watching.to_string()}}}}).to_string())).unwrap()).await.unwrap();
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -469,7 +605,10 @@ async fn fanout_bounds_follow_local_candidates() {
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].silence, TurnLivenessValueV1::Ms(17000));
         assert_eq!(source[0].work_cutoff, TurnLivenessValueV1::Ms(23000));
-        assert_eq!(source[0].client_watching, watching);
+        assert_eq!(
+            source[0].client_watching,
+            watching && method == "SendMessage"
+        );
         assert_eq!(
             source[0].observer_key.as_deref(),
             Some(owner.execution_id.as_str())
@@ -645,5 +784,43 @@ async fn fanout_local_cutoff_does_not_cancel_peer_or_route() {
         );
         assert_eq!(peer.cancels.load(Ordering::SeqCst), 0);
         assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn fanout_pending_delegation_progress_and_late_cancel() {
+    for (method, canceled) in ["SendMessage", "SendStreamingMessage"]
+        .into_iter()
+        .flat_map(|m| [false, true].map(move |c| (m, c)))
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let f = Fixture::new("blocked-cleanup", "setup", true);
+            let peer = Arc::new(Peer { pending: true, late: canceled, hold: canceled, ..Default::default() });
+            let router = f.served_server(true, peer.clone()).router();
+            let owner = AttemptIdentity::initial().unwrap();
+            let call = Fixture::served_on(router.clone(), method, &owner, None);
+            tokio::pin!(call);
+            tokio::select! { _ = peer.opened.notified() => {}, body = &mut call => panic!("delegation not opened: {body}") }
+            tokio::select! { _ = f.providers[0].cleanup.0.notified() => {}, body = &mut call => panic!("local did not progress: {body}") }
+            assert_eq!(f.providers[0].prompts.load(Ordering::SeqCst), 1);
+            if canceled { cancel(&router, &owner).await; }
+            f.providers[0].cleanup.1.notify_one();
+            peer.delegated.notify_one();
+            peer.release.notify_one();
+            let raw = call.await;
+            let body = normalized(&raw, method);
+            assert_eq!(body["result"]["status"]["state"], if canceled {"TASK_STATE_CANCELED"} else {"TASK_STATE_COMPLETED"});
+            assert_eq!(peer.prompts.load(Ordering::SeqCst), 1);
+            assert_eq!(peer.cancels.load(Ordering::SeqCst), usize::from(canceled));
+            assert_eq!(f.providers[1].setup.load(Ordering::SeqCst), usize::from(!canceled));
+            assert_eq!(f.providers[1].prompts.load(Ordering::SeqCst), 0);
+            if !canceled {
+                assert_eq!(raw.matches("peer answer").count(), 1);
+                if method == "SendStreamingMessage" { assert!(raw.contains("model not available"), "{raw}"); }
+                assert_eq!(f.rows().len(), 2);
+            }
+            let terminal = f.store.attempt(&owner.attempt_id).await.unwrap().unwrap().terminal.unwrap();
+            assert_eq!(terminal.terminal_evidence_counts.reached, 2);
+        }).await.expect("pending delegation failed to settle");
     }
 }
