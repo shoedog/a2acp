@@ -5369,6 +5369,13 @@ fn admitted_review_checkout(
 }
 
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
+    run_workflow_with_registry(args, None).await
+}
+
+async fn run_workflow_with_registry(
+    args: &[String],
+    registry_override: Option<(Arc<dyn bridge_core::ports::AgentRegistry>, Arc<SqliteStore>)>,
+) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
         return Ok(());
@@ -5517,6 +5524,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             opened
         }
     };
+    let selected_history = registry_override
+        .as_ref()
+        .map(|(_, store)| Ok(store.clone()))
+        .unwrap_or(selected_history);
     if let Err(error) = &selected_history {
         if error.reason
             == bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
@@ -5696,10 +5707,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         Some(Arc::clone(&liveness_board)),
     );
-    let registry = Arc::new(
-        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
-            .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
-    );
+    let registry: Arc<dyn AgentRegistry> = match registry_override {
+        Some((registry, _)) => registry,
+        None => Arc::new(
+            bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
+                .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
+        ),
+    };
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
@@ -5798,6 +5812,62 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None
     };
 
+    let operator_chains = admission_cfg.fallback_chains_v1()?;
+    if admission_cfg.governance.is_none() && !operator_chains.is_empty() {
+        authority = workflow_admission.bind_local_chains(authority, &operator_chains)?;
+    }
+    let candidate_task = authority
+        .run_spec
+        .fallback_chains
+        .as_ref()
+        .map(|_| bridge_core::ids::TaskId::parse(identity.execution_id.as_str()))
+        .transpose()?;
+    let executor = if let Some(task) = candidate_task.clone() {
+        use bridge_core::task_store::{
+            TaskAttemptLocator, TaskRecord, TaskRecordStatus, TaskStore,
+        };
+        let now = bridge_core::task_store::system_wall_now_ms();
+        accounting_store
+            .create_with_attempt_locator(
+                &TaskRecord {
+                    id: task.clone(),
+                    workflow: workflow_id.clone(),
+                    status: TaskRecordStatus::Working,
+                    result: None,
+                    error: None,
+                    created_ms: now,
+                    updated_ms: now,
+                    last_artifact_ms: None,
+                    input: input.clone(),
+                    workflow_spec_json: Some(String::from_utf8(
+                        authority.run_spec.encode_snapshot_v2()?,
+                    )?),
+                    resume_attempts: 0,
+                    session_cwd: authority
+                        .run_spec
+                        .requested_session_cwd
+                        .as_ref()
+                        .map(|cwd| cwd.as_str().into()),
+                    batch_id: None,
+                    item_id: None,
+                    artifacts_purged_at: None,
+                },
+                &TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await?;
+        executor.with_local_fallback(
+            workflow_admission,
+            authority.clone(),
+            accounting_store.clone(),
+            task,
+        )
+    } else {
+        executor
+    };
+
     // Optional history remains fail-open except for identity collision and an
     // unsupported physical-accounting configuration. Both fail closed before
     // any session/provider effect.
@@ -5809,7 +5879,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Ok(store) => {
             let reservation = bridge_core::workflow_history::AttemptReservation {
                 identity: identity.clone(),
-                task_id: None,
+                task_id: candidate_task.clone(),
                 workflow: workflow_id.clone(),
                 task_class: "workflow".into(),
                 surface: bridge_core::workflow_history::ExecutionSurface::Offline,
@@ -6384,6 +6454,25 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let finalization_ms = attempt_timing
         .elapsed_ms()
         .saturating_sub(finalization_started_ms);
+
+    if let Some(task) = candidate_task {
+        use bridge_core::task_store::{TaskRecordStatus, TaskStore};
+        usage_store
+            .set_terminal(
+                &task,
+                if terminal_outcome == "canceled" {
+                    TaskRecordStatus::Canceled
+                } else if ok {
+                    TaskRecordStatus::Completed
+                } else {
+                    TaskRecordStatus::Failed
+                },
+                Some(&output),
+                None,
+                bridge_core::task_store::system_wall_now_ms(),
+            )
+            .await?;
+    }
 
     // The resolved result/output is published before summary finalization; a
     // summary-store failure cannot roll back bytes already handed to the caller.
@@ -20896,8 +20985,7 @@ cmd = "cargo build --locked"
 }
 
 #[cfg(test)]
-#[path = "../tests/fallback_direct.rs"]
-mod fallback_billing_fixture;
+use local_fallback_fixture::direct as fallback_billing_fixture;
 #[cfg(test)]
 #[tokio::test]
 async fn production_billing_per_visited_candidate() {
@@ -21073,4 +21161,18 @@ async fn production_billing_per_visited_candidate() {
             0
         );
     }
+}
+
+#[cfg(test)]
+#[path = "../tests/fallback_workflow.rs"]
+mod local_fallback_fixture;
+#[cfg(test)]
+#[tokio::test]
+async fn workflow_declared_fallback_local_and_retry_accounting() {
+    local_fallback_fixture::local_activation(|args, registry, store| async move {
+        run_workflow_with_registry(&args, Some((registry, store)))
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
 }

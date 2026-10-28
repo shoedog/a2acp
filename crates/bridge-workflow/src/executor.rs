@@ -1799,14 +1799,22 @@ pub(crate) fn render_weights(panel: &Option<crate::graph::PanelConfig>) -> Strin
 pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
     accounting: Option<WorkflowAccountingInvocationV1>,
+    local_fallback: Option<Arc<LocalWorkflowFallbackV1>>,
     /// Test-only fault injection for the preflight turn-metadata mint, so the
     /// zero-effects-before-fallible-metadata ordering is behaviorally provable.
     #[cfg(test)]
     preflight_metadata_fault: std::sync::atomic::AtomicBool,
 }
 
-/// Dormant execution boundary for explicitly admitted, cold candidates. No
-/// production scheduler constructs this; activation and recovery belong to later slices.
+struct LocalWorkflowFallbackV1 {
+    admission: Arc<crate::admission::WorkflowAdmissionV1>,
+    admitted: crate::admission::AdmittedWorkflowRunV1,
+    store: Arc<dyn TaskStore>,
+    task: bridge_core::ids::TaskId,
+    entries: Vec<Arc<AgentEntry>>,
+}
+
+/// Durable execution boundary for explicitly admitted, cold candidates.
 #[doc(hidden)]
 pub struct WorkflowCandidateRunV1 {
     store: Arc<dyn TaskStore>,
@@ -1817,6 +1825,9 @@ pub struct WorkflowCandidateRunV1 {
     routing: Option<FrozenFallbackInvocationV1>,
     position: usize,
     preceding: Option<AccountingFailureV1>,
+    retry: bool,
+    authority_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    observer_key: Option<String>,
 }
 impl WorkflowCandidateRunV1 {
     pub fn new(
@@ -1835,6 +1846,9 @@ impl WorkflowCandidateRunV1 {
             position: 0,
             preceding: None,
             before_poll: None,
+            retry: false,
+            authority_guard: None,
+            observer_key: None,
         }
     }
 
@@ -1846,6 +1860,14 @@ impl WorkflowCandidateRunV1 {
         cancel: &CancellationToken,
         admit: impl FnOnce(&FallbackCandidateV1) -> Result<FallbackCandidateV1, BridgeError>,
     ) -> Result<FallbackCandidateV1, AccountingFailureV1> {
+        if self
+            .progress
+            .visits
+            .last()
+            .is_none_or(|visit| !visit.phase.dispatched())
+        {
+            return Err(failure);
+        }
         let routing = self.routing.take().ok_or_else(|| failure.clone())?;
         let (routing, candidate) =
             routing.transition(failure.clone(), cancel.is_cancelled(), admit)?;
@@ -2379,17 +2401,65 @@ async fn prompt_accounted_turn(
 }
 
 impl WorkflowExecutor {
+    pub(crate) fn candidate_is_admitted(
+        &self,
+        admitted: &crate::admission::AdmittedWorkflowRunV1,
+        node: &WorkflowNode,
+        candidate: &FallbackCandidateV1,
+    ) -> bool {
+        let authority = FrozenWorkflowAuthority {
+            run_spec: admitted.run_spec.clone(),
+            provider_effect_key: admitted.provider_effect_key.clone(),
+            r2f1b: admitted.r2f1b.clone(),
+        };
+        self.bind_frozen_entry(
+            &authority,
+            node,
+            FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+        )
+        .is_ok_and(|bound| candidate_matches_admission(candidate, &bound))
+    }
+
     pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
         Self {
             registry,
             accounting: None,
+            local_fallback: None,
             #[cfg(test)]
             preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Execute exactly one durable candidate through frozen admission. This seam
-    /// has no scheduler/CLI callers and does not automatically consume a chain.
+    /// Enable cold fallback only on the fresh local composition surface.
+    pub fn with_local_fallback(
+        mut self,
+        admission: Arc<crate::admission::WorkflowAdmissionV1>,
+        admitted: crate::admission::AdmittedWorkflowRunV1,
+        store: Arc<dyn TaskStore>,
+        task: bridge_core::ids::TaskId,
+    ) -> Self {
+        let entries = admitted
+            .run_spec
+            .fallback_chains
+            .iter()
+            .flat_map(|nodes| nodes.values())
+            .flatten()
+            .flat_map(|chain| std::iter::once(&chain.source).chain(&chain.steps))
+            .filter_map(|candidate| self.registry.entry_snapshot(&candidate.agent))
+            .collect();
+        self.local_fallback = Some(Arc::new(LocalWorkflowFallbackV1 {
+            admission,
+            admitted,
+            store,
+            task,
+            entries,
+        }));
+        self
+    }
+
+    /// Execute exactly one durable candidate through frozen admission.
     #[doc(hidden)]
     pub async fn run_durable_candidate_v1(
         &self,
@@ -2409,14 +2479,17 @@ impl WorkflowExecutor {
             ..error.into()
         };
         let result = async {
-            if run
-                .progress
-                .visits
-                .last()
-                .is_some_and(|visit| visit.position >= run.position)
+            if run.authority_guard.as_ref().is_some_and(|guard| !guard()) {
+                return Err(BridgeError::ConfigMismatch { field: "fallback_authority" }.into());
+            }
+            if run.progress.terminal.is_some()
+                || run.progress.visits.last().is_some_and(|visit| {
+                    visit.position > run.position || visit.position == run.position && !run.retry
+                })
             {
                 return Err(BridgeError::InvalidStateTransition.into());
             }
+            run.retry = false;
             admitted
                 .run_spec
                 .validate()
@@ -2439,7 +2512,8 @@ impl WorkflowExecutor {
                     .selected_chain
                     .ok_or(BridgeError::InvalidStateTransition)?]
                 .steps[run.position - 1]
-            };
+            }
+            .clone();
             let authority = FrozenWorkflowAuthority {
                 run_spec: admitted.run_spec.clone(),
                 provider_effect_key: admitted.provider_effect_key.clone(),
@@ -2452,7 +2526,7 @@ impl WorkflowExecutor {
                     candidate_ordinal: 0,
                 },
             )?;
-            if !candidate_matches_admission(candidate, &frozen) {
+            if !candidate_matches_admission(&candidate, &frozen) {
                 return Err(BridgeError::ConfigMismatch {
                     field: "fallback_candidate",
                 }
@@ -2502,6 +2576,23 @@ impl WorkflowExecutor {
                 .as_ref()
                 .ok_or(BridgeError::InvalidStateTransition)?
                 .scope_guard();
+            let registry = self.registry.clone();
+            let bound_node = node.clone();
+            let expected = candidate.clone();
+            let authority_guard = run.authority_guard.clone();
+            let scope = Arc::new(move || {
+                scope()
+                    && authority_guard.as_ref().is_none_or(|guard| guard())
+                    && WorkflowExecutor::new(registry.clone())
+                        .bind_frozen_entry(
+                            &authority,
+                            &bound_node,
+                            FrozenProviderLogicalSessionV1::Execute {
+                                candidate_ordinal: 0,
+                            },
+                        )
+                        .is_ok_and(|bound| candidate_matches_admission(&expected, &bound))
+            });
             let mut current = None;
             let result: Result<_, AccountingFailureV1> = async {
                 // Resolution is joined even after cancellation: its returned backend
@@ -2529,7 +2620,10 @@ impl WorkflowExecutor {
                             )?,
                             requested_mode: HarvestSanitizationMode::default(),
                             prefix_attestation_request: Default::default(),
-                            liveness: Default::default(),
+                            liveness: TurnLivenessRequestV1 {
+                                observer_key: run.observer_key.clone(),
+                                ..workflow_turn_liveness_v1(Some(&admitted.run_spec.controls))
+                            },
                         },
                     )
                     .await;
@@ -2544,6 +2638,15 @@ impl WorkflowExecutor {
                 run.publish(next).await.map_err(persistence)?;
                 if let Some(barrier) = &run.before_poll {
                     barrier().await;
+                }
+                if let Some(sink) = &observers.rich {
+                    if let Some(evidence) = sink.terminal_evidence_for_turn(
+                        attempt.backend().terminal_evidence_capability(),
+                        run.progress.visits.len() as u64, session.as_str(),
+                        &run.progress.visits.last().unwrap().accounting_id,
+                    )? {
+                        observers.terminal_evidence = evidence;
+                    }
                 }
                 let backend = Arc::new(CandidatePollV1 {
                     backend: attempt.backend().clone(),
@@ -2594,7 +2697,14 @@ impl WorkflowExecutor {
                         item = stream.next() => item,
                     };
                     match item {
-                        Some(Ok(Update::Text(text) | Update::FinalAnswer(text))) => {
+                        Some(Ok(Update::FinalAnswer(text))) => {
+                            if !text.is_empty() {
+                                observers.terminal_evidence.record_deliverable_final();
+                            }
+                            effects.record(AttemptPhase::Provider, ActivityReason::MessageDelta, 1);
+                            output.output.push_str(&text);
+                        }
+                        Some(Ok(Update::Text(text))) => {
                             effects.record(AttemptPhase::Provider, ActivityReason::MessageDelta, 1);
                             output.output.push_str(&text);
                         }
@@ -2607,7 +2717,9 @@ impl WorkflowExecutor {
                         Some(Ok(Update::Done { stop_reason, .. }))
                             if stop_reason != STOP_REASON_CANCELLED =>
                         {
-                            return Ok(output)
+                            return if output.output.trim().is_empty() {
+                                Err(BridgeError::EmptyFinal.into())
+                            } else { Ok(output) }
                         }
                         Some(Ok(Update::Done { .. })) => {
                             cancel.cancel();
@@ -2647,6 +2759,13 @@ impl WorkflowExecutor {
             } else {
                 Ok(BackendCleanupDispositionV1::Complete)
             };
+            if result.as_ref().is_err_and(|failure| failure.original.is_transient())
+                && cleanup == Ok(BackendCleanupDispositionV1::Complete)
+            {
+                if let Some(WorkflowAttemptUse::Bound(attempt)) = current.take() {
+                    attempt.frozen.into_retry_invalidation().apply(self.registry.as_ref()).await;
+                }
+            }
             match result {
                 Ok(output) if !cancel.is_cancelled() => {
                     if cleanup != Ok(BackendCleanupDispositionV1::Complete) {
@@ -2678,10 +2797,29 @@ impl WorkflowExecutor {
                     if effects.has_effects() {
                         failure.replay.effects = bridge_core::routing::ExclusionEvidenceV1::Present;
                     }
-                    if let BridgeError::AgentFailure { diagnostic } = &failure.original {
+                    if !cancel.is_cancelled() && failure.persistence.is_none()
+                        && failure.replay.cleanup_completed
+                        && failure.replay.prompt_acceptance == bridge_core::routing::ExclusionEvidenceV1::Excluded
+                    {
+                        if let Err(error) = run.store.update_usage_attempt_v1(
+                            &run.progress.visits.last().unwrap().accounting_id,
+                            observed.load(Ordering::Acquire), None, true,
+                        ).await { failure.persistence = Some(error); }
+                    }
+                    let diagnostic = match &failure.original {
+                        BridgeError::AgentFailure { diagnostic } => Some((**diagnostic).clone()),
+                        error if error.is_transient() => Some(serde_json::from_value(serde_json::json!({
+                            "schema_version":1, "failed_phase":"prompt_start", "class":"unknown",
+                            "disposition":"fatal", "code":"workflow.transient", "summary":"unclassified transient execution failure",
+                            "causes":[], "stderr_observed":false, "stderr_line_count":0,
+                            "prompt_may_have_been_accepted":true
+                        })).map_err(|_| BridgeError::InvalidStateTransition)?),
+                        _ => None,
+                    };
+                    if let Some(diagnostic) = diagnostic {
                         let mut next = run.progress.clone();
                         next.visits.last_mut().unwrap().rejection = Some(CandidateRejectionV1 {
-                            diagnostic: diagnostic.clone(),
+                            diagnostic: Box::new(diagnostic),
                             non_acceptance: failure.replay.prompt_acceptance
                                 == bridge_core::routing::ExclusionEvidenceV1::Excluded,
                             no_effects: failure.replay.effects
@@ -2706,10 +2844,14 @@ impl WorkflowExecutor {
                 failure.preparation_exit =
                     bridge_core::translator::AccountingPreparationExitV1::Canceled;
             }
-            if !observed.load(Ordering::Acquire) {
+            if observed.load(Ordering::Acquire) {
+                run.preceding = Some(failure.clone());
+            } else {
                 // An earlier provider diagnostic remains authoritative, but its
                 // replay permission cannot authorize advancement past this visit.
-                run.routing = None;
+                if run.preceding.is_some() || !failure.original.is_transient() {
+                    run.routing = None;
+                }
                 if let Some(preceding) = run.preceding.take() {
                     failure.original = preceding.original;
                     failure.persistence = failure.persistence.or(preceding.persistence);
@@ -3662,8 +3804,91 @@ impl WorkflowExecutor {
         })
     }
 
-    /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
-    /// Returns (text, ok, usage, disposition). On any failure returns the error marker + ok=false.
+    async fn run_local_chain(
+        &self,
+        local: &LocalWorkflowFallbackV1,
+        run: &mut WorkflowCandidateRunV1,
+        rendered: &str,
+        cancel: &CancellationToken,
+        observers: impl Fn(u32) -> BackendObservers,
+    ) -> Result<CandidateOutputV1, AccountingFailureV1> {
+        let node = local
+            .admitted
+            .run_spec
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == run.node)
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let accounting = self
+            .accounting
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let mut admitted = local.admitted.clone();
+        let mut retry = 1;
+        loop {
+            match self
+                .run_durable_candidate_v1(
+                    run,
+                    accounting,
+                    &admitted,
+                    vec![Part {
+                        text: rendered.into(),
+                    }],
+                    cancel,
+                    observers(retry),
+                )
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(failure) => {
+                    if !cancel.is_cancelled()
+                        && failure.persistence.is_none()
+                        && failure.cleanup == BackendCleanupDispositionV1::Complete
+                        && failure.original.is_transient()
+                        && node.retry.as_ref().is_some_and(|r| retry < r.attempts())
+                        && run.routing.is_some()
+                        && run
+                            .progress
+                            .visits
+                            .last()
+                            .is_some_and(|v| v.rejection.is_some())
+                    {
+                        let policy = node.retry.as_ref().unwrap();
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(failure),
+                            _ = tokio::time::sleep(policy.backoff_for(retry)) => {}
+                        }
+                        retry += 1;
+                        run.retry = true;
+                        continue;
+                    }
+                    let guard = run.authority_guard.clone();
+                    let candidate = run.transition(failure, cancel, |c| {
+                        if guard.as_ref().is_none_or(|guard| guard()) {
+                            Ok(c.clone())
+                        } else {
+                            Err(BridgeError::ConfigMismatch {
+                                field: "fallback_authority",
+                            })
+                        }
+                    })?;
+                    // Keep the original chain and node-wide retry allowance.
+                    admitted = match local
+                        .admission
+                        .freeze_successor(&local.admitted.run_spec, &node.id, &candidate)
+                        .await
+                    {
+                        Ok(admitted) => admitted,
+                        Err(_) => return Err(run.preceding.take().unwrap()),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Run one node through cold execution or its admitted dispatcher.
     #[allow(clippy::too_many_arguments)]
     async fn run_node(
         &self,
@@ -4379,6 +4604,127 @@ impl WorkflowExecutor {
             }
         }
         let rendered = render(&node.prompt_template, vars);
+        if let (Some(local), Some(authority), Some(accounting)) =
+            (&self.local_fallback, frozen_authority, &self.accounting)
+        {
+            if accounting.admits_fresh_fallback()
+                && Arc::ptr_eq(&local.admitted.run_spec, &authority.run_spec)
+            {
+                if let Some(chains) = authority
+                    .run_spec
+                    .fallback_chains
+                    .as_ref()
+                    .and_then(|nodes| nodes.get(&node.id))
+                {
+                    let decision = self
+                        .ensure_frozen_preflight(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            diagnostic_factory,
+                            prompt_dispatch,
+                            cancel,
+                            authority,
+                            preflight_cache,
+                            cleanup_tracker,
+                        )
+                        .await
+                        .map_err(|failure| match failure {
+                            PreflightFailure::Accounting(failure) => failure,
+                            PreflightFailure::Canceled => {
+                                AccountingFailureV1::canceled_before_prompt()
+                            }
+                            PreflightFailure::Hard { message, .. } => {
+                                BridgeError::ConfigInvalid { reason: message }.into()
+                            }
+                        })?;
+                    if decision.candidate_ordinal == 0 {
+                        if let Some(routing) = FrozenFallbackInvocationV1::freeze(
+                            chains.clone(),
+                            chains[0].source.clone(),
+                        ) {
+                            let mut run = WorkflowCandidateRunV1::new(
+                                local.store.clone(),
+                                local.task.clone(),
+                                node.id.clone(),
+                                routing,
+                            );
+                            run.before_poll = prompt_dispatch.clone();
+                            run.observer_key = ctx.observer_key.clone();
+                            let registry = self.registry.clone();
+                            let entries = local.entries.clone();
+                            run.authority_guard = Some(Arc::new(move || {
+                                entries.iter().all(|entry| {
+                                    registry
+                                        .entry_snapshot(&entry.id)
+                                        .is_some_and(|now| entry.as_ref() == now.as_ref())
+                                })
+                            }));
+                            let result = self
+                                .run_local_chain(local, &mut run, &rendered, cancel, |retry| {
+                                    BackendObservers::new(
+                                        diagnostic_factory.make(&node.id, retry),
+                                        ctx.make_rich_sink
+                                            .as_ref()
+                                            .map(|factory| factory.make(&node.id)),
+                                    )
+                                })
+                                .await;
+                            let output = match result {
+                                Ok(output) => output,
+                                Err(_) if cancel.is_cancelled() => {
+                                    return Ok(node_run_output(
+                                        wf_id,
+                                        node,
+                                        run_id,
+                                        ctx,
+                                        format!("[node {} canceled]", node.id.as_str()),
+                                        false,
+                                        None,
+                                        NodeDisposition::Canceled,
+                                        CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                    )?)
+                                }
+                                Err(failure)
+                                    if failure.persistence.is_none() && !cancel.is_cancelled() =>
+                                {
+                                    let mut output = node_run_output(
+                                        wf_id,
+                                        node,
+                                        run_id,
+                                        ctx,
+                                        format!(
+                                            "[node {} failed: {:?}]",
+                                            node.id.as_str(),
+                                            failure.original
+                                        ),
+                                        false,
+                                        None,
+                                        NodeDisposition::Failed,
+                                        CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                    )?;
+                                    output.primary_error = Some(failure.original);
+                                    return Ok(output);
+                                }
+                                Err(failure) => return Err(failure),
+                            };
+                            return Ok(node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                output.output,
+                                output.ok,
+                                output.usage,
+                                NodeDisposition::Completed,
+                                CompletionBodyOrigin::ModelText,
+                            )?);
+                        }
+                    }
+                }
+            }
+        }
         let base_session = match SessionId::parse(format!(
             "workflow-{}-{}-{}",
             wf_id,
@@ -6132,10 +6478,15 @@ impl WorkflowExecutor {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
             accounting,
+            local_fallback: self.local_fallback.clone(),
             #[cfg(test)]
             preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
         };
         Box::pin(async_stream::stream! {
+            if this.local_fallback.is_some() && (!seed.is_empty() || structured_seed.is_some()) {
+                yield Err(BridgeError::InvalidStateTransition.into());
+                return;
+            }
             if let Some(authority) = frozen_authority.as_ref() {
                 if graph.as_ref() != &authority.run_spec.graph {
                     yield Err(BridgeError::ConfigMismatch { field: "workflow_graph" }.into());
