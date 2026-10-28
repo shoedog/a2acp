@@ -186,6 +186,43 @@ impl CandidateRejectionV1 {
     }
 }
 impl CandidateProgressV1 {
+    /// Bind each concrete visit to the authoritative ledger, never projections or
+    /// caller-supplied attribution. Prepared/fenced visits cannot claim dispatch.
+    pub fn validate_accounting(
+        &self,
+        rows: &[crate::accounting::UsageAttemptV1],
+        workflow: &str,
+        node: &crate::ids::NodeId,
+    ) -> Result<(), BridgeError> {
+        self.validate()?;
+        for visit in &self.visits {
+            let candidate = if visit.position == 0 {
+                &self.source
+            } else {
+                self.selected_chain
+                    .and_then(|i| self.chains[i].steps.get(visit.position - 1))
+                    .ok_or(BridgeError::InvalidStateTransition)?
+            };
+            let row = rows
+                .iter()
+                .find(|r| r.id == visit.accounting_id)
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            let a = &row.attribution;
+            if a.execution.as_deref() != Some(visit.owner.execution_id.as_str())
+                || a.run_attempt.as_deref() != Some(visit.owner.attempt_id.as_str())
+                || a.node.as_deref() != Some(node.as_str())
+                || a.workflow.as_deref() != Some(workflow)
+                || a.agent != candidate.agent.as_str()
+                || a.effective_model.as_ref() != Some(&candidate.model)
+                || a.effective_mode != candidate.posture.mode
+                || row.dispatched != visit.phase.dispatched()
+            {
+                return Err(BridgeError::InvalidStateTransition);
+            }
+        }
+        Ok(())
+    }
+
     /// Structural validation never grants authority: restore also revalidates the
     /// operator's current frozen policy, effective source and pinned scope.
     pub fn validate(&self) -> Result<(), BridgeError> {
@@ -340,9 +377,9 @@ impl FrozenFallbackInvocationV1 {
         }
     }
 
-    /// Any error interrupts recovery. This is a read-only decision: the caller
-    /// must CAS-publish a Preparing visit before allowing preparation to escape.
-    /// A second recovery of that visit refuses rather than repeating preparation.
+    /// Any error interrupts recovery. Progress must come from the store's checked
+    /// recovery read. This decision grants no preparation permission: only an
+    /// Applied CAS publication of a Preparing visit does. Replayed never does.
     pub fn restore(
         mut self,
         progress: &CandidateProgressV1,
