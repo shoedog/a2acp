@@ -2751,6 +2751,12 @@ impl SqliteStore {
                 PRIMARY KEY (task_id, node_id),
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS task_candidate_progress_v1 (
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL,
+                progress_json TEXT NOT NULL,
+                PRIMARY KEY (task_id, node_id)
+            );
             CREATE TABLE IF NOT EXISTS task_node_starts (
                 task_id TEXT NOT NULL,
                 node_id TEXT NOT NULL,
@@ -5984,6 +5990,65 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
+    }
+
+    async fn candidate_progress_v1(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+    ) -> Result<Option<bridge_core::task_store::CandidateProgressV1>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: Option<String> = conn.query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()], |row| row.get(0),
+        ).optional().map_err(|_| BridgeError::StoreFailure)?;
+        bytes
+            .map(|bytes| {
+                let progress: bridge_core::task_store::CandidateProgressV1 =
+                    serde_json::from_str(&bytes).map_err(|_| BridgeError::StoreFailure)?;
+                progress.validate()?;
+                Ok(progress)
+            })
+            .transpose()
+    }
+
+    // This contract publishes its terminal record atomically with its evidence.
+    // C2c2 must reconcile it with node checkpoints before activating consumers.
+    async fn put_candidate_progress_v1(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        expected: Option<&bridge_core::task_store::CandidateProgressV1>,
+        next: &bridge_core::task_store::CandidateProgressV1,
+    ) -> Result<(), BridgeError> {
+        next.validate()?;
+        let encode = |value| serde_json::to_string(value).map_err(|_| BridgeError::StoreFailure);
+        let bytes = encode(next)?;
+        let expected = expected.map(encode).transpose()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = immediate_transaction(&conn)?;
+        let old: Option<String> = tx.query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()], |row| row.get(0),
+        ).optional().map_err(|_| BridgeError::StoreFailure)?;
+        if old.as_ref() == Some(&bytes) {
+            return Ok(());
+        }
+        if old != expected {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        if let Some(old) = old {
+            next.follows(&serde_json::from_str(&old).map_err(|_| BridgeError::StoreFailure)?)?;
+        } else if !next.visits.is_empty() || next.terminal.is_some() {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        tx.execute(
+            "INSERT INTO task_candidate_progress_v1(task_id,node_id,progress_json) VALUES(?1,?2,?3)
+            ON CONFLICT(task_id,node_id) DO UPDATE SET progress_json=excluded.progress_json",
+            rusqlite::params![task.as_str(), node.as_str(), bytes],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18877,6 +18942,345 @@ mod tests {
             bridge_core::workflow_history::LedgerUnavailableReason::ReadOnlyParent
         );
         assert!(!base.exists(), "refusal must not create the missing parent");
+    }
+
+    fn candidate_diagnostic(
+        code: &str,
+        summary: &str,
+    ) -> Box<bridge_core::diagnostics::FailureDiagnostic> {
+        use bridge_core::diagnostics::*;
+        Box::new(
+            FailureDiagnostic::build(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                    class: DiagnosticFailureClass::QuotaExhausted,
+                    disposition: FailureDisposition::Fatal,
+                    code: code.into(),
+                    summary: summary.into(),
+                    causes: vec![summary.into()],
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: false,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn workflow_resume_candidate_boundaries() {
+        use bridge_core::execution_policy::BoundedReasonV1 as Reason;
+        use bridge_core::fallback_runtime::{
+            CandidateRecoveryV1 as Recovery, FrozenFallbackInvocationV1,
+        };
+        use bridge_core::routing::*;
+        use bridge_core::task_store::{
+            CandidateOutputV1 as Output, CandidatePhaseV1 as Phase, CandidateProgressV1,
+            CandidateRejectionV1, CandidateVisitV1,
+        };
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap().to_owned();
+        let source = FallbackCandidateV1 {
+            agent: AgentId::parse("a").unwrap(),
+            model: "one".into(),
+            posture: CandidatePostureV1 {
+                cwd: cwd.clone(),
+                session_cwd: cwd,
+                ..Default::default()
+            },
+        };
+        let mut target = source.clone();
+        target.agent = AgentId::parse("b").unwrap();
+        let chain = FrozenFallbackChainV1 {
+            id: "chain".into(),
+            source: source.clone(),
+            causes: BTreeSet::from([FallbackCauseV1::QuotaExhausted]),
+            steps: vec![target.clone()],
+        };
+        let frozen =
+            || FrozenFallbackInvocationV1::freeze(vec![chain.clone()], source.clone()).unwrap();
+        let no_admit = |_: &FallbackCandidateV1| panic!("no preparation or provider effects");
+        let path = dir.path().join("p.db");
+        let task = TaskId::parse("candidates").unwrap();
+        let node = NodeId::parse("node").unwrap();
+        let publish = async |store: &SqliteStore,
+                             node: &NodeId,
+                             expected: Option<&CandidateProgressV1>,
+                             next: &CandidateProgressV1| {
+            store
+                .put_candidate_progress_v1(&task, node, expected, next)
+                .await
+                .unwrap();
+        };
+        let read = async |store: &SqliteStore, node: &NodeId| {
+            store
+                .candidate_progress_v1(&task, node)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let store = SqliteStore::open(&path).unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+        // Recreate the immediately preceding schema, then reopen through migration.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE task_candidate_progress_v1", [])
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store
+            .candidate_progress_v1(&task, &node)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM task_candidate_progress_v1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let mut p = frozen().progress();
+        publish(&store, &node, None, &p).await;
+        let owner = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let visit = |position, owner| CandidateVisitV1 {
+            position,
+            owner,
+            accounting_id: format!("accounting-{position}"),
+            cold_context: ContextId::parse(format!("cold-{position}")).unwrap(),
+            phase: Phase::Preparing,
+            rejection: None,
+        };
+        let mut next = p.clone();
+        next.visits.push(visit(0, owner.clone()));
+        publish(&store, &node, Some(&p), &next).await;
+        p = next;
+        for phase in [Phase::Prepared, Phase::PollFenced, Phase::Polled] {
+            let mut next = p.clone();
+            next.visits[0].phase = phase;
+            publish(&store, &node, Some(&p), &next).await;
+            p = next;
+            assert_eq!(
+                phase.dispatched(),
+                phase == Phase::Polled,
+                "pre-poll fences never claim dispatch"
+            );
+            assert!(
+                frozen().restore(&p, |c| Ok(c.clone())).is_err(),
+                "uncertain source interrupts"
+            );
+        }
+        let mut next = p.clone();
+        next.selected_chain = Some(0);
+        next.visits[0].rejection = Some(CandidateRejectionV1 {
+            diagnostic: candidate_diagnostic("quota.first", "First quota rejection"),
+            non_acceptance: true,
+            no_effects: true,
+            cleanup_complete: true,
+            persistence_error: None,
+            canceled: false,
+        });
+        publish(&store, &node, Some(&p), &next).await;
+        p = next;
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.candidate_progress_v1(&task, &node).await.unwrap(),
+            Some(p.clone())
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                frozen().restore(&p, |c| Ok(c.clone())).unwrap().1,
+                Recovery::Continue {
+                    candidate: Box::new(target.clone()),
+                    preceding_failure: Box::new(p.visits[0].rejection.clone().unwrap()),
+                }
+            );
+        }
+        let mut drift = p.clone();
+        drift.chains[0].id = "drift".into();
+        assert!(frozen().restore(&drift, |c| Ok(c.clone())).is_err());
+        for missing in 0..5 {
+            let mut unsafe_progress = p.clone();
+            let rejection = unsafe_progress.visits[0].rejection.as_mut().unwrap();
+            match missing {
+                0 => rejection.non_acceptance = false,
+                1 => rejection.no_effects = false,
+                2 => rejection.cleanup_complete = false,
+                3 => rejection.persistence_error = Some(Reason::parse("store failure").unwrap()),
+                _ => rejection.canceled = true,
+            }
+            assert!(frozen()
+                .restore(&unsafe_progress, |c| Ok(c.clone()))
+                .is_err());
+        }
+        // Same-class diagnostics remain distinct across restart and terminal
+        // failure, including B setup failures with a separate persistence error.
+        let mut store = store;
+        for (code, summary) in [
+            ("quota.first", "First quota rejection"),
+            ("quota.second", "Second quota rejection"),
+        ] {
+            for setup_failed in [false, true] {
+                let failed_node =
+                    NodeId::parse(format!("{}-{setup_failed}", code.replace('.', "-"))).unwrap();
+                let diagnostic = candidate_diagnostic(code, summary);
+                let initial = frozen().progress();
+                publish(&store, &failed_node, None, &initial).await;
+                let mut previous = initial;
+                let mut failure = p.clone();
+                failure.visits[0].rejection.as_mut().unwrap().diagnostic = diagnostic.clone();
+                for phase in [
+                    Phase::Preparing,
+                    Phase::Prepared,
+                    Phase::PollFenced,
+                    Phase::Polled,
+                ] {
+                    let mut next = failure.clone();
+                    next.selected_chain = None;
+                    next.visits[0].phase = phase;
+                    next.visits[0].rejection = None;
+                    publish(&store, &failed_node, Some(&previous), &next).await;
+                    previous = next;
+                }
+                publish(&store, &failed_node, Some(&previous), &failure).await;
+                drop(store);
+                store = SqliteStore::open(&path).unwrap();
+                failure = read(&store, &failed_node).await;
+                assert_eq!(failure.primary_failure().unwrap().diagnostic, diagnostic);
+                assert_eq!(
+                    frozen().restore(&failure, |c| Ok(c.clone())).unwrap().1,
+                    Recovery::Continue {
+                        candidate: Box::new(target.clone()),
+                        preceding_failure: Box::new(failure.visits[0].rejection.clone().unwrap())
+                    }
+                );
+                if setup_failed {
+                    for phase in [Phase::Preparing, Phase::Prepared] {
+                        let mut next = failure.clone();
+                        if next.visits.len() == 1 {
+                            next.visits.push(visit(1, owner.resume().unwrap()));
+                        }
+                        next.visits[1].phase = phase;
+                        publish(&store, &failed_node, Some(&failure), &next).await;
+                        failure = next;
+                    }
+                    let mut next = failure.clone();
+                    let mut setup = next.visits[0].rejection.clone().unwrap();
+                    setup.diagnostic = candidate_diagnostic("setup.failed", "B preparation failed");
+                    setup.persistence_error = Some(Reason::parse("store failure").unwrap());
+                    next.visits[1].rejection = Some(setup);
+                    publish(&store, &failed_node, Some(&failure), &next).await;
+                    failure = next;
+                    assert!(!failure.visits[1].phase.dispatched());
+                } else {
+                    assert!(frozen()
+                        .restore(&failure, |_| Err(BridgeError::InvalidStateTransition))
+                        .is_err());
+                }
+                let rejected = failure.clone();
+                failure.terminal = Some(Output {
+                    output: summary.into(),
+                    ok: false,
+                    usage: None,
+                });
+                publish(&store, &failed_node, Some(&rejected), &failure).await;
+                drop(store);
+                store = SqliteStore::open(&path).unwrap();
+                let completed = read(&store, &failed_node).await;
+                assert_eq!(completed, failure);
+                assert_eq!(completed.primary_failure().unwrap().diagnostic, diagnostic);
+                assert_eq!(
+                    frozen().restore(&completed, no_admit).unwrap().1,
+                    Recovery::Completed(completed.terminal.clone().unwrap())
+                );
+                publish(&store, &failed_node, None, &completed).await;
+                let mut rewritten = completed.clone();
+                rewritten.terminal.as_mut().unwrap().output = "changed failure".into();
+                assert!(store
+                    .put_candidate_progress_v1(&task, &failed_node, Some(&completed), &rewritten)
+                    .await
+                    .is_err());
+            }
+        }
+        let settled = p.clone();
+        let mut next = p.clone();
+        next.visits.push(visit(1, owner.resume().unwrap()));
+        publish(&store, &node, Some(&p), &next).await;
+        p = next;
+        publish(&store, &node, Some(&settled), &p).await; // exact duplicate
+        assert!(store
+            .put_candidate_progress_v1(&task, &node, Some(&settled), &settled)
+            .await
+            .is_err());
+        drop(store);
+        for phase in [
+            Phase::Preparing,
+            Phase::Prepared,
+            Phase::PollFenced,
+            Phase::Polled,
+        ] {
+            let store = SqliteStore::open(&path).unwrap();
+            let durable = read(&store, &node).await;
+            let mut next = durable.clone();
+            next.visits[1].phase = phase;
+            publish(&store, &node, Some(&durable), &next).await;
+            drop(store);
+            let store = SqliteStore::open(&path).unwrap();
+            p = read(&store, &node).await;
+            for _ in 0..2 {
+                assert!(frozen().restore(&p, no_admit).is_err());
+            }
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let mut next = p.clone();
+        next.terminal = Some(Output {
+            output: "B answer".into(),
+            ok: true,
+            usage: None,
+        });
+        publish(&store, &node, Some(&p), &next).await;
+        p = next;
+        store
+            .put_node_checkpoint(&task, &node, "B answer", true, 3)
+            .await
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        let completed = read(&store, &node).await;
+        for _ in 0..2 {
+            assert_eq!(
+                frozen().restore(&completed, no_admit).unwrap().1,
+                Recovery::Completed(completed.terminal.clone().unwrap())
+            );
+            publish(&store, &node, None, &completed).await;
+        }
+        let mut conflict = completed.clone();
+        conflict.terminal.as_mut().unwrap().output = "changed".into();
+        assert!(store
+            .put_candidate_progress_v1(&task, &node, Some(&completed), &conflict)
+            .await
+            .is_err());
+        assert_eq!(
+            store.node_checkpoints(&task).await.unwrap()[0].1,
+            "B answer"
+        );
+        assert_eq!(completed.visits.len(), 2);
+        assert_eq!(completed.visits[0].owner, owner);
+        assert_eq!(completed, p);
     }
 
     #[tokio::test]
