@@ -20903,6 +20903,7 @@ mod fallback_billing_fixture;
 async fn production_billing_per_visited_candidate() {
     use bridge_core::{ids::AttemptIdentity, routing::BillingModeV1, task_store::TaskStore};
     for (surface, target, mapped) in [
+        ("FanoutSse", "success", true),
         ("Fanout", "success", true),
         ("Fanout", "setup", true),
         ("Fanout", "success", false),
@@ -20979,11 +20980,15 @@ async fn production_billing_per_visited_candidate() {
         .unwrap();
         let owner = AttemptIdentity::initial().unwrap();
         let call = async {
-            if surface == "Fanout" {
+            if surface.starts_with("Fanout") {
                 fallback_billing_fixture::Fixture::served_on(
                     f.served_server(true, Arc::new(bridge_a2a_outbound::StubDelegation))
                         .router(),
-                    "SendMessage",
+                    if surface == "FanoutSse" {
+                        "SendStreamingMessage"
+                    } else {
+                        "SendMessage"
+                    },
                     &owner,
                     None,
                 )
@@ -21018,7 +21023,7 @@ async fn production_billing_per_visited_candidate() {
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].id, rows[1].id);
         for row in &rows {
-            if surface == "SendStreamingMessage" {
+            if surface == "SendStreamingMessage" || surface == "FanoutSse" {
                 assert_eq!(
                     row.attribution.run_attempt.as_deref(),
                     Some(owner.attempt_id.as_str())

@@ -2540,6 +2540,8 @@ async fn stream_message(
                     routing: Some(routing),
                     exposed: false,
                     unary_leg: false,
+                    streaming_leg: false,
+                    client_tx: None,
                     fallback_control: None,
                 };
                 // Dropping the driver drops pending-cold ownership and its exact binding guard.
@@ -2549,6 +2551,56 @@ async fn stream_message(
                     _ = route_admitted_message(srv, id, params, routed, stream_owner, Some(history), output) => {},
                 }
             });
+            return Sse::new(sse_event_stream(rx, task.clone(), task))
+                .keep_alive(KeepAlive::default())
+                .into_response();
+        }
+    }
+
+    if matches!(routed.target, RouteTarget::Fanout)
+        && routed.context_id.is_none()
+        && !srv.bindings().lock().await.contains_key(&routed.task)
+        && matches!(srv.store.session_for(&routed.task).await, Ok(None))
+    {
+        let agent = local_agent_id(&srv, &routed.target);
+        if let Some(routing) = srv.coordinator().freeze_direct_fallback(
+            &agent,
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        ) {
+            if let Err(error) = srv.coordinator().refuse_governed_unsupported_route() {
+                return bridge_err_to_jsonrpc(id, &error);
+            }
+            let (fingerprint, complete) = srv.coordinator().direct_workload_fingerprint(
+                &agent,
+                routed.overrides.as_ref(),
+                "a2a_fanout",
+            );
+            let history = match srv
+                .coordinator()
+                .admit_direct_attempt(
+                    stream_owner.clone(),
+                    bridge_core::workflow_history::ExecutionSurface::Other,
+                    "a2a_stream",
+                    fingerprint,
+                    complete,
+                )
+                .await
+            {
+                Ok(history) => history,
+                Err(error) => return identity_refusal_response(id, &error, &params),
+            };
+            let task = routed.task.as_str().to_owned();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(fallback_fanout(
+                srv,
+                id,
+                routed,
+                stream_owner,
+                Some(history),
+                routing,
+                Some(tx),
+            ));
             return Sse::new(sse_event_stream(rx, task.clone(), task))
                 .keep_alive(KeepAlive::default())
                 .into_response();
@@ -5017,13 +5069,15 @@ struct ServedEventOutput {
     routing: Option<bridge_core::fallback_runtime::FrozenFallbackInvocationV1>,
     exposed: bool,
     unary_leg: bool,
+    streaming_leg: bool,
+    client_tx: Option<tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
     fallback_control: Option<Arc<bridge_coordinator::dispatch::ColdAbortControl>>,
 }
 impl ServedEventOutput {
     async fn forward(&mut self, event: Event) {
         if let Some(tx) = &self.tx {
             if tx.send(Ok(event)).await.is_ok() {
-                self.exposed |= !self.unary_leg;
+                self.exposed |= !self.unary_leg || self.streaming_leg;
             }
         }
     }
@@ -5088,7 +5142,7 @@ async fn route_admitted_message(
     .await
 }
 
-/// Shared local candidate driver; a unary leg's channel is internal collection.
+/// Shared local candidate driver; fan-out legs suppress their candidate terminals.
 async fn run_admitted_message(
     srv: Arc<InboundServer>,
     id: Value,
@@ -5169,7 +5223,7 @@ async fn run_admitted_message(
             ))
         })
     });
-    // A unary fan-out owns this same control before the initial barrier and
+    // A fan-out owns this same control before the initial barrier and
     // retains it through both logical legs, including peer-only work.
     let _fallback_cancel = fallback_control
         .as_ref()
@@ -5191,7 +5245,11 @@ async fn run_admitted_message(
             if fallback_control
                 .as_ref()
                 .is_some_and(|control| control.token.is_cancelled())
-                || output.tx.as_ref().is_some_and(|tx| tx.is_closed())
+                || output
+                    .client_tx
+                    .as_ref()
+                    .or(output.tx.as_ref())
+                    .is_some_and(|tx| tx.is_closed())
                 || (fallback_active
                     && srv
                         .store
@@ -5340,7 +5398,10 @@ async fn run_admitted_message(
                 dispatch.backend.as_ref(),
                 &dispatch.session,
                 turn_meta.clone(),
-                served_turn_liveness(&routed, output.tx.is_none() || output.unary_leg),
+                served_turn_liveness(
+                    &routed,
+                    !output.streaming_leg && (output.tx.is_none() || output.unary_leg),
+                ),
             )
             .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
@@ -5581,7 +5642,11 @@ async fn run_admitted_message(
                         routing = None;
                     }
                     let canceled = abort.is_cancelled()
-                        || output.tx.as_ref().is_some_and(|tx| tx.is_closed())
+                        || output
+                            .client_tx
+                            .as_ref()
+                            .or(output.tx.as_ref())
+                            .is_some_and(|tx| tx.is_closed())
                         || srv
                             .store
                             .cancel_requested(&routed.task)
@@ -5929,7 +5994,7 @@ async fn unary_fanout_message(
             &routed.overrides.clone().unwrap_or_default(),
             routed.session_cwd.as_ref(),
         ) {
-            return unary_fallback_fanout(srv, id, routed, identity, direct_history, routing).await;
+            return fallback_fanout(srv, id, routed, identity, direct_history, routing, None).await;
         }
     }
     let _ = srv.store.put(&routed.task, &routed.session).await;
@@ -6126,13 +6191,14 @@ async fn unary_fanout_message(
     .await
 }
 
-async fn unary_fallback_fanout(
+async fn fallback_fanout(
     srv: Arc<InboundServer>,
     id: Value,
     mut routed: RoutedCall,
     identity: bridge_core::ids::AttemptIdentity,
     mut history: Option<bridge_coordinator::DirectAttemptHandle>,
     routing: bridge_core::fallback_runtime::FrozenFallbackInvocationV1,
+    stream_tx: Option<tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
 ) -> Response {
     let _ = srv.store.set_fanout(&routed.task).await;
     let control = Arc::new(bridge_coordinator::dispatch::ColdAbortControl::new(
@@ -6148,6 +6214,10 @@ async fn unary_fallback_fanout(
                 .await
             {
                 tracing::warn!(error = ?terminal_error, "fanout prompt barrier finalization failed");
+            }
+            if let Some(tx) = &stream_tx {
+                let _ = tx.send(Err(error.clone())).await;
+                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
             }
             return bridge_err_to_jsonrpc(id, &error);
         }
@@ -6187,6 +6257,7 @@ async fn unary_fallback_fanout(
     // Pending delegation then progresses concurrently without holding the lock.
     let permit = peer_control.first_poll.lock().await;
     let first = if peer_control.token.is_cancelled()
+        || stream_tx.as_ref().is_some_and(|tx| tx.is_closed())
         || peer_srv
             .store
             .cancel_requested(&peer_task)
@@ -6264,39 +6335,83 @@ async fn unary_fallback_fanout(
         }),
     );
     routed.target = RouteTarget::Local(routing.source().agent.clone());
-    let driver = run_admitted_message(
-        srv.clone(),
-        Value::Null,
-        Value::Null,
-        routed,
-        identity.clone(),
-        &mut history,
-        ServedEventOutput {
-            tx: Some(local_tx),
-            routing: Some(routing),
-            unary_leg: true,
-            fallback_control: Some(control),
-            exposed: false,
-        },
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let merge = fanout::run(vec![local, peer], tx);
-    let collect = async {
-        let mut events = Vec::new();
-        let mut outcome = TaskOutcome::Failed;
-        while let Some(Ok(event)) = rx.recv().await {
-            if let Some(terminal) = event.outcome() {
-                outcome = terminal;
-            } else {
-                events.push(event);
+    let (_, _, (events, mut outcome)) = {
+        let driver = run_admitted_message(
+            srv.clone(),
+            Value::Null,
+            Value::Null,
+            routed,
+            identity.clone(),
+            &mut history,
+            ServedEventOutput {
+                tx: Some(local_tx),
+                routing: Some(routing),
+                unary_leg: true,
+                fallback_control: Some(control),
+                streaming_leg: stream_tx.is_some(),
+                client_tx: stream_tx.clone(),
+                exposed: false,
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let merge = fanout::run(vec![local, peer], tx);
+        let collect = async {
+            let mut events = Vec::new();
+            let mut outcome = TaskOutcome::Failed;
+            while let Some(Ok(event)) = rx.recv().await {
+                if let Some(terminal) = event.outcome() {
+                    outcome = terminal;
+                } else if let Some(tx) = &stream_tx {
+                    let _ = tx.send(Ok(event)).await;
+                } else {
+                    events.push(event);
+                }
+            }
+            if srv.store.cancel_requested(&task).await.unwrap_or(false) {
+                outcome = TaskOutcome::Canceled;
+            }
+            (events, outcome)
+        };
+        let work = async { tokio::join!(driver, merge, collect) };
+        tokio::pin!(work);
+        tokio::select! {
+            biased;
+            _ = async { stream_tx.as_ref().unwrap().closed().await }, if stream_tx.is_some() => {
+                // Disconnect and CancelTask share active-candidate ownership and peer
+                // deduplication, including pending delegation and late ID discovery.
+                let _ = cancel_admitted_task(srv.clone(), Value::Null, task.clone()).await;
+                work.await
+            }
+            result = &mut work => result,
+        }
+    };
+    if let Some(tx) = stream_tx {
+        if let Some(history) = history.as_mut() {
+            let (state, reason) = match outcome {
+                TaskOutcome::Completed => ("completed", "completed"),
+                TaskOutcome::Canceled => ("canceled", "canceled"),
+                _ => ("failed", "prompt_failed"),
+            };
+            match history
+                .finish_resolved(state, reason, state != "completed", "unknown")
+                .await
+            {
+                Ok(terminal) => {
+                    outcome = match terminal.outcome.as_str() {
+                        "completed" => TaskOutcome::Completed,
+                        "canceled" => TaskOutcome::Canceled,
+                        _ => TaskOutcome::Failed,
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    outcome = TaskOutcome::Failed;
+                }
             }
         }
-        if srv.store.cancel_requested(&task).await.unwrap_or(false) {
-            outcome = TaskOutcome::Canceled;
-        }
-        (events, outcome)
-    };
-    let (_, _, (events, outcome)) = tokio::join!(driver, merge, collect);
+        let _ = tx.send(Ok(Event::terminal(outcome))).await;
+        return jsonrpc_ok(id, Value::Null);
+    }
     render_unary_fanout(id, &task, &identity, history.as_mut(), events, outcome).await
 }
 
@@ -6401,6 +6516,10 @@ async fn cancel_task(
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
 
+    cancel_admitted_task(srv, id, task).await
+}
+
+async fn cancel_admitted_task(srv: Arc<InboundServer>, id: Value, task: TaskId) -> Response {
     let control = srv
         .bindings()
         .lock()
@@ -7643,12 +7762,27 @@ mod tests {
             rx.is_empty(),
             "draining the outgoing channel cannot erase exposure"
         );
-        let fresh = ServedEventOutput {
+        let mut fanout_output = ServedEventOutput {
             tx: output.tx.clone(),
+            unary_leg: true,
+            streaming_leg: true,
             ..Default::default()
         };
-        for exposed in [true, false] {
-            let tested = if exposed { &output } else { &fresh };
+        fanout_output
+            .forward(Event::status("local fanout status only"))
+            .await;
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap().text(),
+            "local fanout status only"
+        );
+        assert!(rx.is_empty());
+        let fresh = ServedEventOutput {
+            tx: output.tx.clone(),
+            unary_leg: true,
+            streaming_leg: true,
+            ..Default::default()
+        };
+        for (tested, exposed) in [(&output, true), (&fanout_output, true), (&fresh, false)] {
             let run = FrozenFallbackInvocationV1::freeze(vec![chain.clone()], chain.source.clone())
                 .unwrap();
             let prepared = AtomicUsize::new(0);
