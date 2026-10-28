@@ -74,6 +74,60 @@ impl WorkflowAccountingSelectionV1 {
         &self.selection
     }
 
+    /// Reserve one cold visit before resolution or configuration can escape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_candidate(
+        self,
+        store: &dyn bridge_core::task_store::TaskStore,
+        task: &bridge_core::ids::TaskId,
+        node: &NodeId,
+        progress: &mut bridge_core::task_store::CandidateProgressV1,
+        selected_chain: Option<usize>,
+        position: usize,
+        context: bridge_core::ids::ContextId,
+    ) -> Result<PreparedAccountingTurnV1, bridge_core::translator::AccountingFailureV1> {
+        use bridge_core::task_store::*;
+        let persistence = |error: BridgeError| bridge_core::translator::AccountingFailureV1 {
+            persistence: Some(error.clone()),
+            ..error.into()
+        };
+        if progress.visits.is_empty()
+            && store
+                .put_candidate_progress_v1(task, node, None, progress)
+                .await
+                .map_err(persistence)?
+                != CandidatePublicationV1::Applied
+        {
+            return Err(BridgeError::InvalidStateTransition.into());
+        }
+        let mut next = progress.clone();
+        next.selected_chain = selected_chain;
+        next.visits.push(CandidateVisitV1 {
+            position,
+            accounting_id: self.selection.concrete.as_str().into(),
+            owner: self.selection.owner.clone(),
+            cold_context: context,
+            phase: CandidatePhaseV1::Preparing,
+            rejection: None,
+        });
+        let prepared = self.prepare().await.map_err(persistence)?;
+        match store
+            .put_candidate_progress_v1(task, node, Some(progress), &next)
+            .await
+        {
+            Ok(CandidatePublicationV1::Applied) => {
+                *progress = next;
+                Ok(prepared)
+            }
+            result => {
+                let error = result.err().unwrap_or(BridgeError::InvalidStateTransition);
+                let mut failure = prepared.reject_preparation(error.clone()).await;
+                failure.persistence = Some(error);
+                Err(failure)
+            }
+        }
+    }
+
     /// Start durable accounting before checkout, resolution, or configuration.
     /// Transfer the result to the existing capture boundary on dispatch, or use
     /// `PreparedAccountingTurnV1::reject_preparation` on an admitted rejection.
