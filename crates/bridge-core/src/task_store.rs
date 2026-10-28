@@ -884,6 +884,21 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         Err(BridgeError::StoreFailure)
     }
 
+    /// Publish a candidate completion and its matching sequenced node checkpoint
+    /// in one transaction. Failure grants no successor or completion authority.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_candidate_v1(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _expected: &CandidateProgressV1,
+        _next: &CandidateProgressV1,
+        _operation: &OperationId,
+        _ts: i64,
+    ) -> Result<CandidatePublicationV1, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     /// Recovery read: bind visits to accounting and admitted attempt lineage.
     /// Completion must agree with the write-once node checkpoint, including usage.
     /// Either publication order interrupts while only one record is durable;

@@ -74,6 +74,52 @@ impl WorkflowAccountingSelectionV1 {
         &self.selection
     }
 
+    /// Reserve one cold visit before resolution or configuration can escape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_candidate(
+        self,
+        store: &dyn bridge_core::task_store::TaskStore,
+        task: &bridge_core::ids::TaskId,
+        node: &NodeId,
+        progress: &mut bridge_core::task_store::CandidateProgressV1,
+        selected_chain: Option<usize>,
+        position: usize,
+        context: bridge_core::ids::ContextId,
+    ) -> Result<PreparedAccountingTurnV1, bridge_core::translator::AccountingFailureV1> {
+        use bridge_core::task_store::*;
+        if progress.visits.is_empty()
+            && store
+                .put_candidate_progress_v1(task, node, None, progress)
+                .await?
+                != CandidatePublicationV1::Applied
+        {
+            return Err(BridgeError::InvalidStateTransition.into());
+        }
+        let mut next = progress.clone();
+        next.selected_chain = selected_chain;
+        next.visits.push(CandidateVisitV1 {
+            position,
+            accounting_id: self.selection.concrete.as_str().into(),
+            owner: self.selection.owner.clone(),
+            cold_context: context,
+            phase: CandidatePhaseV1::Preparing,
+            rejection: None,
+        });
+        let prepared = self.prepare().await?;
+        match store
+            .put_candidate_progress_v1(task, node, Some(progress), &next)
+            .await
+        {
+            Ok(CandidatePublicationV1::Applied) => {
+                *progress = next;
+                Ok(prepared)
+            }
+            result => Err(prepared
+                .reject_preparation(result.err().unwrap_or(BridgeError::InvalidStateTransition))
+                .await),
+        }
+    }
+
     /// Start durable accounting before checkout, resolution, or configuration.
     /// Transfer the result to the existing capture boundary on dispatch, or use
     /// `PreparedAccountingTurnV1::reject_preparation` on an admitted rejection.
