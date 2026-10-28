@@ -596,6 +596,7 @@ type ServedAdmission = (
     Arc<bridge_core::domain::AgentEntry>,
     Arc<dyn Fn() -> bool + Send + Sync>,
     Arc<bridge_coordinator::dispatch::ColdAbortControl>,
+    bool, // Unary fan-out keeps its original local accounting node.
 );
 
 fn fallback_refusal(error: &BridgeError) -> bool {
@@ -629,8 +630,8 @@ async fn accounted_local_dispatch(
                 owner,
                 agent.as_str().into(),
                 Some(effective_config(&entry.0, routed.overrides.as_ref())),
-                "direct",
-                None,
+                if entry.3 { "fanout_local" } else { "direct" },
+                entry.3.then(|| srv.local_source_label.clone()),
             )
             .await?
     } else {
@@ -1162,7 +1163,7 @@ async fn resolve_configure_bind(
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
-    let resolved = if let Some((entry, scope, control)) = admitted {
+    let resolved = if let Some((entry, scope, control, _)) = admitted {
         if control.token.is_cancelled() {
             return Err(BridgeError::SessionExpired);
         }
@@ -1241,7 +1242,7 @@ async fn resolve_configure_bind(
             },
         )
         .await?;
-    if admitted.is_some_and(|(_, scope, _)| !scope()) {
+    if admitted.is_some_and(|(_, scope, _, _)| !scope()) {
         return Err(BridgeError::ConfigMismatch {
             field: "fallback scope",
         });
@@ -2538,12 +2539,14 @@ async fn stream_message(
                     tx: Some(tx.clone()),
                     routing: Some(routing),
                     exposed: false,
+                    unary_leg: false,
+                    fallback_control: None,
                 };
                 // Dropping the driver drops pending-cold ownership and its exact binding guard.
                 tokio::select! {
                     biased;
                     _ = tx.closed() => {},
-                    _ = run_admitted_message(srv, id, params, routed, stream_owner, Some(history), output) => {},
+                    _ = route_admitted_message(srv, id, params, routed, stream_owner, Some(history), output) => {},
                 }
             });
             return Sse::new(sse_event_stream(rx, task.clone(), task))
@@ -4958,7 +4961,7 @@ async fn unary_message(
         routed.default_route_deferred = false;
     }
 
-    run_admitted_message(
+    route_admitted_message(
         srv,
         id,
         params,
@@ -4975,6 +4978,25 @@ struct ServedFallbackCancel {
     srv: Arc<InboundServer>,
     task: TaskId,
     control: Arc<bridge_coordinator::dispatch::ColdAbortControl>,
+}
+impl ServedFallbackCancel {
+    fn register(
+        srv: &Arc<InboundServer>,
+        task: &TaskId,
+        control: &Arc<bridge_coordinator::dispatch::ColdAbortControl>,
+    ) -> Self {
+        let mut controls = srv.fallback_cancels.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(slot) = controls.entry(task.clone()) {
+            slot.insert(control.clone());
+        } else {
+            control.token.cancel(); // Another incarnation already owns task cancellation.
+        }
+        Self {
+            srv: srv.clone(),
+            task: task.clone(),
+            control: control.clone(),
+        }
+    }
 }
 impl Drop for ServedFallbackCancel {
     fn drop(&mut self) {
@@ -4994,16 +5016,21 @@ struct ServedEventOutput {
     tx: Option<tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
     routing: Option<bridge_core::fallback_runtime::FrozenFallbackInvocationV1>,
     exposed: bool,
+    unary_leg: bool,
+    fallback_control: Option<Arc<bridge_coordinator::dispatch::ColdAbortControl>>,
 }
 impl ServedEventOutput {
     async fn forward(&mut self, event: Event) {
         if let Some(tx) = &self.tx {
             if tx.send(Ok(event)).await.is_ok() {
-                self.exposed = true;
+                self.exposed |= !self.unary_leg;
             }
         }
     }
     async fn terminal(&self, outcome: TaskOutcome) {
+        if self.unary_leg {
+            return;
+        }
         if let Some(tx) = &self.tx {
             let _ = tx.send(Ok(Event::terminal(outcome))).await;
         }
@@ -5037,13 +5064,38 @@ impl ServedEventOutput {
     }
 }
 
+async fn route_admitted_message(
+    srv: Arc<InboundServer>,
+    id: Value,
+    params: Value,
+    routed: RoutedCall,
+    supplied_identity: bridge_core::ids::AttemptIdentity,
+    mut direct_history: Option<bridge_coordinator::DirectAttemptHandle>,
+    output: ServedEventOutput,
+) -> Response {
+    if let RouteTarget::Fanout = routed.target {
+        return unary_fanout_message(srv, id, routed, supplied_identity, direct_history).await;
+    }
+    run_admitted_message(
+        srv,
+        id,
+        params,
+        routed,
+        supplied_identity,
+        &mut direct_history,
+        output,
+    )
+    .await
+}
+
+/// Shared local candidate driver; a unary leg's channel is internal collection.
 async fn run_admitted_message(
     srv: Arc<InboundServer>,
     id: Value,
     params: Value,
     mut routed: RoutedCall,
     supplied_identity: bridge_core::ids::AttemptIdentity,
-    mut direct_history: Option<bridge_coordinator::DirectAttemptHandle>,
+    direct_history: &mut Option<bridge_coordinator::DirectAttemptHandle>,
     mut output: ServedEventOutput,
 ) -> Response {
     let mut cleanup_disposition = "unknown";
@@ -5057,12 +5109,6 @@ async fn run_admitted_message(
         && (!matches!(routed.target, RouteTarget::Local(_)) || routed.context_id.is_some())
     {
         let _ = srv.store.put(&routed.task, &routed.session).await;
-    }
-
-    // Fan-out unary: collect all fanout::run events and build an a2a::Task
-    // response with both labeled artifacts.
-    if let RouteTarget::Fanout = routed.target {
-        return unary_fanout_message(srv, id, routed, supplied_identity, direct_history).await;
     }
 
     let route_was_local = matches!(&routed.target, RouteTarget::Local(_));
@@ -5092,6 +5138,16 @@ async fn run_admitted_message(
         )
     });
     if (routing.is_some() && admitted_entry.is_none()) || output.routing.is_some() {
+        if output.unary_leg {
+            return output
+                .error(
+                    id,
+                    &BridgeError::ConfigMismatch {
+                        field: "fallback source admission",
+                    },
+                )
+                .await;
+        }
         let failure = bridge_coordinator::Coordinator::finish_direct_preparation_failure(
             direct_history.as_mut(),
             BridgeError::ConfigMismatch {
@@ -5107,24 +5163,18 @@ async fn run_admitted_message(
     let mut provider_resolution = None;
     let fallback_active = routing.is_some();
     let fallback_control = fallback_active.then(|| {
-        Arc::new(bridge_coordinator::dispatch::ColdAbortControl::new(
-            Default::default(),
-        ))
+        output.fallback_control.take().unwrap_or_else(|| {
+            Arc::new(bridge_coordinator::dispatch::ColdAbortControl::new(
+                Default::default(),
+            ))
+        })
     });
-    let _fallback_cancel = fallback_control.as_ref().map(|control| {
-        let mut controls = srv.fallback_cancels.lock().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(slot) = controls.entry(routed.task.clone())
-        {
-            slot.insert(control.clone());
-        } else {
-            control.token.cancel(); // Another incarnation already owns task cancellation.
-        }
-        ServedFallbackCancel {
-            srv: srv.clone(),
-            task: routed.task.clone(),
-            control: control.clone(),
-        }
-    });
+    // A unary fan-out owns this same control before the initial barrier and
+    // retains it through both logical legs, including peer-only work.
+    let _fallback_cancel = fallback_control
+        .as_ref()
+        .filter(|_| !output.unary_leg)
+        .map(|control| ServedFallbackCancel::register(&srv, &routed.task, control));
     if fallback_active {
         if let Some(history) = direct_history.as_mut() {
             history.begin_multi_provider_terminal();
@@ -5161,10 +5211,18 @@ async fn run_admitted_message(
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
             let diagnostic = direct_diagnostic_observer();
-            let admission = admitted_entry
-                .clone()
-                .zip(scope_guard.clone())
-                .map(|(entry, scope)| (entry, scope, fallback_control.clone().unwrap()));
+            let admission =
+                admitted_entry
+                    .clone()
+                    .zip(scope_guard.clone())
+                    .map(|(entry, scope)| {
+                        (
+                            entry,
+                            scope,
+                            fallback_control.clone().unwrap(),
+                            output.unary_leg,
+                        )
+                    });
             let dispatch = accounted_local_dispatch(
                 &srv,
                 &candidate_agent,
@@ -5184,12 +5242,16 @@ async fn run_admitted_message(
                             .or_else(|| (!fallback_refusal(&e.original)).then_some(e.original));
                         break vec![Err(original)];
                     }
-                    let e = bridge_coordinator::Coordinator::finish_direct_preparation_failure(
-                        direct_history.as_mut(),
-                        e,
-                        srv.coordinator().has_budget_policy(),
-                    )
-                    .await;
+                    let e = if output.unary_leg {
+                        e
+                    } else {
+                        bridge_coordinator::Coordinator::finish_direct_preparation_failure(
+                            direct_history.as_mut(),
+                            e,
+                            srv.coordinator().has_budget_policy(),
+                        )
+                        .await
+                    };
                     if e.preparation_exit
                         == bridge_core::translator::AccountingPreparationExitV1::Canceled
                         && e.persistence.is_none()
@@ -5278,7 +5340,7 @@ async fn run_admitted_message(
                 dispatch.backend.as_ref(),
                 &dispatch.session,
                 turn_meta.clone(),
-                served_turn_liveness(&routed, output.tx.is_none()),
+                served_turn_liveness(&routed, output.tx.is_none() || output.unary_leg),
             )
             .await;
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
@@ -5403,7 +5465,8 @@ async fn run_admitted_message(
                                 return Ok(None);
                             }
                             if let Some(history) = direct_history.as_mut() {
-                                history.mark_prompt_dispatch().await?;
+                                // Fan-out persisted the shared barrier before either leg; successors still renew it.
+                                if !output.unary_leg || preceding.is_some() { history.mark_prompt_dispatch().await?; }
                                 if let Some((backend, _)) = &observation { history.arm_served_provider(backend); }
                             }
                             // Continue directly into events.next() in this poll;
@@ -5693,6 +5756,40 @@ async fn run_admitted_message(
         }
     };
 
+    if output.unary_leg {
+        for event in collected {
+            match event {
+                Ok(event) if event.kind() == &EventKind::Terminal => {
+                    if event.outcome() != Some(TaskOutcome::Completed) {
+                        let _ = output
+                            .tx
+                            .as_ref()
+                            .unwrap()
+                            .send(Err(BridgeError::SessionExpired))
+                            .await;
+                    }
+                }
+                event => {
+                    let _ = output
+                        .tx
+                        .as_ref()
+                        .unwrap()
+                        .send(event.map_err(|e| e.surfaced_error()))
+                        .await;
+                }
+            }
+        }
+        if provider_resolution.is_some_and(|r| r.outcome.as_str() != "completed") {
+            let _ = output
+                .tx
+                .as_ref()
+                .unwrap()
+                .send(Err(BridgeError::MissingTerminal))
+                .await;
+        }
+        return jsonrpc_ok(id, Value::Null);
+    }
+
     // Surface a terminal error if the pipeline failed/suspended.
     if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
         let reason = if matches!(e.original, BridgeError::MissingTerminal) {
@@ -5822,6 +5919,20 @@ async fn unary_fanout_message(
     identity: bridge_core::ids::AttemptIdentity,
     mut direct_history: Option<bridge_coordinator::DirectAttemptHandle>,
 ) -> Response {
+    let agent = local_agent_id(&srv, &routed.target);
+    if routed.context_id.is_none()
+        && !srv.bindings().lock().await.contains_key(&routed.task)
+        && matches!(srv.store.session_for(&routed.task).await, Ok(None))
+    {
+        if let Some(routing) = srv.coordinator().freeze_direct_fallback(
+            &agent,
+            &routed.overrides.clone().unwrap_or_default(),
+            routed.session_cwd.as_ref(),
+        ) {
+            return unary_fallback_fanout(srv, id, routed, identity, direct_history, routing).await;
+        }
+    }
+    let _ = srv.store.put(&routed.task, &routed.session).await;
     // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
     let _ = srv.store.set_fanout(&routed.task).await;
 
@@ -6004,6 +6115,199 @@ async fn unary_fanout_message(
     }
     let _ = run_handle.await;
 
+    render_unary_fanout(
+        id,
+        &routed.task,
+        &identity,
+        direct_history.as_mut(),
+        all_events,
+        terminal_outcome,
+    )
+    .await
+}
+
+async fn unary_fallback_fanout(
+    srv: Arc<InboundServer>,
+    id: Value,
+    mut routed: RoutedCall,
+    identity: bridge_core::ids::AttemptIdentity,
+    mut history: Option<bridge_coordinator::DirectAttemptHandle>,
+    routing: bridge_core::fallback_runtime::FrozenFallbackInvocationV1,
+) -> Response {
+    let _ = srv.store.set_fanout(&routed.task).await;
+    let control = Arc::new(bridge_coordinator::dispatch::ColdAbortControl::new(
+        Default::default(),
+    ));
+    let _fallback_cancel = ServedFallbackCancel::register(&srv, &routed.task, &control);
+    let peer_control = control.clone();
+    // Acceptance is shared by both legs; the peer observer only counts provider reach.
+    if let Some(history) = history.as_mut() {
+        if let Err(error) = history.mark_prompt_dispatch().await {
+            if let Err(terminal_error) = history
+                .finish("failed", "prompt_barrier_failed", true, "not_needed")
+                .await
+            {
+                tracing::warn!(error = ?terminal_error, "fanout prompt barrier finalization failed");
+            }
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
+    let task = routed.task.clone();
+    let peer_srv = srv.clone();
+    let peer_task = task.clone();
+    let auth = routed.auth.clone();
+    let parts = routed.parts.clone();
+    let dispatched = history.as_mut().map(|h| {
+        h.begin_multi_provider_terminal();
+        h.multi_provider_leg_dispatch_observer(
+            bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
+            None,
+        )
+    });
+    let delegate_srv = srv.clone();
+    let delegate_task = task.clone();
+    let mut delegation = Box::pin(async move {
+        match dispatched {
+            Some(observer) => {
+                delegate_srv
+                    .delegation
+                    .delegate_observed(&auth, &delegate_task, parts, observer)
+                    .await
+            }
+            None => {
+                delegate_srv
+                    .delegation
+                    .delegate(&auth, &delegate_task, parts)
+                    .await
+            }
+        }
+    });
+    // Serialize the first peer poll with CancelTask's acknowledgement, before
+    // starting the local driver: its synchronous poll guard uses this same lock.
+    // Pending delegation then progresses concurrently without holding the lock.
+    let permit = peer_control.first_poll.lock().await;
+    let first = if peer_control.token.is_cancelled()
+        || peer_srv
+            .store
+            .cancel_requested(&peer_task)
+            .await
+            .unwrap_or(true)
+    {
+        None
+    } else {
+        Some(
+            futures::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(delegation.as_mut(), cx))
+            })
+            .await,
+        )
+    };
+    drop(permit);
+    let peer = Source::from_stream(
+        "peer",
+        Box::pin(async_stream::stream! {
+            let Some(first) = first else { return; };
+            let delegated = match first {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => delegation.await,
+            };
+            match delegated {
+                Ok(d) => {
+                    // Use the same fan-out key as CancelTask, including late peer discovery.
+                    let mut watch = d.peer_task;
+                    let mut events = d.events;
+                    loop {
+                        let current = watch.borrow_and_update().clone();
+                        if let Some(peer) = current.clone() {
+                            let _ = peer_srv.store.set_peer_task(&peer_task, &peer).await;
+                            if peer_srv.store.cancel_requested(&peer_task).await.unwrap_or(false)
+                                && try_win_cancel_key(&peer_srv.cancelled_peers, format!("{}:peer", peer_task.as_str())).await {
+                                let _ = peer_srv.delegation.cancel(&peer).await;
+                            }
+                        }
+                        tokio::select! {
+                            item = events.next() => match item {
+                            Some(item) => {
+                                if item.is_err() { try_win_cancel_key(&peer_srv.cancelled_peers, format!("{}:peer", peer_task.as_str())).await; }
+                                yield item;
+                            }
+                            None => break,
+                        },
+                            changed = watch.changed(), if watch.has_changed().is_ok() => { let _ = changed; },
+                        _ = poll_cancel_requested(peer_srv.store.as_ref(), &peer_task), if current.is_some() => {
+                            if try_win_cancel_key(&peer_srv.cancelled_peers, format!("{}:peer", peer_task.as_str())).await {
+                                let _ = peer_srv.delegation.cancel(current.as_ref().unwrap()).await;
+                            }
+                            break;
+                        },
+                        }
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+            try_win_cancel_key(&peer_srv.cancelled_peers, format!("{}:peer", peer_task.as_str())).await;
+        }),
+    );
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<Result<Event, BridgeError>>(64);
+    let local_srv = srv.clone();
+    let local_task = task.clone();
+    let local = Source::from_stream(
+        srv.local_source_label.clone(),
+        Box::pin(async_stream::stream! {
+            while let Some(event) = local_rx.recv().await {
+                if event.is_err() {
+                    try_win_cancel_key(&local_srv.cancelled_peers, format!("{}:kiro", local_task.as_str())).await;
+                }
+                yield event;
+            }
+            try_win_cancel_key(&local_srv.cancelled_peers, format!("{}:kiro", local_task.as_str())).await;
+        }),
+    );
+    routed.target = RouteTarget::Local(routing.source().agent.clone());
+    let driver = run_admitted_message(
+        srv.clone(),
+        Value::Null,
+        Value::Null,
+        routed,
+        identity.clone(),
+        &mut history,
+        ServedEventOutput {
+            tx: Some(local_tx),
+            routing: Some(routing),
+            unary_leg: true,
+            fallback_control: Some(control),
+            exposed: false,
+        },
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let merge = fanout::run(vec![local, peer], tx);
+    let collect = async {
+        let mut events = Vec::new();
+        let mut outcome = TaskOutcome::Failed;
+        while let Some(Ok(event)) = rx.recv().await {
+            if let Some(terminal) = event.outcome() {
+                outcome = terminal;
+            } else {
+                events.push(event);
+            }
+        }
+        if srv.store.cancel_requested(&task).await.unwrap_or(false) {
+            outcome = TaskOutcome::Canceled;
+        }
+        (events, outcome)
+    };
+    let (_, _, (events, outcome)) = tokio::join!(driver, merge, collect);
+    render_unary_fanout(id, &task, &identity, history.as_mut(), events, outcome).await
+}
+
+async fn render_unary_fanout(
+    id: Value,
+    task_id: &TaskId,
+    identity: &bridge_core::ids::AttemptIdentity,
+    direct_history: Option<&mut bridge_coordinator::DirectAttemptHandle>,
+    all_events: Vec<Event>,
+    terminal_outcome: TaskOutcome,
+) -> Response {
     // Build one a2a::Artifact per source from the collected artifact events.
     let artifacts: Vec<a2a::Artifact> = all_events
         .iter()
@@ -6027,7 +6331,7 @@ async fn unary_fanout_message(
         TaskOutcome::Canceled => a2a::TaskState::Canceled,
     };
 
-    if let Some(history) = direct_history.as_mut() {
+    if let Some(history) = direct_history {
         let (outcome, reason, degraded) = match terminal_outcome {
             TaskOutcome::Completed => ("completed", "completed", false),
             TaskOutcome::Failed => ("failed", "prompt_failed", true),
@@ -6053,8 +6357,8 @@ async fn unary_fanout_message(
     }
 
     let task = a2a::Task {
-        id: routed.task.as_str().to_owned(),
-        context_id: routed.task.as_str().to_owned(),
+        id: task_id.as_str().to_owned(),
+        context_id: task_id.as_str().to_owned(),
         status: a2a::TaskStatus {
             state,
             message: None,
@@ -6066,7 +6370,7 @@ async fn unary_fanout_message(
             Some(artifacts)
         },
         history: None,
-        metadata: Some(attempt_identity_metadata(&identity, None)),
+        metadata: Some(attempt_identity_metadata(identity, None)),
     };
 
     jsonrpc_ok(
@@ -6214,7 +6518,12 @@ async fn cancel_task(
         // path and the supervisor. We collect the first error (if any) and return
         // it only AFTER both cancels have been attempted.
         let mut first_err: Option<BridgeError> = None;
-        if try_win_cancel_key(&srv.cancelled_peers, format!("{}:kiro", task.as_str())).await {
+        let resolving_fallback = srv.fallback_cancels.lock().unwrap().contains_key(&task)
+            && !srv.bindings().lock().await.contains_key(&task)
+            && !srv.pending_cold.lock().unwrap().contains_key(&task);
+        if !resolving_fallback
+            && try_win_cancel_key(&srv.cancelled_peers, format!("{}:kiro", task.as_str())).await
+        {
             // Prefer the task's bound instance; fall back to the default agent if no
             // binding exists yet (binding-or-fallback; T11 makes this binding-only).
             match cancel_backend_for(&srv, &task).await {
