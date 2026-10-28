@@ -27,7 +27,7 @@ permissions:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -83,7 +83,7 @@ jobs:
 
   coverage:
     name: Build, Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -120,7 +120,7 @@ jobs:
 
   test-uninstrumented:
     name: Test (uninstrumented control)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     # Coverage instrumentation has its own failure modes (see
     # docs/superpowers/reviews/2026-08-17-coverage-lane-flake-family-investigation.md), so this
