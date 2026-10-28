@@ -69,6 +69,14 @@ pub struct CandidateProgressV1 {
     pub terminal: Option<CandidateOutputV1>,
 }
 
+/// Only Applied grants permission to prepare a newly appended visit. A replay
+/// acknowledges durable state but must never repeat its external effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidatePublicationV1 {
+    Applied,
+    Replayed,
+}
+
 pub const RETENTION_NEVER_ELIGIBLE_MS: i64 = i64::MAX;
 
 pub type PersistenceClock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -863,17 +871,23 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
 
     /// Compare-and-swap the complete candidate record atomically. None requires
     /// an absent row. Exact duplicate publication is idempotent; completion is
-    /// write-once. Unsupported stores fail closed before preparation can escape.
+    /// write-once. Only Applied grants preparation permission; appending requires
+    /// the current authoritative owner and verified preceding accounting evidence.
+    /// Unsupported stores fail closed before preparation can escape.
     async fn put_candidate_progress_v1(
         &self,
         _task: &TaskId,
         _node: &NodeId,
         _expected: Option<&CandidateProgressV1>,
         _next: &CandidateProgressV1,
-    ) -> Result<(), BridgeError> {
+    ) -> Result<CandidatePublicationV1, BridgeError> {
         Err(BridgeError::StoreFailure)
     }
 
+    /// Recovery read: bind visits to accounting and admitted attempt lineage.
+    /// Completion must agree with the write-once node checkpoint, including usage.
+    /// Either publication order interrupts while only one record is durable;
+    /// conflicting records always interrupt. Absence grants no replay authority.
     async fn candidate_progress_v1(
         &self,
         _task: &TaskId,
