@@ -20903,6 +20903,9 @@ mod fallback_billing_fixture;
 async fn production_billing_per_visited_candidate() {
     use bridge_core::{ids::AttemptIdentity, routing::BillingModeV1, task_store::TaskStore};
     for (surface, target, mapped) in [
+        ("Fanout", "success", true),
+        ("Fanout", "setup", true),
+        ("Fanout", "success", false),
         ("SendMessage", "success", true),
         ("SendStreamingMessage", "success", true),
         ("Mcp", "success", true),
@@ -20976,7 +20979,16 @@ async fn production_billing_per_visited_candidate() {
         .unwrap();
         let owner = AttemptIdentity::initial().unwrap();
         let call = async {
-            if surface == "Mcp" {
+            if surface == "Fanout" {
+                fallback_billing_fixture::Fixture::served_on(
+                    f.served_server(true, Arc::new(bridge_a2a_outbound::StubDelegation))
+                        .router(),
+                    "SendMessage",
+                    &owner,
+                    None,
+                )
+                .await
+            } else if surface == "Mcp" {
                 f.call("run", None).await.to_string()
             } else {
                 f.served(surface, &owner, None).await

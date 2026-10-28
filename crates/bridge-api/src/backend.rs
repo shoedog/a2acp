@@ -2963,7 +2963,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(stop_sse())
-                    .set_delay(Duration::from_secs(5)),
+                    .set_delay(Duration::from_secs(60)),
             )
             .mount(&server)
             .await;
@@ -2981,7 +2981,8 @@ mod tests {
             .unwrap();
         let task = spawn_drain(Arc::clone(&fixture.backend), session.clone());
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Admission includes durable journal writes. Keep the fake response pending beyond this wait.
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if server.received_requests().await.unwrap().len() >= 2 {
                     return;
@@ -3545,16 +3546,6 @@ mod tests {
     #[tokio::test]
     async fn settlement_refusal_does_not_mask_the_provider_failure() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string("data: not-json\n\n")
-                    .set_delay(Duration::from_millis(200)),
-            )
-            .mount(&server)
-            .await;
         let fixture = protected_backend(
             format!("{}/v1", server.uri()),
             vec![request_id('f')],
@@ -3567,15 +3558,27 @@ mod tests {
             .backend
             .attach_resource_flight_owner_v1(&session)
             .unwrap();
-        let task = spawn_drain(Arc::clone(&fixture.backend), session);
-        wait_for_provider_requests(&server, 1).await;
-        std::fs::rename(
-            &fixture.journal_root,
-            fixture._root.path().join("journal-refusing-terminal"),
+        let journal = fixture.journal_root.clone();
+        let refused = fixture._root.path().join("journal-refusing-terminal");
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The request is accepted; refuse settlement before releasing the protocol failure.
+                fs::rename(&journal, &refused).unwrap();
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: not-json\n\n")
+            })
+            .mount(&server)
+            .await;
+        let updates = tokio::time::timeout(
+            Duration::from_secs(30),
+            spawn_drain(Arc::clone(&fixture.backend), session),
         )
+        .await
+        .expect("provider failure and settlement must finish")
         .unwrap();
-
-        let updates = task.await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         let diagnostic = updates
             .iter()
             .find_map(|update| match update {

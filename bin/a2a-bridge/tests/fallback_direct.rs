@@ -41,9 +41,17 @@ pub(crate) struct Provider {
     pub(crate) configure: (tokio::sync::Notify, tokio::sync::Notify),
     pub(crate) sessions: Mutex<Vec<SessionId>>,
     activity: Mutex<Option<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>>>,
+    pub(crate) liveness: Mutex<Vec<bridge_core::turn_liveness::TurnLivenessRequestV1>>,
 }
 #[async_trait::async_trait]
 impl AgentBackend for Provider {
+    async fn configure_turn_liveness(
+        &self,
+        _: &SessionId,
+        value: bridge_core::turn_liveness::TurnLivenessRequestV1,
+    ) {
+        self.liveness.lock().unwrap().push(value);
+    }
     fn terminal_evidence_capability(&self) -> EvidenceCapability {
         if self.behavior.starts_with("evidence-") {
             EvidenceCapability::V1
@@ -113,6 +121,22 @@ impl AgentBackend for Provider {
             },
         );
         match self.behavior {
+            "local-cancel" => Ok(Box::pin(futures::stream::iter([Ok(Update::done(
+                "cancelled",
+            ))]))),
+            "cutoff" => {
+                use bridge_core::turn_liveness::*;
+                let request = self.liveness.lock().unwrap().last().unwrap().clone();
+                let tracker = TurnLivenessTracker::new(resolve_turn_liveness_v1(&request, None));
+                let due = tracker.work_due_ms().unwrap();
+                self.configure.0.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(due)).await;
+                assert_eq!(
+                    tracker.due_cause(due, false),
+                    Some(TurnLivenessCauseV1::WorkCutoff)
+                );
+                Err(BridgeError::AgentTimedOut)
+            }
             "parked" => Ok(Box::pin(futures::stream::pending())),
             "status-reject" => {
                 use futures::StreamExt;
@@ -126,7 +150,7 @@ impl AgentBackend for Provider {
                 ))
             }
             "reject" | "shared-reject" | "accepted" | "billing" | "billing-match" | "region"
-            | "rate" | "cleanup" | "blocked-cleanup" | "cleanup-effect" => Err(error),
+            | "rate" | "exhaust" | "cleanup" | "blocked-cleanup" | "cleanup-effect" => Err(error),
             "tool" => {
                 obs.activity.record(
                     bridge_core::attempt_activity::AttemptPhase::Tool,
@@ -179,6 +203,9 @@ impl AgentBackend for Provider {
                 1,
             );
         }
+        if self.behavior == "cutoff" {
+            self.cleanup.0.notify_one();
+        }
         self.cleaned.fetch_add(1, Ordering::SeqCst);
         Ok(if self.behavior == "cleanup" {
             BackendCleanupDispositionV1::Unknown
@@ -199,6 +226,7 @@ struct SecondDispatchFailure(
     AtomicUsize,
     Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
     Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    usize,
 );
 #[async_trait::async_trait]
 impl WorkflowHistoryStore for SecondDispatchFailure {
@@ -210,7 +238,7 @@ impl WorkflowHistoryStore for SecondDispatchFailure {
         self.0.reserve(r).await
     }
     async fn mark_prompt_acceptance(&self, id: &AttemptId, a: &str) -> Result<(), LedgerError> {
-        if self.1.fetch_add(1, Ordering::SeqCst) == 1 {
+        if self.1.fetch_add(1, Ordering::SeqCst) == self.4 {
             if let Some(gate) = &self.2 {
                 gate.0.notify_one();
                 gate.1.notified().await;
@@ -269,7 +297,7 @@ impl Fixture {
     pub(crate) fn new(source: &'static str, target: &'static str, chain: bool) -> Self {
         Self::with_dispatch_failure(source, target, chain, false)
     }
-    fn with_dispatch_failure(
+    pub(crate) fn with_dispatch_failure(
         source: &'static str,
         target: &'static str,
         chain: bool,
@@ -305,24 +333,34 @@ impl Fixture {
         std::fs::create_dir(&scope).unwrap();
         let dispatch_gate = Arc::<(tokio::sync::Notify, tokio::sync::Notify)>::default();
         let cleaned = Arc::new(AtomicUsize::new(0));
-        let providers: Vec<_> = [source, target, "setup", "parked"]
-            .into_iter()
-            .map(|behavior| {
-                Arc::new(Provider {
-                    behavior,
-                    setup: AtomicUsize::new(0),
-                    prompts: AtomicUsize::new(0),
-                    cancels: AtomicUsize::new(0),
-                    forgets: AtomicUsize::new(0),
-                    cleaned: cleaned.clone(),
-                    inputs: Mutex::new(vec![]),
-                    cleanup: Default::default(),
-                    configure: Default::default(),
-                    sessions: Default::default(),
-                    activity: Default::default(),
-                })
+        let providers: Vec<_> = [
+            source,
+            target,
+            if target == "exhaust" {
+                "reject"
+            } else {
+                "setup"
+            },
+            "parked",
+        ]
+        .into_iter()
+        .map(|behavior| {
+            Arc::new(Provider {
+                behavior,
+                setup: AtomicUsize::new(0),
+                prompts: AtomicUsize::new(0),
+                cancels: AtomicUsize::new(0),
+                forgets: AtomicUsize::new(0),
+                cleaned: cleaned.clone(),
+                inputs: Mutex::new(vec![]),
+                cleanup: Default::default(),
+                configure: Default::default(),
+                sessions: Default::default(),
+                activity: Default::default(),
+                liveness: Default::default(),
             })
-            .collect();
+        })
+        .collect();
         let seed = common::single_agent_registry("source", providers[0].clone());
         let entries: Vec<_> = ["source", "target", "last", "other"]
             .into_iter()
@@ -419,16 +457,19 @@ impl Fixture {
             Arc::new(bridge_observ::NoopObserver),
             3,
         )
-        .with_workflow_history(Ok(if fail || target == "ledger-gate" || admission_gate {
-            Arc::new(SecondDispatchFailure(
-                store.clone(),
-                AtomicUsize::new(0),
-                (target == "ledger-gate").then(|| dispatch_gate.clone()),
-                admission_gate.then(|| dispatch_gate.clone()),
-            ))
-        } else {
-            store.clone()
-        }))
+        .with_workflow_history(Ok(
+            if fail || matches!(target, "ledger-gate" | "first-gate") || admission_gate {
+                Arc::new(SecondDispatchFailure(
+                    store.clone(),
+                    AtomicUsize::new(0),
+                    matches!(target, "ledger-gate" | "first-gate").then(|| dispatch_gate.clone()),
+                    admission_gate.then(|| dispatch_gate.clone()),
+                    usize::from(target != "first-gate"),
+                ))
+            } else {
+                store.clone()
+            },
+        ))
         .with_accounting(AccountingV1 {
             billing: Some(billing),
             budget_policy: governed.then(|| {
@@ -519,20 +560,42 @@ impl Fixture {
     }
     #[allow(dead_code)] // Shared with served and production-composition witnesses.
     pub(crate) fn server(&self) -> Arc<bridge_a2a_inbound::server::InboundServer> {
-        struct Route;
+        self.served_server(false, Arc::new(bridge_a2a_outbound::StubDelegation))
+    }
+    #[allow(dead_code)]
+    pub(crate) fn served_server(
+        &self,
+        fanout: bool,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<bridge_a2a_inbound::server::InboundServer> {
+        struct Route(bool);
         impl RouteDecision for Route {
+            fn route_before_default(
+                &self,
+                meta: &TaskMeta,
+            ) -> Result<Option<RouteTarget>, BridgeError> {
+                if self.0 {
+                    self.route(meta).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
             fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-                Ok(RouteTarget::Local(
-                    meta.agent.clone().unwrap_or(AgentId::parse("source")?),
-                ))
+                if self.0 && meta.agent.is_none() {
+                    Ok(RouteTarget::Fanout)
+                } else {
+                    Ok(RouteTarget::Local(
+                        meta.agent.clone().unwrap_or(AgentId::parse("source")?),
+                    ))
+                }
             }
         }
         Arc::new(bridge_a2a_inbound::server::InboundServer::from_coordinator(
             self.coordinator.clone(),
-            Arc::new(Route),
+            Arc::new(Route(fanout)),
             Arc::new(bridge_policy::auth::AlwaysGrant),
             "http://localhost",
-            Arc::new(bridge_a2a_outbound::StubDelegation),
+            delegation,
             "source",
         ))
     }
