@@ -20,6 +20,12 @@ pub struct WorkflowAccountingInvocationV1 {
 }
 
 impl WorkflowAccountingInvocationV1 {
+    pub(crate) fn admits_fresh_fallback(&self) -> bool {
+        self.accounting.budget_policy.is_none()
+            && self.owner.ordinal == 0
+            && self.owner.parent_attempt_id.is_none()
+    }
+
     pub fn new(mut accounting: AccountingV1, owner: AttemptIdentity, workflow: WorkflowId) -> Self {
         accounting.budget_context = Some(BudgetContextV1 {
             request: BudgetRequestIdV1::Execution(owner.execution_id.clone()),
@@ -102,6 +108,13 @@ impl WorkflowAccountingSelectionV1 {
         }
         let mut next = progress.clone();
         next.selected_chain = selected_chain;
+        if next
+            .visits
+            .last()
+            .is_some_and(|visit| visit.position == position)
+        {
+            next.retries_consumed += 1;
+        }
         next.visits.push(CandidateVisitV1 {
             position,
             accounting_id: self.selection.concrete.as_str().into(),

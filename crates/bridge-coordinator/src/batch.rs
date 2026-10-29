@@ -449,6 +449,23 @@ async fn resumed_child_future(
         }
     };
     let (graph, frozen_run_spec) = decoded.into_parts();
+    if frozen_run_spec
+        .as_ref()
+        .is_some_and(|spec| spec.fallback_chains.is_some())
+    {
+        let _ = finalize_detached(
+            &deps.detached.task_store,
+            &deps.detached.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("not resumable: workflow candidate recovery is not activated"),
+            None,
+        )
+        .await;
+        drop(permit);
+        return None;
+    }
 
     let cps = match deps.detached.task_store.node_checkpoints(&task).await {
         Ok(cps) => cps,

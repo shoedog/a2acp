@@ -5369,10 +5369,43 @@ fn admitted_review_checkout(
 }
 
 async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
+    run_workflow_with_registry(args, None).await
+}
+
+#[cfg(test)]
+type LocalWorkflowEvents =
+    Arc<std::sync::Mutex<Vec<Result<bridge_workflow::executor::WorkflowEvent, BridgeError>>>>;
+
+struct LocalWorkflowRegistryOverride {
+    registry: Arc<dyn bridge_core::ports::AgentRegistry>,
+    store: Arc<SqliteStore>,
+    #[cfg(test)]
+    history_reservation_error: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
+    #[cfg(test)]
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    #[cfg(test)]
+    events: Option<LocalWorkflowEvents>,
+}
+
+async fn run_workflow_with_registry(
+    args: &[String],
+    registry_override: Option<LocalWorkflowRegistryOverride>,
+) -> Result<(), BoxError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_WORKFLOW_USAGE}");
         return Ok(());
     }
+    #[cfg(test)]
+    let workflow_events = registry_override.as_ref().and_then(|o| o.events.clone());
+    #[cfg(test)]
+    let cancellation = registry_override
+        .as_ref()
+        .and_then(|o| o.cancellation.clone())
+        .unwrap_or_default();
+    #[cfg(test)]
+    let history_reservation_error = registry_override
+        .as_ref()
+        .and_then(|override_| override_.history_reservation_error);
     bridge_observ::init();
     let heartbeat = heartbeat::heartbeat_interval(
         args,
@@ -5517,6 +5550,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             opened
         }
     };
+    let selected_history = registry_override
+        .as_ref()
+        .map(|override_| Ok(override_.store.clone()))
+        .unwrap_or(selected_history);
     if let Err(error) = &selected_history {
         if error.reason
             == bridge_core::workflow_history::LedgerUnavailableReason::UnsupportedConfiguration
@@ -5531,12 +5568,15 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // Accounting is mandatory for local workflows and owns the selected durable allocation,
     // independently of optional history reservation/telemetry degradation below. Never allocate
     // a second store or install accounting on the remote-client early-return path.
-    let accounting_store = selected_history.as_ref().map_err(|error| {
-        format!(
-            "run-workflow: accounting storage unavailable ({})",
-            error.reason.as_str()
-        )
-    })?;
+    let accounting_store = selected_history
+        .as_ref()
+        .map_err(|error| {
+            format!(
+                "run-workflow: accounting storage unavailable ({})",
+                error.reason.as_str()
+            )
+        })?
+        .clone();
     let usage_store = accounting_store.clone();
     let accounting = bridge_workflow::accounting::WorkflowAccountingInvocationV1::new(
         bridge_core::accounting::AccountingV1 {
@@ -5696,10 +5736,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         Some(Arc::clone(&liveness_board)),
     );
-    let registry = Arc::new(
-        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
-            .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
-    );
+    let registry: Arc<dyn AgentRegistry> = match registry_override {
+        Some(override_) => override_.registry,
+        None => Arc::new(
+            bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
+                .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
+        ),
+    };
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
@@ -5798,6 +5841,54 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None
     };
 
+    let operator_chains = admission_cfg.fallback_chains_v1()?;
+    if admission_cfg.governance.is_none() && !operator_chains.is_empty() {
+        authority = workflow_admission.bind_local_chains(authority, &operator_chains)?;
+    }
+    let candidate_task = authority
+        .run_spec
+        .fallback_chains
+        .as_ref()
+        .map(|_| bridge_core::ids::TaskId::parse(identity.execution_id.as_str()))
+        .transpose()?;
+    if let Some(task) = candidate_task.clone() {
+        use bridge_core::task_store::{
+            TaskAttemptLocator, TaskRecord, TaskRecordStatus, TaskStore,
+        };
+        let now = bridge_core::task_store::system_wall_now_ms();
+        accounting_store
+            .create_with_attempt_locator(
+                &TaskRecord {
+                    id: task.clone(),
+                    workflow: workflow_id.clone(),
+                    status: TaskRecordStatus::Working,
+                    result: None,
+                    error: None,
+                    created_ms: now,
+                    updated_ms: now,
+                    last_artifact_ms: None,
+                    input: input.clone(),
+                    workflow_spec_json: Some(String::from_utf8(
+                        authority.run_spec.encode_snapshot_v2()?,
+                    )?),
+                    resume_attempts: 0,
+                    session_cwd: authority
+                        .run_spec
+                        .requested_session_cwd
+                        .as_ref()
+                        .map(|cwd| cwd.as_str().into()),
+                    batch_id: None,
+                    item_id: None,
+                    artifacts_purged_at: None,
+                },
+                &TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await?;
+    }
+
     // Optional history remains fail-open except for identity collision and an
     // unsupported physical-accounting configuration. Both fail closed before
     // any session/provider effect.
@@ -5809,7 +5900,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Ok(store) => {
             let reservation = bridge_core::workflow_history::AttemptReservation {
                 identity: identity.clone(),
-                task_id: None,
+                task_id: candidate_task.clone(),
                 workflow: workflow_id.clone(),
                 task_class: "workflow".into(),
                 surface: bridge_core::workflow_history::ExecutionSurface::Offline,
@@ -5857,12 +5948,21 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 expected_node_count,
                 nodes,
             };
-            match bridge_core::workflow_history::WorkflowHistoryStore::reserve_v2(
-                store.as_ref(),
-                &structured_reservation,
-            )
-            .await
-            {
+            let reservation_result = {
+                let reservation = bridge_core::workflow_history::WorkflowHistoryStore::reserve_v2(
+                    store.as_ref(),
+                    &structured_reservation,
+                );
+                #[cfg(not(test))]
+                let reservation_result = reservation.await;
+                #[cfg(test)]
+                let reservation_result = match history_reservation_error {
+                    Some(reason) => Err(bridge_core::workflow_history::LedgerError::new(reason)),
+                    None => reservation.await,
+                };
+                reservation_result
+            };
+            match reservation_result {
                 Ok(()) => Some(store),
                 Err(error)
                     if matches!(
@@ -5898,6 +5998,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
             None
         }
+    };
+
+    // History admission may replace the frozen run spec with its degraded
+    // ledger state. Install fallback only after that state is final so the
+    // executor and diagnostic context share the exact same authority.
+    let executor = if let Some(task) = candidate_task.clone() {
+        executor.with_local_fallback(
+            workflow_admission,
+            authority.clone(),
+            accounting_store.clone(),
+            task,
+        )
+    } else {
+        executor
     };
 
     let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
@@ -6021,13 +6135,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     use futures::StreamExt;
     let expected_node_count = graph.nodes.len();
-    let mut stream = executor.run_with_diagnostic_context(
-        graph,
-        input,
-        run_id,
-        tokio_util::sync::CancellationToken::new(),
-        diagnostic_ctx,
-    );
+    #[cfg(not(test))]
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut stream =
+        executor.run_with_diagnostic_context(graph, input, run_id, cancellation, diagnostic_ctx);
     let beat = heartbeat::spawn_heartbeat(
         heartbeat,
         heartbeat::board_poller(liveness_board, observer_key),
@@ -6047,6 +6158,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut budget_refusal = None;
     let mut policy_trigger_json: Option<String> = None;
     while let Some(item) = stream.next().await {
+        #[cfg(test)]
+        if let Some(events) = workflow_events.as_ref() {
+            events.lock().unwrap().push(item.clone());
+        }
         match item {
             Ok(WorkflowEvent::NodeStarted { node, selection }) => {
                 let ordinal = u64::from(completed_nodes)
@@ -6219,8 +6334,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
 
     // Resolve negotiated terminal evidence before publishing either the output
     // or the process result. Unsupported legacy turns retain their stream
-    // outcome; a v1 resolution is authoritative for both durable and public
-    // projections.
+    // outcome. This run-level decision does not revise completed node records;
+    // it is recorded in the candidate task and attempt summary below.
     let evidence_counts = terminal_evidence.counts();
     let single_evidence = terminal_evidence.single_turn();
     let (
@@ -6384,6 +6499,25 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let finalization_ms = attempt_timing
         .elapsed_ms()
         .saturating_sub(finalization_started_ms);
+
+    if let Some(task) = candidate_task {
+        use bridge_core::task_store::{TaskRecordStatus, TaskStore};
+        usage_store
+            .set_terminal(
+                &task,
+                if terminal_outcome == "canceled" {
+                    TaskRecordStatus::Canceled
+                } else if ok {
+                    TaskRecordStatus::Completed
+                } else {
+                    TaskRecordStatus::Failed
+                },
+                Some(&output),
+                None,
+                bridge_core::task_store::system_wall_now_ms(),
+            )
+            .await?;
+    }
 
     // The resolved result/output is published before summary finalization; a
     // summary-store failure cannot roll back bytes already handed to the caller.
@@ -20896,8 +21030,7 @@ cmd = "cargo build --locked"
 }
 
 #[cfg(test)]
-#[path = "../tests/fallback_direct.rs"]
-mod fallback_billing_fixture;
+use local_fallback_fixture::direct as fallback_billing_fixture;
 #[cfg(test)]
 #[tokio::test]
 async fn production_billing_per_visited_candidate() {
@@ -21072,5 +21205,329 @@ async fn production_billing_per_visited_candidate() {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/fallback_workflow.rs"]
+mod local_fallback_fixture;
+#[cfg(test)]
+#[tokio::test]
+async fn workflow_declared_fallback_local_and_retry_accounting() {
+    local_fallback_fixture::local_activation(|args, registry, store| async move {
+        run_workflow_with_registry(
+            &args,
+            Some(LocalWorkflowRegistryOverride {
+                registry,
+                store,
+                history_reservation_error: None,
+                cancellation: None,
+                events: None,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round4_history_degradation_uses_final_fallback_authority() {
+    local_fallback_fixture::round4_history_admission(|args, registry, store, reason| async move {
+        run_workflow_with_registry(
+            &args,
+            Some(LocalWorkflowRegistryOverride {
+                registry,
+                store,
+                history_reservation_error: Some(reason),
+                cancellation: None,
+                events: None,
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round5_persisted_attempt_telemetry_parity() {
+    local_fallback_fixture::round5_persisted_attempt_telemetry_parity(
+        |args, registry, store| async move {
+            run_workflow_with_registry(
+                &args,
+                Some(LocalWorkflowRegistryOverride {
+                    registry,
+                    store,
+                    history_reservation_error: None,
+                    cancellation: None,
+                    events: None,
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        },
+    )
+    .await;
+}
+
+#[cfg(test)]
+async fn round6_run_harvest_publication(audit_failure: bool) {
+    local_fallback_fixture::round6_harvest_publication(
+        |args, registry, store| async move {
+            run_workflow_with_registry(
+                &args,
+                Some(LocalWorkflowRegistryOverride {
+                    registry,
+                    store,
+                    history_reservation_error: None,
+                    cancellation: None,
+                    events: None,
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        },
+        audit_failure,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round6_harvested_body_matches_cli_checkpoint_and_replay() {
+    round6_run_harvest_publication(false).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round6_audit_failure_leaves_no_successful_checkpoint() {
+    round6_run_harvest_publication(true).await;
+}
+
+#[cfg(test)]
+async fn round7_run_terminal_publication(behavior: &'static str, chain: bool) {
+    local_fallback_fixture::round7_terminal_publication(
+        |args, registry, store| async move {
+            run_workflow_with_registry(
+                &args,
+                Some(LocalWorkflowRegistryOverride {
+                    registry,
+                    store,
+                    history_reservation_error: None,
+                    cancellation: None,
+                    events: None,
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        },
+        behavior,
+        chain,
+        local_fallback_fixture::TerminalPublicationShape::Single,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn single_missing_v1_preserves_node_success() {
+    round8_run_terminal_publication(
+        "v1-missing",
+        local_fallback_fixture::TerminalPublicationShape::Single,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round7_v1_valid_evidence_publication_matches_cli() {
+    round7_run_terminal_publication("v1-final", true).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round7_legacy_publication_matches_cli() {
+    round7_run_terminal_publication("final-only", true).await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round7_v1_missing_evidence_without_chain_is_unchanged() {
+    round7_run_terminal_publication("v1-missing", false).await;
+}
+
+#[cfg(test)]
+async fn round8_run_terminal_publication(
+    behavior: &'static str,
+    shape: local_fallback_fixture::TerminalPublicationShape,
+) {
+    let mut projections = Vec::new();
+    for chain in [false, true] {
+        projections.push(
+            local_fallback_fixture::round7_terminal_publication(
+                |args, registry, store| async move {
+                    let events = LocalWorkflowEvents::default();
+                    let result = run_workflow_with_registry(
+                        &args,
+                        Some(LocalWorkflowRegistryOverride {
+                            registry,
+                            store,
+                            history_reservation_error: None,
+                            cancellation: None,
+                            events: Some(events.clone()),
+                        }),
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                    assert_local_node_completion(
+                        &events,
+                        true,
+                        behavior.starts_with("v1-").then_some(7),
+                    );
+                    result
+                },
+                behavior,
+                chain,
+                shape,
+            )
+            .await,
+        );
+    }
+    assert_eq!(projections[0], projections[1], "{behavior}");
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn two_turn_missing_v1_matches_ordinary() {
+    round8_run_terminal_publication(
+        "v1-missing",
+        local_fallback_fixture::TerminalPublicationShape::Predecessor,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round8_two_node_v1_valid_matches_ordinary() {
+    round8_run_terminal_publication(
+        "v1-final",
+        local_fallback_fixture::TerminalPublicationShape::Predecessor,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round8_two_node_legacy_matches_ordinary() {
+    round8_run_terminal_publication(
+        "final-only",
+        local_fallback_fixture::TerminalPublicationShape::Predecessor,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn round8_candidate_before_later_turn_matches_ordinary() {
+    round8_run_terminal_publication(
+        "v1-missing",
+        local_fallback_fixture::TerminalPublicationShape::Successor,
+    )
+    .await;
+}
+
+#[cfg(test)]
+async fn run_seam_publication_exit(case: &'static str) {
+    local_fallback_fixture::seam_publication_exits(
+        |args, registry, store, cancellation| async move {
+            let events = LocalWorkflowEvents::default();
+            let result = run_workflow_with_registry(
+                &args,
+                Some(LocalWorkflowRegistryOverride {
+                    registry,
+                    store,
+                    history_reservation_error: None,
+                    cancellation: Some(cancellation),
+                    events: Some(events.clone()),
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string());
+            assert_local_node_completion(
+                &events,
+                !matches!(case, "own-audit" | "own-transaction"),
+                Some(7),
+            );
+            if matches!(case, "audit" | "own-audit") {
+                assert!(events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, Err(BridgeError::HarvestAuditPersistFailed { .. }))));
+            } else if case == "own-transaction" {
+                assert!(events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, Err(BridgeError::StoreFailure))));
+            }
+            result
+        },
+        case,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn later_setup_failure_preserves_completed_candidate() {
+    run_seam_publication_exit("setup").await;
+}
+#[cfg(test)]
+#[tokio::test]
+async fn later_executor_error_preserves_completed_candidate() {
+    run_seam_publication_exit("audit").await;
+}
+#[cfg(test)]
+#[tokio::test]
+async fn later_cancellation_preserves_completed_candidate() {
+    run_seam_publication_exit("cancel-before").await;
+    run_seam_publication_exit("cancel-running").await;
+}
+#[cfg(test)]
+#[tokio::test]
+async fn dependent_observes_committed_candidate() {
+    run_seam_publication_exit("observe").await;
+}
+#[cfg(test)]
+#[tokio::test]
+async fn own_publication_failure_blocks_dependents() {
+    run_seam_publication_exit("own-audit").await;
+    run_seam_publication_exit("own-transaction").await;
+}
+
+#[cfg(test)]
+fn assert_local_node_completion(events: &LocalWorkflowEvents, published: bool, used: Option<u64>) {
+    let events = events.lock().unwrap();
+    let completions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Ok(bridge_workflow::executor::WorkflowEvent::NodeFinished {
+                node,
+                ok: true,
+                output,
+                usage,
+                ..
+            }) if node.as_str() == "node" => Some((output, usage)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), usize::from(published));
+    if published {
+        assert_eq!(completions[0].0, "answer");
+        assert_eq!(completions[0].1.as_ref().and_then(|usage| usage.used), used);
     }
 }
