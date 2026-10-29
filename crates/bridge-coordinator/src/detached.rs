@@ -5118,6 +5118,22 @@ pub async fn resume_one_working_task_with_accounting(
         }
     };
     let (graph, frozen_run_spec) = decoded.into_parts();
+    if frozen_run_spec
+        .as_ref()
+        .is_some_and(|spec| spec.fallback_chains.is_some())
+    {
+        let _ = finalize_detached(
+            &deps.task_store,
+            &deps.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("not resumable: workflow candidate recovery is not activated"),
+            None,
+        )
+        .await;
+        return;
+    }
     let is_v2 = frozen_run_spec.is_some();
 
     // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).

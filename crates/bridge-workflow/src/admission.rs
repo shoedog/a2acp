@@ -190,6 +190,103 @@ pub struct FreshWorkflowAdmissionV3 {
 }
 
 impl WorkflowAdmissionV1 {
+    /// Local operator declarations, bound to the frozen source selection. This
+    /// does not resolve any provider or grant authority to request metadata.
+    pub fn bind_local_chains(
+        &self,
+        mut admitted: AdmittedWorkflowRunV1,
+        chains: &[bridge_core::routing::FrozenFallbackChainV1],
+    ) -> Result<AdmittedWorkflowRunV1, BridgeError> {
+        let mut nodes = BTreeMap::new();
+        for identity in &admitted.run_spec.node_execution_identities {
+            let node = admitted
+                .run_spec
+                .graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    PolicyNodeRefV1::from_node_id(identity.node.sorted_ordinal, node.id.as_str())
+                        == identity.node
+                })
+                .ok_or_else(|| invalid("missing fallback node"))?;
+            let executor = crate::executor::WorkflowExecutor::new(self.registry.clone());
+            let selected: Vec<_> = chains
+                .iter()
+                .filter(|chain| {
+                    chain.source.agent == identity.selection.agent
+                        && Some(&chain.source.model) == identity.selection.effective_model.as_ref()
+                        && chain.source.posture.mode == identity.selection.effective_mode
+                        && executor.candidate_is_admitted(&admitted, node, &chain.source)
+                })
+                .cloned()
+                .collect();
+            if !selected.is_empty() {
+                let node = &admitted
+                    .run_spec
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        PolicyNodeRefV1::from_node_id(
+                            identity.node.sorted_ordinal,
+                            node.id.as_str(),
+                        ) == identity.node
+                    })
+                    .ok_or_else(|| invalid("missing fallback node"))?
+                    .id;
+                nodes.insert(node.clone(), selected);
+            }
+        }
+        admitted.run_spec = Arc::new(
+            (*admitted.run_spec)
+                .clone()
+                .with_fallback_chains(nodes)
+                .map_err(|_| invalid("invalid local fallback authority"))?,
+        );
+        Ok(admitted)
+    }
+
+    pub(crate) async fn freeze_successor(
+        &self,
+        source: &WorkflowRunSpecV1,
+        node: &bridge_core::ids::NodeId,
+        candidate: &bridge_core::routing::FallbackCandidateV1,
+    ) -> Result<AdmittedWorkflowRunV1, BridgeError> {
+        let mut graph = source.graph.clone();
+        let target = graph
+            .nodes
+            .iter_mut()
+            .find(|n| &n.id == node)
+            .ok_or_else(|| invalid("missing fallback node"))?;
+        target.agent = candidate.agent.clone();
+        target.model = Some(candidate.model.clone());
+        target.mode = candidate.posture.mode.clone();
+        target.effort = None;
+        let mut admitted = self
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: source.attempt_id.clone(),
+                graph: Arc::new(graph),
+                requested_session_cwd: source.requested_session_cwd.clone(),
+                policy_invocation: ExecutionPolicyInvocationV1::default(),
+                ledger_admission: source.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await?;
+        let spec = &admitted.run_spec;
+        admitted.run_spec = Arc::new(
+            WorkflowRunSpecV1::build(
+                spec.attempt_id.clone(),
+                spec.graph.clone(),
+                source.controls.clone(),
+                spec.requested_session_cwd.clone(),
+                spec.node_execution_identities.clone(),
+                spec.ledger_admission.clone(),
+            )
+            .map_err(|_| invalid("invalid successor controls"))?,
+        );
+        Ok(admitted)
+    }
+
     pub fn new(
         registry: Arc<dyn AgentRegistry>,
         checkout_planner: Arc<dyn WorkflowCheckoutPlannerV1>,

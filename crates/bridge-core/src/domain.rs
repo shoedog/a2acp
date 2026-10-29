@@ -126,7 +126,7 @@ pub enum EgressPolicy {
 }
 
 /// A named bundle: which CLI adapter to launch + model/effort/mode configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentEntry {
     pub id: AgentId,
     /// Process command for `kind="acp"`; `None` for non-process kinds (e.g. `Api`).
