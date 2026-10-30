@@ -26,6 +26,29 @@ impl WorkflowAccountingInvocationV1 {
             && self.owner.parent_attempt_id.is_none()
     }
 
+    /// Resumed execution requires the already claimed durable owner. This check
+    /// grants no preparation permission and never consumes a resume slot.
+    pub(crate) async fn validate_resumed_owner(
+        &self,
+        store: &dyn bridge_core::task_store::TaskStore,
+        task: &bridge_core::ids::TaskId,
+        spec: &crate::run_spec::WorkflowRunSpecV1,
+    ) -> Result<(), BridgeError> {
+        if self.owner.ordinal == 0
+            || self.owner.parent_attempt_id.is_none()
+            || self.owner.attempt_id != spec.attempt_id
+            || self.owner.execution_id.as_str() != task.as_str()
+            || self.workflow != spec.graph.id
+            || store
+                .get_attempt_locator(task)
+                .await?
+                .is_none_or(|locator| locator.identity != self.owner)
+        {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+        Ok(())
+    }
+
     pub fn new(mut accounting: AccountingV1, owner: AttemptIdentity, workflow: WorkflowId) -> Self {
         accounting.budget_context = Some(BudgetContextV1 {
             request: BudgetRequestIdV1::Execution(owner.execution_id.clone()),
