@@ -1508,6 +1508,586 @@ async fn workflow_authority_scope_and_barrier_refusals() {
     }
 }
 
+// Seed durable crash boundaries without running a provider: all recovery effects
+// can therefore be asserted absolutely zero, including preparation and accounting.
+async fn recovery_candidate_fixture(case: &str) -> (CandidateFixture, AdmittedWorkflowRunV1) {
+    let h = CandidateFixture::new("reject", "success").await;
+    let mut initial = h.admission("source").await;
+    if case == "checkpoint-dependencies" {
+        let mut graph = initial.run_spec.graph.clone();
+        let mut upstream = graph.nodes[0].clone();
+        upstream.id = NodeId::parse("upstream").unwrap();
+        graph.nodes[0].inputs.push(upstream.id.clone());
+        graph.nodes.push(upstream);
+        initial = h
+            .builder()
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: h.owner.attempt_id.clone(),
+                graph: Arc::new(graph),
+                requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+                policy_invocation: Default::default(),
+                ledger_admission: initial.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+    }
+    let admitted = h
+        .builder()
+        .bind_local_chains(initial, &h.run.progress.chains)
+        .unwrap();
+    let task = &TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let node = NodeId::parse("node").unwrap();
+    let mut progress = h.run.progress.clone();
+    if case == "missing" {
+        return (h, admitted);
+    }
+    h.f.store
+        .put_candidate_progress_v1(task, &node, None, &progress)
+        .await
+        .unwrap();
+    if case == "empty" {
+        return (h, admitted);
+    }
+    let rejection: CandidateRejectionV1 = serde_json::from_value(serde_json::json!({
+        "diagnostic": {"schema_version":1, "failed_phase":"prompt_start", "class":"quota_exhausted",
+            "disposition":"fatal", "code":"fixture.rejected", "summary":"original rejection",
+            "causes":[], "stderr_observed":false, "stderr_line_count":0,
+            "prompt_may_have_been_accepted":false},
+        "non_acceptance":true, "no_effects":true, "cleanup_complete":true,
+        "persistence_error":null, "canceled":false
+    }))
+    .unwrap();
+    let completed = case.starts_with("completed")
+        || case.starts_with("checkpoint")
+        || case.starts_with("terminal");
+    let successor = match case {
+        "preparing" => Some(CandidatePhaseV1::Preparing),
+        "prepared" => Some(CandidatePhaseV1::Prepared),
+        "fenced" => Some(CandidatePhaseV1::PollFenced),
+        "polled" => Some(CandidatePhaseV1::Polled),
+        _ => None,
+    };
+    for position in 0..=usize::from(successor.is_some()) {
+        let candidate = if position == 0 {
+            &progress.source
+        } else {
+            &progress.chains[0].steps[0]
+        };
+        let id = AttemptId::mint().unwrap().as_str().to_owned();
+        h.f.store
+            .start_usage_attempt_v1(&UsageAttemptV1 {
+                id: id.clone(),
+                attribution: bridge_core::accounting::UsageAttributionV1 {
+                    execution: Some(h.owner.execution_id.as_str().into()),
+                    run_attempt: Some(h.owner.attempt_id.as_str().into()),
+                    workflow: Some("workflow".into()),
+                    node: Some("node".into()),
+                    agent: candidate.agent.as_str().into(),
+                    effective_model: Some(candidate.model.clone()),
+                    effective_mode: candidate.posture.mode.clone(),
+                    attempt_kind: "node".into(),
+                    ..Default::default()
+                },
+                started_ms: 1,
+                utc_day: 0,
+                dispatched: false,
+                finalized: false,
+                usage: Default::default(),
+                cost_invalid: false,
+            })
+            .await
+            .unwrap();
+        for phase in [
+            CandidatePhaseV1::Preparing,
+            CandidatePhaseV1::Prepared,
+            CandidatePhaseV1::PollFenced,
+            CandidatePhaseV1::Polled,
+        ] {
+            let old = progress.clone();
+            if phase == CandidatePhaseV1::Preparing {
+                progress.visits.push(CandidateVisitV1 {
+                    position,
+                    accounting_id: id.clone(),
+                    owner: h.owner.clone(),
+                    cold_context: ContextId::parse(format!("cold-{position}")).unwrap(),
+                    phase,
+                    rejection: None,
+                });
+            } else {
+                progress.visits.last_mut().unwrap().phase = phase;
+            }
+            h.f.store
+                .put_candidate_progress_v1(task, &node, Some(&old), &progress)
+                .await
+                .unwrap();
+            if phase == CandidatePhaseV1::Polled {
+                h.f.store
+                    .update_usage_attempt_v1(&id, true, None, true)
+                    .await
+                    .unwrap();
+            }
+            if position == 1 && Some(phase) == successor {
+                break;
+            }
+        }
+        if position == 0 && !completed {
+            let old = progress.clone();
+            progress.selected_chain = Some(0);
+            progress.visits[0].rejection = Some(rejection.clone());
+            h.f.store
+                .put_candidate_progress_v1(task, &node, Some(&old), &progress)
+                .await
+                .unwrap();
+        }
+    }
+    if completed {
+        let old = progress.clone();
+        progress.terminal = Some(CandidateOutputV1 {
+            output: "exact checkpoint output".into(),
+            ok: true,
+            usage: Some(bridge_core::orch::UsageSnapshot {
+                used: Some(7),
+                at_ms: 3,
+                ..Default::default()
+            }),
+        });
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Completed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 0,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: None,
+        };
+        h.f.store
+            .complete_candidate_v2(
+                task,
+                &node,
+                &old,
+                &progress,
+                &OperationId::parse("op-recovery").unwrap(),
+                3,
+                Some(std::str::from_utf8(&terminal.encode_canonical().unwrap()).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let usage =
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    match case {
+        "accounting-missing" => {
+            usage.execute("DELETE FROM usage_attempts_v1", []).unwrap();
+        }
+        "accounting-conflict" => {
+            usage.execute("UPDATE usage_attempts_v1 SET record_json=json_set(record_json,'$.attribution.agent','other')", []).unwrap();
+        }
+        "accounting-dispatch" => {
+            usage.execute("UPDATE usage_attempts_v1 SET record_json=json_set(record_json,'$.dispatched',json('false'))", []).unwrap();
+        }
+        "lineage-missing" => {
+            db.execute("DELETE FROM task_attempt_locators", []).unwrap();
+        }
+        "owner-conflict" => {
+            progress.visits[0].owner.attempt_id = AttemptId::mint().unwrap();
+        }
+        "schema" => progress.schema_version = 99,
+        "retries" => progress.retries_consumed = 1,
+        "chain-drift" => progress.chains[0].id.push_str("-drift"),
+        "scope-drift" => {
+            let scope = h.f.dir.path().join("scope");
+            std::fs::rename(&scope, h.f.dir.path().join("old-scope")).unwrap();
+            std::fs::create_dir(scope).unwrap();
+        }
+        "authority-drift" => {
+            let mut snapshot = h.f.snapshot();
+            snapshot.entries[0].args.push("drift".into());
+            h.registry.apply(snapshot).await.unwrap();
+        }
+        "rejection-persistence" => {
+            progress.visits[0]
+                .rejection
+                .as_mut()
+                .unwrap()
+                .persistence_error = Some(BoundedReasonV1::parse("failed persistence").unwrap());
+        }
+        "rejection-accepted" => {
+            progress.visits[0]
+                .rejection
+                .as_mut()
+                .unwrap()
+                .non_acceptance = false
+        }
+        "rejection-effects" => progress.visits[0].rejection.as_mut().unwrap().no_effects = false,
+        "rejection-cleanup" => {
+            progress.visits[0]
+                .rejection
+                .as_mut()
+                .unwrap()
+                .cleanup_complete = false
+        }
+        "rejection-canceled" => progress.visits[0].rejection.as_mut().unwrap().canceled = true,
+        "completed-missing-progress" => {
+            db.execute("DELETE FROM task_candidate_progress_v1", [])
+                .unwrap();
+        }
+        "checkpoint-missing" => {
+            db.execute("DELETE FROM task_node_checkpoints", []).unwrap();
+        }
+        "checkpoint-output" => {
+            db.execute("UPDATE task_node_checkpoints SET output='conflict'", [])
+                .unwrap();
+        }
+        "checkpoint-ok" => {
+            db.execute("UPDATE task_node_checkpoints SET ok=0", [])
+                .unwrap();
+        }
+        "checkpoint-usage" => {
+            db.execute("UPDATE task_node_checkpoints SET usage_json=NULL", [])
+                .unwrap();
+        }
+        "checkpoint-unknown" => {
+            db.execute("UPDATE task_node_checkpoints SET node_id='foreign'", [])
+                .unwrap();
+        }
+        "terminal-missing" => {
+            db.execute("UPDATE task_node_checkpoints SET terminal_json=NULL", [])
+                .unwrap();
+        }
+        "terminal-corrupt" => {
+            db.execute("UPDATE task_node_checkpoints SET terminal_json='{}'", [])
+                .unwrap();
+        }
+        "terminal-disposition" => {
+            // Canonical, internally valid Failed terminal paired with ok=true.
+            let mut terminal: NodeTerminalV1 = NodeTerminalV1::decode_canonical(
+                &db.query_row("SELECT terminal_json FROM task_node_checkpoints", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+                .into_bytes(),
+            )
+            .unwrap();
+            terminal.primary = NodePrimaryDispositionV1::Failed;
+            terminal.cause = Some(NodeCauseV1::from_bridge_error(&BridgeError::AgentTimedOut));
+            db.execute(
+                "UPDATE task_node_checkpoints SET terminal_json=?1",
+                [String::from_utf8(terminal.encode_canonical().unwrap()).unwrap()],
+            )
+            .unwrap();
+        }
+        "policy-trigger" => {
+            let trigger = PolicyTriggerV1 {
+                schema_version: 1,
+                id: ControlEventIdV1::for_attempt(&h.owner.attempt_id, 0),
+                node: PolicyNodeRefV1::from_node_id(0, "node"),
+                policy: FanOutPolicyNameV1::FailFast,
+                grace_ms: None,
+            };
+            db.execute(
+                "UPDATE tasks SET policy_trigger_json=?1",
+                [String::from_utf8(trigger.encode_canonical().unwrap()).unwrap()],
+            )
+            .unwrap();
+        }
+        "pending-outcome" => {
+            db.execute("UPDATE tasks SET workflow_outcome='interrupted'", [])
+                .unwrap();
+        }
+        _ => {}
+    }
+    // Fault injection bypasses publication exclusively to model torn/corrupt storage.
+    db.execute(
+        "UPDATE task_candidate_progress_v1 SET progress_json=?1",
+        [serde_json::to_string(&progress).unwrap()],
+    )
+    .unwrap();
+    if case == "corrupt" {
+        db.execute(
+            "UPDATE task_candidate_progress_v1 SET progress_json='{}'",
+            [],
+        )
+        .unwrap();
+    }
+    (h, admitted)
+}
+
+async fn check_candidate_recovery_cases(cases: &[(&str, &str)], persistence_failure: bool) {
+    use bridge_coordinator::{batch::*, detached::*};
+    let mut mismatches = Vec::new();
+    // Reconciliation is exercised independently, so terminal shortcuts cannot
+    // hide an unchecked path even when a later consumer would also refuse it.
+    for consumer in ["detached", "batch", "reconciliation"] {
+        for &(case, expected) in cases {
+            let (h, admitted) = recovery_candidate_fixture(case).await;
+            let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+            let bid = BatchId::parse("batch-fixture").unwrap();
+            if consumer == "batch" {
+                h.f.store
+                    .create_batch(&BatchRecord {
+                        id: bid.clone(),
+                        workflow: "workflow".into(),
+                        concurrency: 1,
+                        total: 1,
+                        status: BatchStatus::Working,
+                        items_json: "{\"v\":1,\"items\":[]}".into(),
+                        error: None,
+                        created_ms: 1,
+                        updated_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+            db.execute(
+                "UPDATE tasks SET workflow_spec_json=?1,batch_id=?2,item_id=?3 WHERE id=?4",
+                rusqlite::params![
+                    String::from_utf8(admitted.run_spec.encode_snapshot_v2().unwrap()).unwrap(),
+                    (consumer == "batch").then(|| bid.as_str()),
+                    (consumer == "batch").then_some("one"),
+                    task.as_str()
+                ],
+            )
+            .unwrap();
+            if persistence_failure {
+                db.execute_batch("CREATE TRIGGER refuse_interruption BEFORE UPDATE OF status ON tasks WHEN NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'interruption fault'); END;").unwrap();
+            }
+            let record = h.f.store.get(&task).await.unwrap().unwrap();
+            let locator = h.f.store.get_attempt_locator(&task).await.unwrap();
+            let rows = if case == "missing" {
+                vec![]
+            } else {
+                h.f.rows()
+            };
+            let checkpoints = h.f.store.node_checkpoints(&task).await.unwrap();
+            let deps = DetachedDeps {
+                task_store: h.f.store.clone(),
+                executor: Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+                workflows: Arc::new(std::collections::HashMap::from([(
+                    admitted.run_spec.graph.id.clone(),
+                    Arc::new(admitted.run_spec.graph.clone()),
+                )])),
+                workflow_cancels: Default::default(),
+                progress_hubs: Default::default(),
+                clock: Arc::new(bridge_coordinator::clock::SystemClock),
+                observer: Arc::new(bridge_observ::NoopObserver),
+                workflow_history: None,
+                workflow_admission: Some(h.builder()),
+            };
+            match consumer {
+                "batch" => {
+                    run_admission(
+                        BatchDeps {
+                            detached: deps.clone(),
+                            runtime: BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+                            allowed_cwd_root: None,
+                        },
+                        bid,
+                        [record].into(),
+                        Default::default(),
+                        1,
+                        CancellationToken::new(),
+                        3,
+                    )
+                    .await
+                }
+                "detached" => resume_one_working_task(&deps, &record, 3).await,
+                _ => {
+                    assert!(reconcile_terminal_checkpoints(&deps).await);
+                    let after = h.f.store.get(&task).await.unwrap().unwrap();
+                    assert_eq!(after.status, TaskRecordStatus::Working);
+                    assert!(after.result.is_none());
+                    // Reconciliation validates but leaves chain-bearing snapshots
+                    // for the existing attempt sweep and consumer refusal ordering.
+                    resume_one_working_task(&deps, &record, 3).await;
+                }
+            }
+            let record = h.f.store.get(&task).await.unwrap().unwrap();
+            if persistence_failure {
+                assert_eq!(
+                    record.status,
+                    TaskRecordStatus::Working,
+                    "{consumer}/{case}"
+                );
+                assert!(record.error.is_none());
+                assert!(h
+                    .f
+                    .store
+                    .workflow_task_evidence(&task)
+                    .await
+                    .unwrap()
+                    .workflow_outcome
+                    .is_none());
+                assert!(h
+                    .f
+                    .store
+                    .pending_terminal_projection(&task)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    db.query_row(
+                        "SELECT last_event_seq FROM tasks WHERE id=?1",
+                        [task.as_str()],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    if checkpoints.is_empty() { 0 } else { 1 }
+                );
+            } else if record.status != TaskRecordStatus::Interrupted
+                || !record
+                    .error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected))
+            {
+                mismatches.push(format!(
+                    "{consumer}/{case}: {:?}, {:?}; expected {expected}",
+                    record.status, record.error
+                ));
+            }
+            assert_eq!(record.resume_attempts, 0, "{consumer}/{case}");
+            assert!(record.result.is_none());
+            assert_eq!(h.f.store.get_attempt_locator(&task).await.unwrap(), locator);
+            assert_eq!(
+                h.f.store.node_checkpoints(&task).await.unwrap(),
+                checkpoints
+            );
+            if case != "missing" {
+                assert_eq!(h.f.rows(), rows);
+            }
+            assert!(deps.progress_hubs.lock().await.is_empty());
+            assert!(deps.workflow_cancels.lock().await.is_empty());
+            assert!(h.f.spawns.lock().unwrap().is_empty());
+            assert!(h
+                .f
+                .providers
+                .iter()
+                .all(|p| p.setup.load(Ordering::SeqCst) == 0
+                    && p.prompts.load(Ordering::SeqCst) == 0));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[tokio::test]
+async fn workflow_checked_recovery_classifies_completed_and_continuation() {
+    check_candidate_recovery_cases(
+        &[
+            ("completed", "(completed)"),
+            ("continuation", "(continuation)"),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn workflow_checked_recovery_refuses_unsafe_and_drifted_evidence() {
+    check_candidate_recovery_cases(
+        &[
+            ("missing", "candidate progress missing"),
+            ("empty", "candidate state or frozen scope invalid"),
+            ("preparing", "candidate state or frozen scope invalid"),
+            ("prepared", "candidate state or frozen scope invalid"),
+            ("fenced", "candidate state or frozen scope invalid"),
+            ("polled", "candidate state or frozen scope invalid"),
+            (
+                "accounting-missing",
+                "candidate checked evidence unavailable",
+            ),
+            (
+                "accounting-conflict",
+                "candidate checked evidence unavailable",
+            ),
+            (
+                "accounting-dispatch",
+                "candidate checked evidence unavailable",
+            ),
+            ("owner-conflict", "candidate checked evidence unavailable"),
+            ("lineage-missing", "candidate lineage missing"),
+            ("schema", "candidate checked evidence unavailable"),
+            ("retries", "candidate checked evidence unavailable"),
+            ("corrupt", "candidate checked evidence unavailable"),
+            ("chain-drift", "candidate state or frozen scope invalid"),
+            ("scope-drift", "candidate state or frozen scope invalid"),
+            ("authority-drift", "candidate source authority drift"),
+            (
+                "rejection-persistence",
+                "candidate state or frozen scope invalid",
+            ),
+            (
+                "rejection-accepted",
+                "candidate state or frozen scope invalid",
+            ),
+            (
+                "rejection-effects",
+                "candidate state or frozen scope invalid",
+            ),
+            (
+                "rejection-cleanup",
+                "candidate state or frozen scope invalid",
+            ),
+            (
+                "rejection-canceled",
+                "candidate state or frozen scope invalid",
+            ),
+            ("policy-trigger", "committed V2 policy trigger"),
+            (
+                "pending-outcome",
+                "V2 terminal projection is already pending",
+            ),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn workflow_checked_recovery_validates_terminal_checkpoints_before_shortcuts() {
+    check_candidate_recovery_cases(
+        &[
+            (
+                "checkpoint-dependencies",
+                "candidate checkpoints are not closed under inputs",
+            ),
+            (
+                "checkpoint-missing",
+                "candidate checked evidence unavailable",
+            ),
+            (
+                "checkpoint-output",
+                "candidate checked evidence unavailable",
+            ),
+            ("checkpoint-ok", "candidate checkpoint disposition mismatch"),
+            ("checkpoint-usage", "candidate checked evidence unavailable"),
+            (
+                "checkpoint-unknown",
+                "candidate checkpoint references unknown node",
+            ),
+            ("completed-missing-progress", "candidate progress missing"),
+            ("terminal-missing", "V2 checkpoint terminal set mismatch"),
+            ("terminal-corrupt", "corrupt V2 node terminal"),
+            (
+                "terminal-disposition",
+                "candidate checkpoint disposition mismatch",
+            ),
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn workflow_checked_recovery_failed_interruption_stays_working() {
+    check_candidate_recovery_cases(&[("continuation", ""), ("completed", "")], true).await;
+}
+
 #[tokio::test]
 async fn workflow_recovery_consumers_refuse_before_executor_effects() {
     use bridge_coordinator::{batch::*, detached::*};
@@ -1582,10 +2162,7 @@ async fn workflow_recovery_consumers_refuse_before_executor_effects() {
         }
         let record = h.f.store.get(&task).await.unwrap().unwrap();
         assert_eq!(record.status, TaskRecordStatus::Interrupted);
-        assert!(record
-            .error
-            .unwrap()
-            .contains("candidate recovery is not activated"));
+        assert!(record.error.unwrap().contains("candidate progress missing"));
         assert_eq!(record.resume_attempts, 0);
         assert!(h.f.spawns.lock().unwrap().is_empty());
         assert!(h
