@@ -1511,7 +1511,13 @@ async fn workflow_authority_scope_and_barrier_refusals() {
 // Seed durable crash boundaries without running a provider: all recovery effects
 // can therefore be asserted absolutely zero, including preparation and accounting.
 async fn recovery_candidate_fixture(case: &str) -> (CandidateFixture, AdmittedWorkflowRunV1) {
-    let h = CandidateFixture::new("reject", "success").await;
+    recovery_candidate_fixture_target(case, "success").await
+}
+async fn recovery_candidate_fixture_target(
+    case: &str,
+    target: &'static str,
+) -> (CandidateFixture, AdmittedWorkflowRunV1) {
+    let h = CandidateFixture::new("reject", target).await;
     let mut initial = h.admission("source").await;
     if case == "checkpoint-dependencies" {
         let mut graph = initial.run_spec.graph.clone();
@@ -5032,4 +5038,612 @@ async fn joint_startup_refuses_terminal_candidate_checkpoint() {
 #[tokio::test]
 async fn joint_startup_recovers_ordinary_terminal_checkpoint() {
     joint_startup_checkpoint_recovery(false).await;
+}
+
+// C2c2d4: executor composition only; public recovery still refuses these snapshots.
+async fn restored_owner(
+    h: &CandidateFixture,
+    source: &AdmittedWorkflowRunV1,
+    retries: u32,
+) -> (AdmittedWorkflowRunV1, WorkflowAccountingInvocationV1) {
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let previous = h.f.store.get_attempt_locator(&task).await.unwrap().unwrap();
+    let owner = previous.identity.resume().unwrap();
+    assert!(matches!(
+        h.f.store
+            .claim_resume_attempt_with_locator(
+                &task,
+                3,
+                2,
+                &previous,
+                &TaskAttemptLocator {
+                    identity: owner.clone(),
+                    telemetry_unavailable: None
+                }
+            )
+            .await
+            .unwrap(),
+        ResumeClaim::Resumable { .. }
+    ));
+    let mut graph = source.run_spec.graph.clone();
+    graph.nodes[0].retry = Some(bridge_workflow::graph::RetryPolicy {
+        max_attempts: retries,
+        backoff_ms: 0,
+        backoff_cap_ms: None,
+    });
+    let admitted = h
+        .builder()
+        .freeze(WorkflowAdmissionRequestV1 {
+            attempt_id: owner.attempt_id.clone(),
+            graph: Arc::new(graph),
+            requested_session_cwd: source.run_spec.requested_session_cwd.clone(),
+            policy_invocation: Default::default(),
+            ledger_admission: source.run_spec.ledger_admission.clone(),
+            r2f1b: None,
+        })
+        .await
+        .unwrap();
+    let admitted = h
+        .builder()
+        .bind_local_chains(
+            admitted,
+            source
+                .run_spec
+                .fallback_chains
+                .as_ref()
+                .unwrap()
+                .get(&NodeId::parse("node").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    (
+        admitted,
+        WorkflowAccountingInvocationV1::new(
+            AccountingV1::new(h.f.store.clone()),
+            owner,
+            WorkflowId::parse("workflow").unwrap(),
+        ),
+    )
+}
+
+async fn restored_executor(
+    h: &CandidateFixture,
+    admitted: &AdmittedWorkflowRunV1,
+    accounting: &WorkflowAccountingInvocationV1,
+) -> Result<WorkflowExecutor> {
+    WorkflowExecutor::new(h.registry.clone())
+        .with_restored_fallback_v1(
+            h.builder(),
+            admitted.clone(),
+            h.f.store.clone(),
+            TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+            accounting,
+            |diagnostic| BridgeError::agent_failure(diagnostic.clone()),
+        )
+        .await
+}
+
+async fn drive_restored(
+    h: &CandidateFixture,
+    executor: &WorkflowExecutor,
+    admitted: AdmittedWorkflowRunV1,
+    accounting: Option<WorkflowAccountingInvocationV1>,
+) -> Vec<Result<WorkflowEvent>> {
+    drive_restored_accounted(h, executor, admitted, accounting, None)
+        .await
+        .into_iter()
+        .map(|event| event.map_err(|failure| failure.surfaced_error()))
+        .collect()
+}
+
+async fn drive_restored_accounted(
+    h: &CandidateFixture,
+    executor: &WorkflowExecutor,
+    admitted: AdmittedWorkflowRunV1,
+    accounting: Option<WorkflowAccountingInvocationV1>,
+    structured_seed: Option<StructuredWorkflowSeedV1>,
+) -> Vec<Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>> {
+    use futures::StreamExt;
+    let graph = Arc::new(admitted.run_spec.graph.clone());
+    let mut context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: admitted.run_spec.requested_session_cwd.clone(),
+        harvest_audit_store: h.f.store.clone(),
+        task_id: Some(TaskId::parse(h.owner.execution_id.as_str()).unwrap()),
+        observer_key: Some(h.owner.execution_id.as_str().into()),
+        ..Default::default()
+    })
+    .with_admitted_workflow_run(admitted)
+    .unwrap();
+    if let Some(accounting) = accounting {
+        context = context.with_accounting(accounting);
+    }
+    let seed = structured_seed
+        .as_ref()
+        .map(|seed| {
+            seed.nodes
+                .iter()
+                .map(|(node, checkpoint)| {
+                    (
+                        node.as_str().to_owned(),
+                        (
+                            checkpoint.output.clone(),
+                            checkpoint.ok,
+                            checkpoint.usage.clone(),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    executor
+        .run_from_with_accounting_failures(
+            graph,
+            "restored input".into(),
+            "restored".into(),
+            CancellationToken::new(),
+            seed,
+            structured_seed,
+            context,
+        )
+        .collect()
+        .await
+}
+
+async fn checked_progress(h: &CandidateFixture) -> CandidateProgressV1 {
+    h.f.store
+        .candidate_progress_v1(
+            &TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+            &NodeId::parse("node").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+// Extend the real checked store at a settled crash boundary, without provider work.
+async fn seed_rejected_visit(h: &CandidateFixture, position: usize) {
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let node = NodeId::parse("node").unwrap();
+    let mut progress = checked_progress(h).await;
+    let prior = progress.visits.last().unwrap().clone();
+    let candidate = if position == 0 {
+        &progress.source
+    } else {
+        &progress.chains[0].steps[position - 1]
+    };
+    let id = AttemptId::mint().unwrap().as_str().to_owned();
+    let mut row = h.f.rows()[0].clone();
+    row.id = id.clone();
+    row.dispatched = false;
+    row.finalized = false;
+    row.attribution.agent = candidate.agent.as_str().into();
+    row.attribution.effective_model = Some(candidate.model.clone());
+    row.attribution.effective_mode = candidate.posture.mode.clone();
+    h.f.store.start_usage_attempt_v1(&row).await.unwrap();
+    for phase in [
+        CandidatePhaseV1::Preparing,
+        CandidatePhaseV1::Prepared,
+        CandidatePhaseV1::PollFenced,
+        CandidatePhaseV1::Polled,
+    ] {
+        let old = progress.clone();
+        if phase == CandidatePhaseV1::Preparing {
+            progress.retries_consumed += u32::from(position == prior.position);
+            progress.visits.push(CandidateVisitV1 {
+                position,
+                accounting_id: id.clone(),
+                owner: h.owner.clone(),
+                cold_context: ContextId::parse(id.clone()).unwrap(),
+                phase,
+                rejection: None,
+            });
+        } else {
+            progress.visits.last_mut().unwrap().phase = phase;
+        }
+        h.f.store
+            .put_candidate_progress_v1(&task, &node, Some(&old), &progress)
+            .await
+            .unwrap();
+    }
+    h.f.store
+        .update_usage_attempt_v1(&id, true, None, true)
+        .await
+        .unwrap();
+    let old = progress.clone();
+    progress.visits.last_mut().unwrap().rejection = prior.rejection;
+    h.f.store
+        .put_candidate_progress_v1(&task, &node, Some(&old), &progress)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn restored_successor_preserves_chain_position_and_prior_visits() {
+    for position in [1, 2] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        if position == 2 {
+            seed_rejected_visit(&h, 1).await;
+        }
+        let prior = checked_progress(&h).await;
+        let rows = h.f.rows();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        assert!(
+            h.f.spawns.lock().unwrap().is_empty(),
+            "restore grants no preparation"
+        );
+        let events = drive_restored(&h, &executor, admitted.clone(), Some(accounting)).await;
+        assert!(events.iter().any(|e| matches!(e, Ok(WorkflowEvent::Terminal { outcome, output }) if *outcome == if position == 1 { WorkflowOutcome::Completed } else { WorkflowOutcome::Failed } && (position != 1 || output == "answer"))), "{events:?}");
+        let progress = checked_progress(&h).await;
+        assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+        assert_eq!(progress.selected_chain, Some(0));
+        assert_eq!(progress.visits.last().unwrap().position, position);
+        assert_eq!(progress.retries_consumed, prior.retries_consumed);
+        assert_eq!(
+            progress.visits.last().unwrap().owner.attempt_id,
+            admitted.run_spec.attempt_id
+        );
+        for old in rows {
+            assert_eq!(h.f.rows().iter().find(|r| r.id == old.id), Some(&old));
+        }
+        assert_eq!(h.f.providers[0].setup.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.calls[position].setups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.f.providers[position].prompts.load(Ordering::SeqCst),
+            usize::from(position == 1)
+        );
+        assert_eq!(h.calls[position].cleaned.lock().unwrap().len(), 1);
+        if position == 1 {
+            assert_eq!(
+                h.f.providers[position].inputs.lock().unwrap()[0][0].text,
+                "restored input"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_successor_keeps_consumed_retry_budget() {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "retry-unpolled").await;
+    seed_rejected_visit(&h, 0).await;
+    let prior = checked_progress(&h).await;
+    let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let events = drive_restored(&h, &executor, admitted, Some(accounting)).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Failed,
+                ..
+            })
+        )),
+        "{events:?}"
+    );
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        h.f.providers[1].prompts.load(Ordering::SeqCst),
+        1,
+        "spent retry was reused"
+    );
+    let progress = checked_progress(&h).await;
+    assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+    assert_eq!(progress.retries_consumed, 1);
+    assert_eq!(progress.visits.len(), 3);
+    assert_eq!(h.f.rows().len(), 3);
+}
+
+#[tokio::test]
+async fn restored_composition_requires_claimed_accounting_and_checked_evidence() {
+    for fault in [
+        "fresh",
+        "missing",
+        "stale-owner",
+        "missing-row",
+        "authority",
+        "scope",
+        "diagnostic",
+    ] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        if fault == "fresh" {
+            assert!(restored_executor(&h, &initial, &h.accounting)
+                .await
+                .is_err());
+        } else {
+            let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+            if fault == "diagnostic" {
+                assert!(WorkflowExecutor::new(h.registry.clone())
+                    .with_restored_fallback_v1(
+                        h.builder(),
+                        admitted.clone(),
+                        h.f.store.clone(),
+                        TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+                        &accounting,
+                        |_| BridgeError::StoreFailure,
+                    )
+                    .await
+                    .is_err());
+            } else if fault == "missing-row" {
+                rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                    .unwrap()
+                    .execute("DELETE FROM usage_attempts_v1", [])
+                    .unwrap();
+                assert!(restored_executor(&h, &admitted, &accounting).await.is_err());
+            } else {
+                let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+                if fault == "stale-owner" {
+                    restored_owner(&h, &admitted, 2).await;
+                }
+                if fault == "authority" {
+                    let mut snapshot = h.f.snapshot();
+                    snapshot.entries[1].args.push("drift".into());
+                    h.registry.apply(snapshot).await.unwrap();
+                }
+                if fault == "scope" {
+                    let scope = h.f.dir.path().join("scope");
+                    std::fs::rename(&scope, h.f.dir.path().join("old-scope")).unwrap();
+                    std::fs::create_dir(scope).unwrap();
+                }
+                let events = drive_restored(
+                    &h,
+                    &executor,
+                    admitted,
+                    (fault != "missing").then_some(accounting),
+                )
+                .await;
+                assert!(events.iter().any(Result::is_err), "{fault}: {events:?}");
+            }
+        }
+        assert!(h.f.spawns.lock().unwrap().is_empty(), "{fault}");
+        assert_eq!(
+            h.f.rows().len(),
+            usize::from(fault != "missing-row"),
+            "{fault}"
+        );
+        for provider in &h.f.providers {
+            assert_eq!(provider.setup.load(Ordering::SeqCst), 0, "{fault}");
+            assert_eq!(provider.prompts.load(Ordering::SeqCst), 0, "{fault}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_replayed_preparation_never_reaches_provider() {
+    for preflight in [false, true] {
+        let (h, initial) =
+            recovery_candidate_fixture_target("continuation", "preflight-pass").await;
+        let mut snapshot = h.f.snapshot();
+        snapshot.entries[1].preflight = preflight;
+        h.registry.apply(snapshot).await.unwrap();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let first = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let replay = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let events = drive_restored(&h, &first, admitted.clone(), Some(accounting.clone())).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Ok(WorkflowEvent::Terminal {
+                    outcome: WorkflowOutcome::Completed,
+                    ..
+                })
+            )),
+            "{events:?}"
+        );
+        let progress = checked_progress(&h).await;
+        let before = h.f.rows();
+        let events = drive_restored(&h, &replay, admitted, Some(accounting)).await;
+        assert!(events.iter().any(Result::is_err), "{events:?}");
+        assert_eq!(checked_progress(&h).await, progress);
+        // A losing accounting reservation is settled without any provider preparation.
+        assert!(h
+            .f
+            .rows()
+            .iter()
+            .filter(|r| !before.iter().any(|old| old.id == r.id))
+            .all(|r| !r.dispatched && r.finalized));
+        assert_eq!(
+            h.calls[1].setups.load(Ordering::SeqCst),
+            1 + usize::from(preflight)
+        );
+        assert_eq!(
+            h.f.providers[1].prompts.load(Ordering::SeqCst),
+            1 + usize::from(preflight)
+        );
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    }
+}
+#[tokio::test]
+async fn restored_unpolled_failure_retains_primary_and_persistence_errors() {
+    for persistence in [false, true] {
+        let (h, initial) = recovery_candidate_fixture_target("continuation", "setup").await;
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        if persistence {
+            rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap().execute_batch(
+                "CREATE TRIGGER fail_restored_prepare BEFORE INSERT ON usage_attempts_v1 BEGIN SELECT RAISE(ABORT,'accounting fault'); END;"
+            ).unwrap();
+        }
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+        if persistence {
+            let failure = events
+                .iter()
+                .find_map(|event| event.as_ref().err())
+                .unwrap();
+            assert_original(&failure.original, "reject");
+            assert_eq!(failure.persistence, Some(BridgeError::StoreFailure));
+            assert_eq!(failure.surfaced_error(), BridgeError::StoreFailure);
+        }
+        assert!(
+            format!("{events:?}").contains(if persistence {
+                "StoreFailure"
+            } else {
+                "fixture.rejected"
+            }),
+            "{events:?}"
+        );
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            h.calls[1].setups.load(Ordering::SeqCst),
+            usize::from(!persistence)
+        );
+    }
+}
+
+async fn restored_preflight_accounting_failure(settlement_fails: bool) {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "preflight-pass").await;
+    let prior_rows = h.f.rows();
+    let mut snapshot = h.f.snapshot();
+    snapshot.entries[1].preflight = true;
+    h.registry.apply(snapshot).await.unwrap();
+    let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let db =
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=PERSIST; CREATE TRIGGER fail_preflight_insert BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.attempt_kind')='preflight' BEGIN SELECT RAISE(ABORT,'preflight accounting fault'); END;").unwrap();
+    if settlement_fails {
+        db.execute_batch("CREATE TRIGGER fail_node_settlement BEFORE UPDATE ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' AND json_extract(NEW.record_json,'$.finalized')=1 BEGIN SELECT RAISE(ABORT,'node settlement fault'); END;").unwrap();
+    }
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let rows = h.f.rows();
+    assert_eq!(rows.len(), 2, "rows={rows:?}; events={events:?}");
+    let node = rows
+        .iter()
+        .find(|row| row.attribution.agent == "target")
+        .unwrap();
+    assert_eq!(node.attribution.attempt_kind, "node");
+    assert!(!node.dispatched);
+    assert_eq!(node.finalized, !settlement_fails, "{events:?}");
+    for prior in prior_rows {
+        assert_eq!(rows.iter().find(|row| row.id == prior.id), Some(&prior));
+    }
+    let failure = events
+        .iter()
+        .find_map(|event| event.as_ref().err())
+        .unwrap();
+    assert_original(&failure.original, "reject");
+    assert_eq!(failure.persistence, Some(BridgeError::StoreFailure));
+    assert_eq!(failure.surfaced_error(), BridgeError::StoreFailure);
+    assert!(h.f.spawns.lock().unwrap().is_empty());
+    for (provider, calls) in h.f.providers.iter().zip(&h.calls) {
+        assert_eq!(calls.setups.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.prompts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn restored_preflight_failure_settles_reserved_node() {
+    restored_preflight_accounting_failure(false).await;
+}
+
+#[tokio::test]
+async fn restored_preflight_settlement_failure_retains_both_errors() {
+    restored_preflight_accounting_failure(true).await;
+}
+
+#[tokio::test]
+async fn restored_structured_seed_reuses_ordinary_checkpoint_and_refuses_candidate_seed() {
+    use bridge_core::attestation::HarvestSanitizationMode;
+    use bridge_core::orch::UsageSnapshot;
+    for include_candidate in [false, true] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        let mut graph = initial.run_spec.graph.clone();
+        let mut upstream = graph.nodes[0].clone();
+        upstream.id = NodeId::parse("upstream").unwrap();
+        upstream.agent = AgentId::parse("target").unwrap();
+        upstream.harvest_sanitization = Some(HarvestSanitizationMode::AttestedPrefixV1);
+        graph.nodes[0].inputs = vec![upstream.id.clone()];
+        graph.nodes[0].prompt_template = "{{upstream}}\n{{workflow.costs}}".into();
+        graph.nodes.push(upstream.clone());
+        let initial = h
+            .builder()
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: h.owner.attempt_id.clone(),
+                graph: Arc::new(graph),
+                requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+                policy_invocation: Default::default(),
+                ledger_admission: initial.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        let initial = h
+            .builder()
+            .bind_local_chains(initial, &h.run.progress.chains)
+            .unwrap();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let checkpoint = StructuredNodeSeedV1 {
+            output: "process\nexact predecessor output".into(),
+            ok: true,
+            usage: Some(UsageSnapshot {
+                used: Some(41),
+                size: Some(100),
+                at_ms: 7,
+                ..Default::default()
+            }),
+            terminal: NodeTerminalV1 {
+                schema_version: 1,
+                primary: NodePrimaryDispositionV1::Completed,
+                cleanup: NodeCleanupV1 {
+                    disposition: NodeCleanupDispositionV1::Complete,
+                    duration_ms: 0,
+                },
+                cause: None,
+                prompt_may_have_been_accepted: false,
+                degraded_ancestry: false,
+                policy_trigger_id: None,
+            },
+        };
+        let mut seed = StructuredWorkflowSeedV1::default();
+        seed.nodes.insert(upstream.id.clone(), checkpoint.clone());
+        if include_candidate {
+            seed.nodes
+                .insert(NodeId::parse("node").unwrap(), checkpoint.clone());
+        }
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER forbid_seed_harvest BEFORE INSERT ON harvest_raw_records_v1 BEGIN SELECT RAISE(ABORT,'seed reharvested'); END;").unwrap();
+        let prior = checked_progress(&h).await;
+        let prior_rows = h.f.rows();
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), Some(seed)).await;
+        if include_candidate {
+            assert!(events.iter().any(Result::is_err), "{events:?}");
+            assert_eq!(checked_progress(&h).await, prior);
+            assert_eq!(h.f.rows(), prior_rows);
+            assert!(h.f.spawns.lock().unwrap().is_empty());
+        } else {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Ok(WorkflowEvent::Terminal {
+                        outcome: WorkflowOutcome::Completed,
+                        ..
+                    })
+                )),
+                "{events:?}"
+            );
+            let input = &h.f.providers[1].inputs.lock().unwrap()[0][0].text;
+            assert!(
+                input.starts_with(&format!("{}\n", checkpoint.output)),
+                "{input}"
+            );
+            assert!(
+                input.contains("| upstream | 41 | 100 | 0.4100 | n/a |"),
+                "{input}"
+            );
+            assert_eq!(h.calls[1].setups.load(Ordering::SeqCst), 1);
+            assert_eq!(h.f.rows().len(), prior_rows.len() + 1);
+            assert!(!events.iter().any(|event| matches!(event, Ok(WorkflowEvent::NodeStarted { node, .. }) if node == &upstream.id)));
+        }
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM harvest_raw_records_v1", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }
