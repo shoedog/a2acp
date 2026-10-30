@@ -1859,6 +1859,7 @@ struct LocalWorkflowFallbackV1 {
     store: Arc<dyn TaskStore>,
     task: bridge_core::ids::TaskId,
     entries: Vec<Arc<AgentEntry>>,
+    restored: Option<std::sync::Mutex<HashMap<NodeId, WorkflowCandidateRunV1>>>,
 }
 
 /// Durable execution boundary for explicitly admitted, cold candidates.
@@ -1873,6 +1874,12 @@ pub struct WorkflowCandidateRunV1 {
     position: usize,
     preceding: Option<AccountingFailureV1>,
     retry: bool,
+    restored: bool,
+    // Set only by a resolution/configuration failure followed by successful
+    // preparation settlement. Never inferred from an idle prompt observer.
+    substitutable_preparation: Option<BridgeError>,
+    cleanup_refused: bool,
+    preparation_substituted: bool,
     authority_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     observer_key: Option<String>,
     harvest: Option<NodeHarvestMeta>,
@@ -1901,6 +1908,10 @@ impl WorkflowCandidateRunV1 {
             preceding: None,
             before_poll: None,
             retry: false,
+            restored: false,
+            substitutable_preparation: None,
+            cleanup_refused: false,
+            preparation_substituted: false,
             authority_guard: None,
             observer_key: None,
             harvest: None,
@@ -1913,6 +1924,95 @@ impl WorkflowCandidateRunV1 {
         }
     }
 
+    /// Restore checked evidence without granting preparation. The cold-node path
+    /// still needs an exclusive Preparing CAS before any successor provider work.
+    async fn restore(
+        store: Arc<dyn TaskStore>,
+        task: bridge_core::ids::TaskId,
+        node: NodeId,
+        routing: FrozenFallbackInvocationV1,
+        rehydrate: &impl Fn(&bridge_core::diagnostics::FailureDiagnostic) -> BridgeError,
+    ) -> Result<Self, BridgeError> {
+        use bridge_core::fallback_runtime::CandidateRecoveryV1;
+        let progress = store
+            .candidate_progress_v1(&task, &node)
+            .await?
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let (routing, recovery) = routing.restore(&progress, |candidate| Ok(candidate.clone()))?;
+        let CandidateRecoveryV1::Continue {
+            preceding_failure, ..
+        } = recovery
+        else {
+            return Err(BridgeError::InvalidStateTransition);
+        };
+        let position = progress
+            .visits
+            .last()
+            .unwrap()
+            .position
+            .checked_add(1)
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let mut run = Self::new(store, task, node, routing);
+        let original = rehydrate(&preceding_failure.diagnostic);
+        match &original {
+            BridgeError::AgentFailure { diagnostic }
+                if diagnostic == &preceding_failure.diagnostic => {}
+            _ => return Err(BridgeError::InvalidStateTransition),
+        }
+        run.preceding = Some(original.into());
+        run.progress = progress;
+        run.position = position;
+        run.restored = true;
+        Ok(run)
+    }
+
+    fn may_retain_preceding(
+        &self,
+        failure: &AccountingFailureV1,
+        cancel: &CancellationToken,
+    ) -> bool {
+        !self.restored
+            || (self.substitutable_preparation.as_ref() == Some(&failure.original)
+                && !self.cleanup_refused
+                && failure.persistence.is_none()
+                && failure.preparation_exit
+                    == bridge_core::translator::AccountingPreparationExitV1::Failed
+                && !cancel.is_cancelled()
+                && !self.observed.load(std::sync::atomic::Ordering::Acquire)
+                && !self.effects.has_effects())
+    }
+
+    fn restored_accounting_failure(&self, failure: &AccountingFailureV1) -> bool {
+        self.restored
+            && (failure.persistence.is_some()
+                || (failure.preparation_exit
+                    != bridge_core::translator::AccountingPreparationExitV1::Canceled
+                    && matches!(
+                        failure.original,
+                        BridgeError::BudgetRefused { .. } | BridgeError::StoreFailure
+                    )))
+    }
+
+    /// Direct restored failures keep their own cause; only provider preparation
+    /// outcomes may retain the preceding provider rejection.
+    fn stop_with_failure(&mut self, mut failure: AccountingFailureV1) -> AccountingFailureV1 {
+        if self.restored && matches!(failure.original, BridgeError::StoreFailure) {
+            failure.persistence.get_or_insert(failure.original.clone());
+        }
+        if !self.restored && !self.observed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(preceding) = self.preceding.take() {
+                if matches!(failure.original, BridgeError::StoreFailure) {
+                    failure.persistence.get_or_insert(failure.original.clone());
+                }
+                failure.original = preceding.original;
+                failure.persistence = failure.persistence.or(preceding.persistence);
+                failure.replay = Default::default();
+            }
+        }
+        self.routing = None;
+        failure
+    }
+
     /// The shared transition remains the sole advancement authority. The next
     /// visit is not prepared until its own exclusive durable publication succeeds.
     pub fn transition(
@@ -1921,6 +2021,9 @@ impl WorkflowCandidateRunV1 {
         cancel: &CancellationToken,
         admit: impl FnOnce(&FallbackCandidateV1) -> Result<FallbackCandidateV1, BridgeError>,
     ) -> Result<FallbackCandidateV1, AccountingFailureV1> {
+        if self.restored_accounting_failure(&failure) {
+            return Err(self.stop_with_failure(failure));
+        }
         if self
             .progress
             .visits
@@ -1930,10 +2033,12 @@ impl WorkflowCandidateRunV1 {
             // Same-candidate retries use the current setup failure. Once that
             // allowance ends, retain the preceding provider diagnosis without
             // letting it authorize a successor past an unpolled visit.
-            if let Some(preceding) = self.preceding.take() {
-                failure.original = preceding.original;
-                failure.persistence = failure.persistence.or(preceding.persistence);
-                failure.replay = Default::default();
+            if self.may_retain_preceding(&failure, cancel) {
+                if let Some(preceding) = self.preceding.take() {
+                    failure.original = preceding.original;
+                    failure.persistence = failure.persistence.or(preceding.persistence);
+                    failure.replay = Default::default();
+                }
             }
             return Err(failure);
         }
@@ -2609,8 +2714,72 @@ impl WorkflowExecutor {
             store,
             task,
             entries,
+            restored: None,
         }));
         self
+    }
+
+    /// Executor-only continuation composition. Public recovery consumers do not
+    /// call this seam. It requires an already claimed resumed accounting owner;
+    /// fresh local and served admission remain separate and unchanged. The caller
+    /// rehydrates the retained error; its diagnostic must exactly match checked
+    /// evidence. This seam cannot mint a new provider diagnosis.
+    #[doc(hidden)]
+    pub async fn with_restored_fallback_v1(
+        self,
+        admission: Arc<crate::admission::WorkflowAdmissionV1>,
+        admitted: crate::admission::AdmittedWorkflowRunV1,
+        store: Arc<dyn TaskStore>,
+        task: bridge_core::ids::TaskId,
+        accounting: &WorkflowAccountingInvocationV1,
+        rehydrate: impl Fn(&bridge_core::diagnostics::FailureDiagnostic) -> BridgeError,
+    ) -> Result<Self, BridgeError> {
+        accounting
+            .validate_resumed_owner(store.as_ref(), &task, &admitted.run_spec)
+            .await?;
+        let chains = admitted
+            .run_spec
+            .fallback_chains
+            .as_ref()
+            .filter(|nodes| !nodes.is_empty())
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let mut restored = HashMap::new();
+        for (node, chains) in chains {
+            let source = chains
+                .first()
+                .ok_or(BridgeError::InvalidStateTransition)?
+                .source
+                .clone();
+            let graph_node = admitted
+                .run_spec
+                .graph
+                .nodes
+                .iter()
+                .find(|n| &n.id == node)
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            if !self.candidate_is_admitted(&admitted, graph_node, &source) {
+                return Err(BridgeError::InvalidStateTransition);
+            }
+            let routing = FrozenFallbackInvocationV1::freeze(chains.clone(), source)
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            restored.insert(
+                node.clone(),
+                WorkflowCandidateRunV1::restore(
+                    store.clone(),
+                    task.clone(),
+                    node.clone(),
+                    routing,
+                    &rehydrate,
+                )
+                .await?,
+            );
+        }
+        let mut executor = self.with_local_fallback(admission, admitted, store, task);
+        // This newly constructed Arc has no other owners yet.
+        Arc::get_mut(executor.local_fallback.as_mut().unwrap())
+            .unwrap()
+            .restored = Some(std::sync::Mutex::new(restored));
+        Ok(executor)
     }
 
     /// Execute exactly one durable candidate through frozen admission.
@@ -2703,17 +2872,7 @@ impl WorkflowExecutor {
             .await;
         let mut output = match result {
             Ok(output) => output,
-            Err(mut failure) => {
-                if !run.observed.load(std::sync::atomic::Ordering::Acquire) {
-                    if let Some(preceding) = run.preceding.take() {
-                        failure.original = preceding.original;
-                        failure.persistence = failure.persistence.or(preceding.persistence);
-                        failure.replay = Default::default();
-                    }
-                }
-                run.routing = None;
-                return Err(failure);
-            }
+            Err(failure) => return Err(run.stop_with_failure(failure)),
         };
         run.harvest = Some(output.harvest.clone());
         if output.ok {
@@ -2763,7 +2922,9 @@ impl WorkflowExecutor {
                 failure.preparation_exit =
                     bridge_core::translator::AccountingPreparationExitV1::Canceled;
             }
-            if !run.observed.load(std::sync::atomic::Ordering::Acquire)
+            if run.may_retain_preceding(&failure, cancel)
+                && !run.restored_accounting_failure(&failure)
+                && !run.observed.load(std::sync::atomic::Ordering::Acquire)
                 && !failure.original.is_transient()
             {
                 run.routing = None;
@@ -2859,6 +3020,33 @@ impl WorkflowExecutor {
                 }
                 failure
             });
+            // The accounting backend can fail admission or its pre-poll write
+            // after consuming the envelope. This exact boundary still proves
+            // non-dispatch; settle its reserved row without changing attribution.
+            let opened = match opened {
+                Err(mut failure)
+                    if run.restored
+                        && !run.observed.load(std::sync::atomic::Ordering::Acquire)
+                        && failure.persistence.is_some()
+                        && failure.replay.prompt_acceptance
+                            == bridge_core::routing::ExclusionEvidenceV1::Unknown =>
+                {
+                    if let Err(error) = run
+                        .store
+                        .update_usage_attempt_v1(
+                            &run.progress.visits.last().unwrap().accounting_id,
+                            false,
+                            None,
+                            true,
+                        )
+                        .await
+                    {
+                        failure.persistence.get_or_insert(error);
+                    }
+                    Err(failure)
+                }
+                other => other,
+            };
             if run.observed.load(std::sync::atomic::Ordering::Acquire) {
                 let mut next = run.progress.clone();
                 next.visits.last_mut().unwrap().phase = CandidatePhaseV1::Polled;
@@ -3893,10 +4081,26 @@ impl WorkflowExecutor {
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         prompt_dispatch: &Option<PromptDispatchBarrier>,
         preflight_cache: &PreflightCache,
-        initial_preflight: Result<PreflightDecision, PreflightFailure>,
+        initial_preflight: Option<Result<PreflightDecision, PreflightFailure>>,
     ) -> Result<NodeRunOutput, AccountingFailureV1> {
         let mut admitted = local.admitted.clone();
-        let mut initial_preflight = Some(initial_preflight);
+        let mut initial_preflight = initial_preflight;
+        if run.restored {
+            let selected = run
+                .routing
+                .as_ref()
+                .ok_or(BridgeError::InvalidStateTransition)?
+                .progress();
+            let candidate = &selected.chains[selected
+                .selected_chain
+                .ok_or(BridgeError::InvalidStateTransition)?]
+            .steps[run.position - 1];
+            admitted = local
+                .admission
+                .freeze_successor(&local.admitted.run_spec, &run.node, candidate)
+                .await
+                .map_err(|error| run.stop_with_failure(error.into()))?;
+        }
         let mut preceding_output: Option<NodeRunOutput> = None;
         loop {
             let node = admitted
@@ -3929,7 +4133,8 @@ impl WorkflowExecutor {
                     None,
                     Some(run),
                 )
-                .await?;
+                .await
+                .map_err(|failure| run.stop_with_failure(failure))?;
             if output.ok {
                 return Ok(output);
             }
@@ -3940,14 +4145,14 @@ impl WorkflowExecutor {
                     .unwrap_or(BridgeError::InvalidStateTransition)
                     .into()
             });
-            if failure.persistence.is_some() {
-                return Err(failure);
+            if failure.persistence.is_some() || run.restored_accounting_failure(&failure) {
+                return Err(run.stop_with_failure(failure));
             }
             let dispatched = run.observed.load(std::sync::atomic::Ordering::Acquire)
                 || run.progress.visits[first_visit..]
                     .iter()
                     .any(|visit| visit.phase.dispatched());
-            if !dispatched {
+            if !dispatched && (!run.restored || run.preparation_substituted) {
                 if let Some(preceding) = preceding_output.take() {
                     if cancel.is_cancelled() {
                         let origin = output.harvest.origin;
@@ -3977,8 +4182,8 @@ impl WorkflowExecutor {
                 Ok(selected) => selected,
                 Err(final_failure) => {
                     failure = final_failure;
-                    if failure.persistence.is_some() {
-                        return Err(failure);
+                    if failure.persistence.is_some() || run.restored_accounting_failure(&failure) {
+                        return Err(run.stop_with_failure(failure));
                     }
                     return Ok(output);
                 }
@@ -3990,9 +4195,94 @@ impl WorkflowExecutor {
                 .await
             {
                 Ok(admitted) => admitted,
+                Err(error) if run.restored => {
+                    return Err(run.stop_with_failure(error.into()));
+                }
                 Err(_) => return Ok(preceding_output.take().unwrap()),
             };
         }
+    }
+
+    async fn prepare_candidate_visit(
+        &self,
+        run: &mut WorkflowCandidateRunV1,
+        node: &WorkflowNode,
+        authority: &FrozenWorkflowAuthority,
+    ) -> Result<PreparedAccountingTurnV1, AccountingFailureV1> {
+        if !run
+            .routing
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?
+            .scope_guard()()
+        {
+            return Err(BridgeError::InvalidStateTransition.into());
+        }
+        let frozen = self.bind_frozen_entry(
+            authority,
+            node,
+            FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+        )?;
+        let expected = if run.position == 0 {
+            &run.progress.source
+        } else {
+            &run.progress.chains[run
+                .routing
+                .as_ref()
+                .ok_or(BridgeError::InvalidStateTransition)?
+                .progress()
+                .selected_chain
+                .ok_or(BridgeError::InvalidStateTransition)?]
+            .steps[run.position - 1]
+        };
+        if !candidate_matches_admission(expected, &frozen) {
+            return Err(BridgeError::ConfigMismatch {
+                field: "fallback_candidate",
+            }
+            .into());
+        }
+        let registry = self.registry.clone();
+        let poll_authority = authority.clone();
+        let bound_node = node.clone();
+        let expected = expected.clone();
+        run.poll_guard = Some(Arc::new(move || {
+            WorkflowExecutor::new(registry.clone())
+                .bind_frozen_entry(
+                    &poll_authority,
+                    &bound_node,
+                    FrozenProviderLogicalSessionV1::Execute {
+                        candidate_ordinal: 0,
+                    },
+                )
+                .is_ok_and(|frozen| candidate_matches_admission(&expected, &frozen))
+        }));
+        let context = ContextId::parse(bridge_core::ids::AttemptId::mint()?.as_str())?;
+        let accounting = self
+            .accounting
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?;
+        let selected_chain = run
+            .routing
+            .as_ref()
+            .ok_or(BridgeError::InvalidStateTransition)?
+            .progress()
+            .selected_chain;
+        let selection = accounting.select(&node.id, &node.agent, "node", &frozen.config)?;
+        if selection.selection().owner.attempt_id != authority.run_spec.attempt_id {
+            return Err(BridgeError::InvalidStateTransition.into());
+        }
+        selection
+            .prepare_candidate(
+                &*run.store,
+                &run.task,
+                &run.node,
+                &mut run.progress,
+                selected_chain,
+                run.position,
+                context,
+            )
+            .await
     }
 
     /// Run one node through cold execution or its admitted dispatcher.
@@ -4717,7 +5007,74 @@ impl WorkflowExecutor {
         if let (Some(local), Some(authority), Some(accounting)) =
             (&self.local_fallback, frozen_authority, &self.accounting)
         {
-            if accounting.admits_fresh_fallback()
+            if let Some(restored) = &local.restored {
+                if !Arc::ptr_eq(&local.admitted.run_spec, &authority.run_spec) {
+                    return Err(BridgeError::InvalidStateTransition.into());
+                }
+                accounting
+                    .validate_resumed_owner(local.store.as_ref(), &local.task, &authority.run_spec)
+                    .await?;
+                if authority
+                    .run_spec
+                    .fallback_chains
+                    .as_ref()
+                    .is_some_and(|nodes| nodes.contains_key(&node.id))
+                {
+                    let mut run = restored
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&node.id)
+                        .ok_or(BridgeError::InvalidStateTransition)?;
+                    run.before_poll = prompt_dispatch.clone();
+                    run.observer_key = ctx.observer_key.clone();
+                    let registry = self.registry.clone();
+                    let entries = local.entries.clone();
+                    run.authority_guard = Some(Arc::new(move || {
+                        entries.iter().all(|entry| {
+                            registry
+                                .entry_snapshot(&entry.id)
+                                .is_some_and(|now| entry.as_ref() == now.as_ref())
+                        })
+                    }));
+                    let node_obs_ctx = start_node_observation(wf_id, node, run_id, ctx)?;
+                    let result = self
+                        .run_local_chain(
+                            local,
+                            &mut run,
+                            &rendered,
+                            cancel,
+                            cleanup_tracker,
+                            wf_id,
+                            run_id,
+                            ctx,
+                            diagnostic_factory,
+                            prompt_dispatch,
+                            preflight_cache,
+                            None,
+                        )
+                        .await;
+                    if let Ok(output) = &result {
+                        let outcome = match output.disposition {
+                            NodeDisposition::Completed => TurnOutcome::Success,
+                            NodeDisposition::Canceled => TurnOutcome::Canceled,
+                            _ => TurnOutcome::Failed(
+                                output
+                                    .primary_error
+                                    .as_ref()
+                                    .map(classify_failure)
+                                    .unwrap_or(FailureClass::Other),
+                            ),
+                        };
+                        ctx.observer.record(&ObsEvent::NodeFinished {
+                            ctx: &node_obs_ctx,
+                            outcome: &outcome,
+                        });
+                    }
+                    return result;
+                }
+            }
+            if local.restored.is_none()
+                && accounting.admits_fresh_fallback()
                 && Arc::ptr_eq(&local.admitted.run_spec, &authority.run_spec)
             {
                 if let Some(chains) = authority
@@ -4783,7 +5140,7 @@ impl WorkflowExecutor {
                                     diagnostic_factory,
                                     prompt_dispatch,
                                     preflight_cache,
-                                    initial_preflight.take().unwrap(),
+                                    initial_preflight.take(),
                                 )
                                 .await;
                             if let Ok(output) = &result {
@@ -4918,6 +5275,9 @@ impl WorkflowExecutor {
             loop {
                 if let Some(run) = candidate.as_deref_mut() {
                     run.failure = None;
+                    run.substitutable_preparation = None;
+                    run.cleanup_refused = false;
+                    run.preparation_substituted = false;
                     run.effects =
                         Arc::new(bridge_core::attempt_activity::ReplayEffectRecorderV1::default());
                     run.observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4972,6 +5332,7 @@ impl WorkflowExecutor {
                 )?;
                 let mut prepared = None;
                 let mut admitted_selection = None;
+                let mut provider_preparation_failure = None;
                 let outcome = 'attempt: {
                     // Admission must refuse a completed/repeated visit before even
                     // a preflight provider session can be configured or prompted.
@@ -4991,6 +5352,16 @@ impl WorkflowExecutor {
                             return Err(BridgeError::InvalidStateTransition.into());
                         }
                         run.retry = false;
+                    }
+                    if let Some(run) = candidate.as_deref_mut().filter(|run| run.restored) {
+                        prepared = Some(
+                            self.prepare_candidate_visit(
+                                run,
+                                node,
+                                frozen_authority.ok_or(BridgeError::InvalidStateTransition)?,
+                            )
+                            .await?,
+                        );
                     }
                     let (attempt_use, preflight_decision) = if let Some(authority) =
                         frozen_authority
@@ -5014,7 +5385,9 @@ impl WorkflowExecutor {
                             }
                         } {
                             Ok(decision) => decision,
-                            Err(PreflightFailure::Accounting(failure)) => return Err(failure),
+                            Err(PreflightFailure::Accounting(failure)) => {
+                                return Err(failure.settle(prepared.take()).await);
+                            }
                             Err(PreflightFailure::Canceled) => {
                                 attempt_harvest = node_harvest_meta(
                                     wf_id,
@@ -5073,78 +5446,26 @@ impl WorkflowExecutor {
                             }
                         };
                         prepared = if let Some(run) = candidate.as_deref_mut() {
-                            let expected = if run.position == 0 {
-                                &run.progress.source
-                            } else {
-                                &run.progress.chains[run
-                                    .routing
-                                    .as_ref()
-                                    .ok_or(BridgeError::InvalidStateTransition)?
-                                    .progress()
-                                    .selected_chain
-                                    .ok_or(BridgeError::InvalidStateTransition)?]
-                                .steps[run.position - 1]
-                            };
-                            if !candidate_matches_admission(expected, &frozen) {
-                                return Err(BridgeError::ConfigMismatch {
-                                    field: "fallback_candidate",
+                            match prepared.take() {
+                                Some(prepared) => Some(prepared),
+                                None => {
+                                    Some(self.prepare_candidate_visit(run, node, authority).await?)
                                 }
-                                .into());
                             }
-                            let registry = self.registry.clone();
-                            let poll_authority = authority.clone();
-                            let bound_node = node.clone();
-                            let expected = expected.clone();
-                            run.poll_guard = Some(Arc::new(move || {
-                                WorkflowExecutor::new(registry.clone())
-                                    .bind_frozen_entry(
-                                        &poll_authority,
-                                        &bound_node,
-                                        FrozenProviderLogicalSessionV1::Execute {
-                                            candidate_ordinal: 0,
-                                        },
-                                    )
-                                    .is_ok_and(|frozen| {
-                                        candidate_matches_admission(&expected, &frozen)
-                                    })
-                            }));
-                            let context =
-                                ContextId::parse(bridge_core::ids::AttemptId::mint()?.as_str())?;
-                            session = SessionId::parse(context.as_str())?;
-                            let accounting = self
-                                .accounting
-                                .as_ref()
-                                .ok_or(BridgeError::InvalidStateTransition)?;
-                            let selected_chain = run
-                                .routing
-                                .as_ref()
-                                .ok_or(BridgeError::InvalidStateTransition)?
-                                .progress()
-                                .selected_chain;
-                            let selection =
-                                accounting.select(&node.id, &node.agent, "node", &frozen.config)?;
-                            if selection.selection().owner.attempt_id
-                                != authority.run_spec.attempt_id
-                            {
-                                return Err(BridgeError::InvalidStateTransition.into());
-                            }
-                            Some(
-                                selection
-                                    .prepare_candidate(
-                                        &*run.store,
-                                        &run.task,
-                                        &run.node,
-                                        &mut run.progress,
-                                        selected_chain,
-                                        run.position,
-                                        context,
-                                    )
-                                    .await?,
-                            )
                         } else {
                             self.prepare_accounting(node, "node", &frozen.config)
                                 .await?
                         };
+                        if let Some(run) = candidate.as_ref() {
+                            session = SessionId::parse(
+                                run.progress
+                                    .visits
+                                    .last()
+                                    .ok_or(BridgeError::InvalidStateTransition)?
+                                    .cold_context
+                                    .as_str(),
+                            )?;
+                        }
                         if cancel.is_cancelled() {
                             attempt_harvest.origin =
                                 CompletionBodyOrigin::BridgeSyntheticCancellation;
@@ -5174,6 +5495,12 @@ impl WorkflowExecutor {
                             result = self.resolve_frozen_entry(frozen, diagnostic.clone()) => match result {
                                 Ok(resolved) => resolved,
                                 Err((error, frozen)) => {
+                                    if matches!(error, BridgeError::ModelNotAvailable)
+                                        || matches!(error, BridgeError::AgentTimedOut)
+                                            && !should_retry_after_attempt
+                                    {
+                                        provider_preparation_failure = Some(error.clone());
+                                    }
                                     if retry_enabled && error.is_transient() {
                                         break 'attempt Attempt::Transient {
                                             err: error,
@@ -5454,6 +5781,12 @@ impl WorkflowExecutor {
                         .configure_session(&session, ctx.session_cwd.clone())
                         .await
                     {
+                        if matches!(e, BridgeError::ModelNotAvailable)
+                            || matches!(e, BridgeError::AgentTimedOut)
+                                && !should_retry_after_attempt
+                        {
+                            provider_preparation_failure = Some(e.clone());
+                        }
                         if retry_enabled && e.is_transient() {
                             let action = if should_retry_after_attempt {
                                 ColdCleanupAction::Release
@@ -5703,6 +6036,27 @@ impl WorkflowExecutor {
                                             flush_err
                                         );
                                     }
+                                }
+                                if candidate.as_ref().is_some_and(|run| run.restored
+                                    && !run.observed.load(std::sync::atomic::Ordering::Acquire))
+                                    && cancel.is_cancelled() && e == BridgeError::SessionExpired
+                                {
+                                    let cleanup = preserve_then_cleanup_cold_session(
+                                        &node.id, attempt_use.backend(), &session, &diagnostic,
+                                        ColdCleanupAction::Forget, cleanup_tracker,
+                                        ColdExitV1::Cancellation,
+                                    ).await;
+                                    if let Err(error) = cleanup {
+                                        break 'attempt Attempt::Fatal {
+                                            text: format!("[node {} cleanup failed: {error:?}]", node.id.as_str()),
+                                            usage: None, failure_class: classify_failure(&error),
+                                            error: Some(error),
+                                        };
+                                    }
+                                    attempt_harvest.origin = CompletionBodyOrigin::BridgeSyntheticCancellation;
+                                    break 'attempt Attempt::Canceled {
+                                        marker: format!("[node {} canceled]", node.id.as_str()), usage: None,
+                                    };
                                 }
                                 if retry_enabled && e.is_transient()
                                     && candidate.as_ref().and_then(|run| run.failure.as_ref())
@@ -6243,6 +6597,9 @@ impl WorkflowExecutor {
                         _ => BridgeError::InvalidStateTransition,
                     };
                     settle_accounting_preparation(&mut prepared, original).await?;
+                    if let Some(run) = candidate.as_deref_mut() {
+                        run.substitutable_preparation = provider_preparation_failure;
+                    }
                 }
                 if let Some(run) = candidate.as_deref_mut() {
                     let original = match &outcome {
@@ -6279,6 +6636,8 @@ impl WorkflowExecutor {
                                 .and_then(|state| state.last_result.clone())
                                 .unwrap_or(Ok(BackendCleanupDispositionV1::Complete))
                         };
+                        // Keep an independent refusal veto before cleanup errors become Unknown.
+                        run.cleanup_refused = cleanup.is_err();
                         failure = failure.with_checked_cleanup(cleanup);
                         if run.effects.has_effects() {
                             failure.replay.effects =
@@ -6292,16 +6651,20 @@ impl WorkflowExecutor {
                             self.publish_candidate_failure(run, &mut failure, cancel)
                                 .await;
                         }
-                        if failure.persistence.is_some() {
+                        if failure.persistence.is_some()
+                            || run.restored_accounting_failure(&failure)
+                        {
                             return Err(failure);
                         }
                         if run.observed.load(std::sync::atomic::Ordering::Acquire) {
                             run.preceding = Some(failure.clone());
                             run.harvest = Some(attempt_harvest.clone());
                         } else if let Some(preceding) = &run.preceding {
-                            if !matches!(&outcome, Attempt::Transient { .. })
-                                || !should_retry_after_attempt
+                            if (!matches!(&outcome, Attempt::Transient { .. })
+                                || !should_retry_after_attempt)
+                                && run.may_retain_preceding(&failure, cancel)
                             {
+                                run.preparation_substituted = true;
                                 failure.original = preceding.original.clone();
                                 failure.persistence =
                                     failure.persistence.or(preceding.persistence.clone());
@@ -6514,6 +6877,7 @@ impl WorkflowExecutor {
             if !final_ok
                 && !run.observed.load(std::sync::atomic::Ordering::Acquire)
                 && run.preceding.is_some()
+                && (!run.restored || run.preparation_substituted)
             {
                 if !cancel.is_cancelled() {
                     if let Some(failure) = &run.failure {
@@ -6548,7 +6912,14 @@ impl WorkflowExecutor {
                 outcome: &final_node_outcome,
             });
         }
-        let disposition = NodeDisposition::from_turn(&final_node_outcome);
+        let disposition = if candidate.as_ref().is_some_and(|run| run.restored)
+            && cancel.is_cancelled()
+            && !final_ok
+        {
+            NodeDisposition::Canceled
+        } else {
+            NodeDisposition::from_turn(&final_node_outcome)
+        };
         Ok(NodeRunOutput {
             text: final_text,
             ok: final_ok,
@@ -6930,7 +7301,15 @@ impl WorkflowExecutor {
             preflight_metadata_fault: std::sync::atomic::AtomicBool::new(false),
         };
         Box::pin(async_stream::stream! {
-            if this.local_fallback.is_some() && (!seed.is_empty() || structured_seed.is_some()) {
+            if this.local_fallback.as_ref().is_some_and(|local| {
+                if local.restored.is_some() {
+                    this.accounting.is_none() || frozen_authority.is_none()
+                        || local.admitted.run_spec.fallback_chains.as_ref().is_some_and(|nodes|
+                            nodes.keys().any(|node| seed.contains_key(node.as_str())))
+                } else {
+                    !seed.is_empty() || structured_seed.is_some()
+                }
+            }) {
                 yield Err(BridgeError::InvalidStateTransition.into());
                 return;
             }
