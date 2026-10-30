@@ -21,10 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
     decode_workflow_spec, encode_workflow_run_spec, encode_workflow_spec, finalize_detached,
-    finalize_detached_with_barrier, load_structured_resume_seed,
-    refuse_workflow_candidate_recovery, spawn_detached_workflow_accounted,
-    workflow_prompt_dispatch_barrier_with_state, workflow_terminal_summary_barrier,
-    AttemptTelemetryState, TaskProgressHub,
+    finalize_detached_with_barrier, load_completed_candidate_seed, load_structured_resume_seed,
+    spawn_detached_workflow_accounted, workflow_prompt_dispatch_barrier_with_state,
+    workflow_terminal_summary_barrier, AttemptTelemetryState, TaskProgressHub,
 };
 use crate::params::validate_cwd_str;
 
@@ -450,24 +449,25 @@ async fn resumed_child_future(
         }
     };
     let (graph, frozen_run_spec) = decoded.into_parts();
-    if frozen_run_spec
-        .as_ref()
-        .is_some_and(|spec| spec.fallback_chains.is_some())
-    {
-        refuse_workflow_candidate_recovery(
-            &deps.detached,
-            &task,
-            frozen_run_spec.as_ref().expect("chain-bearing V2 spec"),
-        )
-        .await;
-        drop(permit);
-        return None;
-    }
-
     let cps = match deps.detached.task_store.node_checkpoints(&task).await {
         Ok(cps) => cps,
         Err(e) => {
             tracing::warn!(task = task.as_str(), error = ?e, "batch resume: node_checkpoints() failed; skipping task");
+            if frozen_run_spec
+                .as_ref()
+                .is_some_and(|spec| spec.fallback_chains.is_some())
+            {
+                let _ = finalize_detached(
+                    &deps.detached.task_store,
+                    &deps.detached.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: candidate checkpoints unavailable"),
+                    None,
+                )
+                .await;
+            }
             drop(permit);
             return None;
         }
@@ -483,7 +483,14 @@ async fn resumed_child_future(
         .collect();
 
     let structured_seed = if frozen_run_spec.is_some() {
-        match load_structured_resume_seed(&deps.detached, &task, &cps).await {
+        let checked = match frozen_run_spec
+            .as_ref()
+            .filter(|spec| spec.fallback_chains.is_some())
+        {
+            Some(spec) => load_completed_candidate_seed(&deps.detached, &task, spec, &cps).await,
+            None => load_structured_resume_seed(&deps.detached, &task, &cps).await,
+        };
+        match checked {
             Ok(seed) => Some(seed),
             Err(reason) => {
                 let _ = finalize_detached(

@@ -1547,11 +1547,27 @@ async fn recovery_candidate_fixture_target(
         h.run.progress.chains[0].steps.truncate(1);
     }
     let mut initial = h.admission("source").await;
-    if case == "checkpoint-dependencies" {
+    if case == "checkpoint-dependencies"
+        || case == "completed-dependent"
+        || case.starts_with("mixed")
+    {
         let mut graph = initial.run_spec.graph.clone();
         let mut upstream = graph.nodes[0].clone();
         upstream.id = NodeId::parse("upstream").unwrap();
-        graph.nodes[0].inputs.push(upstream.id.clone());
+        if case == "checkpoint-dependencies" {
+            graph.nodes[0].inputs.push(upstream.id.clone());
+        } else {
+            upstream.id = NodeId::parse("after").unwrap();
+            upstream.inputs = vec![graph.nodes[0].id.clone()];
+            if case == "completed-dependent" {
+                upstream.agent = AgentId::parse("target").unwrap();
+                upstream.prompt_template = "{{node}}\n{{workflow.costs}}".into();
+                // A seeded node must never be harvested again, even if its frozen
+                // policy requires attestation that a new provider did not supply.
+                graph.nodes[0].harvest_sanitization =
+                    Some(bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1);
+            }
+        }
         graph.nodes.push(upstream);
         initial = h
             .builder()
@@ -1594,7 +1610,8 @@ async fn recovery_candidate_fixture_target(
     .unwrap();
     let completed = case.starts_with("completed")
         || case.starts_with("checkpoint")
-        || case.starts_with("terminal");
+        || case.starts_with("terminal")
+        || case.starts_with("mixed");
     let successor = match case {
         "preparing" => Some(CandidatePhaseV1::Preparing),
         "prepared" => Some(CandidatePhaseV1::Prepared),
@@ -1715,6 +1732,59 @@ async fn recovery_candidate_fixture_target(
     let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
     let usage =
         rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    if case.starts_with("mixed") {
+        let after = NodeId::parse("after").unwrap();
+        let mut pending = h.run.progress.clone();
+        let mut row = h.f.rows()[0].clone();
+        row.id = AttemptId::mint().unwrap().as_str().into();
+        row.attribution.node = Some(after.as_str().into());
+        row.dispatched = false;
+        row.finalized = false;
+        h.f.store.start_usage_attempt_v1(&row).await.unwrap();
+        h.f.store
+            .put_candidate_progress_v1(task, &after, None, &pending)
+            .await
+            .unwrap();
+        for phase in [
+            CandidatePhaseV1::Preparing,
+            CandidatePhaseV1::Prepared,
+            CandidatePhaseV1::PollFenced,
+            CandidatePhaseV1::Polled,
+        ] {
+            let old = pending.clone();
+            if phase == CandidatePhaseV1::Preparing {
+                pending.visits.push(CandidateVisitV1 {
+                    position: 0,
+                    accounting_id: row.id.clone(),
+                    owner: h.owner.clone(),
+                    cold_context: ContextId::parse("cold-after").unwrap(),
+                    phase,
+                    rejection: None,
+                });
+            } else {
+                pending.visits[0].phase = phase;
+            }
+            h.f.store
+                .put_candidate_progress_v1(task, &after, Some(&old), &pending)
+                .await
+                .unwrap();
+        }
+        h.f.store
+            .update_usage_attempt_v1(&row.id, true, None, true)
+            .await
+            .unwrap();
+        let old = pending.clone();
+        pending.selected_chain = Some(0);
+        pending.visits[0].rejection = Some(rejection);
+        h.f.store
+            .put_candidate_progress_v1(task, &after, Some(&old), &pending)
+            .await
+            .unwrap();
+        if case == "mixed-conflict" {
+            db.execute("UPDATE task_node_checkpoints SET output='conflict'", [])
+                .unwrap();
+        }
+    }
     match case {
         "accounting-missing" => {
             usage.execute("DELETE FROM usage_attempts_v1", []).unwrap();
@@ -1782,6 +1852,10 @@ async fn recovery_candidate_fixture_target(
             db.execute("UPDATE task_node_checkpoints SET ok=0", [])
                 .unwrap();
         }
+        "checkpoint-unreadable-usage" => {
+            db.execute("UPDATE task_node_checkpoints SET usage_json='{'", [])
+                .unwrap();
+        }
         "checkpoint-usage" => {
             db.execute("UPDATE task_node_checkpoints SET usage_json=NULL", [])
                 .unwrap();
@@ -1838,7 +1912,7 @@ async fn recovery_candidate_fixture_target(
     }
     // Fault injection bypasses publication exclusively to model torn/corrupt storage.
     db.execute(
-        "UPDATE task_candidate_progress_v1 SET progress_json=?1",
+        "UPDATE task_candidate_progress_v1 SET progress_json=?1 WHERE node_id='node'",
         [serde_json::to_string(&progress).unwrap()],
     )
     .unwrap();
@@ -1850,6 +1924,387 @@ async fn recovery_candidate_fixture_target(
         .unwrap();
     }
     (h, admitted)
+}
+
+impl CandidateFixture {
+    fn reopen_recovery(self) -> Self {
+        let Self {
+            f,
+            owner,
+            registry,
+            accounting,
+            run,
+            calls,
+        } = self;
+        let Fixture {
+            dir,
+            store,
+            coordinator,
+            providers,
+            spawns,
+            dispatch_gate,
+        } = f;
+        let chains = run.progress.chains.clone();
+        let source = run.progress.source.clone();
+        drop((run, accounting, coordinator, store));
+        let store = Arc::new(
+            bridge_store::sqlite::SqliteStore::open_shared_history(
+                &dir.path().join("tasks.sqlite"),
+            )
+            .unwrap(),
+        );
+        let coordinator = Arc::new(bridge_coordinator::Coordinator::new(
+            Arc::new(bridge_coordinator::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            Arc::new(Default::default()),
+            store.clone(),
+            store.clone(),
+            Arc::new(bridge_policy::permission::AutoPolicy),
+            registry.clone(),
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            Arc::new(bridge_observ::NoopObserver),
+            3,
+        ));
+        let accounting = WorkflowAccountingInvocationV1::new(
+            AccountingV1::new(store.clone()),
+            owner.clone(),
+            WorkflowId::parse("workflow").unwrap(),
+        );
+        let run = WorkflowCandidateRunV1::new(
+            store.clone(),
+            TaskId::parse(owner.execution_id.as_str()).unwrap(),
+            NodeId::parse("node").unwrap(),
+            bridge_core::fallback_runtime::FrozenFallbackInvocationV1::freeze(chains, source)
+                .unwrap(),
+        );
+        Self {
+            f: Fixture {
+                dir,
+                store,
+                coordinator,
+                providers,
+                spawns,
+                dispatch_gate,
+            },
+            owner,
+            registry,
+            accounting,
+            run,
+            calls,
+        }
+    }
+}
+
+// C2c2d5: reopen the durable store used by each recovery consumer.
+async fn completed_recovery_deps(
+    h: &CandidateFixture,
+    admitted: &AdmittedWorkflowRunV1,
+    batch: bool,
+) -> bridge_coordinator::detached::DetachedDeps {
+    use bridge_coordinator::detached::*;
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let bid = BatchId::parse("batch-fixture").unwrap();
+    if batch {
+        h.f.store
+            .create_batch(&BatchRecord {
+                id: bid.clone(),
+                workflow: "workflow".into(),
+                concurrency: 1,
+                total: 1,
+                status: BatchStatus::Working,
+                items_json: "{\"v\":1,\"items\":[]}".into(),
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+            })
+            .await
+            .unwrap();
+    }
+    rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET workflow_spec_json=?1,batch_id=?2,item_id=?3 WHERE id=?4",
+            rusqlite::params![
+                String::from_utf8(admitted.run_spec.encode_snapshot_v2().unwrap()).unwrap(),
+                batch.then(|| bid.as_str()),
+                batch.then_some("one"),
+                task.as_str()
+            ],
+        )
+        .unwrap();
+    use bridge_core::workflow_history::*;
+    h.f.store
+        .reserve_v2(
+            &structured_history_reservation_v1(
+                AttemptReservation {
+                    identity: h.owner.clone(),
+                    task_id: Some(task),
+                    workflow: "workflow".into(),
+                    task_class: "workflow".into(),
+                    surface: ExecutionSurface::ServedTask,
+                    policy: "r2f0a".into(),
+                    workload_fingerprint: admitted.run_spec.workload_fingerprint.clone(),
+                    started_ms: 1,
+                    workload_fingerprint_complete: true,
+                    prompt_acceptance: "not_dispatched".into(),
+                    pinned: false,
+                },
+                &admitted.run_spec,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    DetachedDeps {
+        task_store: h.f.store.clone(),
+        executor: Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+        workflows: Arc::new(
+            [(
+                admitted.run_spec.graph.id.clone(),
+                Arc::new(admitted.run_spec.graph.clone()),
+            )]
+            .into(),
+        ),
+        workflow_cancels: Default::default(),
+        progress_hubs: Default::default(),
+        clock: Arc::new(bridge_coordinator::clock::SystemClock),
+        observer: Arc::new(bridge_observ::NoopObserver),
+        workflow_history: Some(Ok(h.f.store.clone())),
+        workflow_admission: Some(h.builder()),
+    }
+}
+
+async fn consume_completed_recovery(
+    h: &CandidateFixture,
+    deps: &bridge_coordinator::detached::DetachedDeps,
+    batch: bool,
+) -> TaskRecord {
+    use bridge_coordinator::{batch::*, detached::*};
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    if !batch {
+        assert!(reconcile_terminal_checkpoints(deps).await);
+    }
+    use bridge_core::workflow_history::WorkflowHistoryStore;
+    let excluded = deps
+        .task_store
+        .terminal_attempts_with_telemetry_markers()
+        .await
+        .unwrap();
+    h.f.store
+        .interrupt_active_excluding(4, &excluded)
+        .await
+        .unwrap();
+    if batch {
+        resume_batches_with_accounting(
+            &BatchDeps {
+                detached: deps.clone(),
+                runtime: BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+                allowed_cwd_root: None,
+            },
+            3,
+            Some(AccountingV1::new(h.f.store.clone())),
+        )
+        .await;
+    } else {
+        let record = deps.task_store.get(&task).await.unwrap().unwrap();
+        if record.status == TaskRecordStatus::Working {
+            resume_one_working_task_with_accounting(
+                deps,
+                &record,
+                3,
+                Some(AccountingV1::new(h.f.store.clone())),
+            )
+            .await;
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let record = deps.task_store.get(&task).await.unwrap().unwrap();
+            if record.status != TaskRecordStatus::Working {
+                return record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_terminal_reopen() {
+    let mut failures = Vec::new();
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture("completed").await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let before = joint_receipt(&h);
+        let rows = h.f.rows();
+        let locator = deps.task_store.get_attempt_locator(&task).await.unwrap();
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        if record.status != TaskRecordStatus::Completed {
+            failures.push(format!(
+                "batch={batch}: {:?}: {:?}",
+                record.status, record.error
+            ));
+            continue;
+        }
+        assert_eq!(record.result.as_deref(), Some("exact checkpoint output"));
+        assert_eq!(record.resume_attempts, 0);
+        assert_eq!(
+            deps.task_store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .map(|l| l.identity),
+            locator.map(|l| l.identity)
+        );
+        assert_eq!(joint_receipt(&h), before);
+        assert_eq!(h.f.rows(), rows);
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+        assert!(h
+            .f
+            .providers
+            .iter()
+            .all(|p| p.setup.load(Ordering::SeqCst) == 0 && p.prompts.load(Ordering::SeqCst) == 0));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_nonterminal_reopen() {
+    let mut failures = Vec::new();
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture("completed-dependent").await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let before = joint_receipt(&h);
+        let rows = h.f.rows();
+        // A replay of either publication or harvest must fail observably.
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap().execute_batch(
+            "CREATE TRIGGER no_seed_update BEFORE UPDATE ON task_node_checkpoints WHEN OLD.node_id='node' BEGIN SELECT RAISE(ABORT,'seed checkpoint replay'); END;
+             CREATE TRIGGER no_seed_insert BEFORE INSERT ON task_node_checkpoints WHEN NEW.node_id='node' BEGIN SELECT RAISE(ABORT,'seed checkpoint replay'); END;
+             CREATE TRIGGER no_seed_harvest BEFORE INSERT ON harvest_raw_records_v1 BEGIN SELECT RAISE(ABORT,'seed harvest replay'); END;"
+        ).unwrap();
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        if record.status != TaskRecordStatus::Completed {
+            failures.push(format!(
+                "batch={batch}: {:?}: {:?}",
+                record.status, record.error
+            ));
+            continue;
+        }
+        assert_eq!(record.result.as_deref(), Some("answer"));
+        assert_eq!(record.resume_attempts, 1);
+        assert_eq!(joint_receipt(&h), before);
+        let after_rows = h.f.rows();
+        assert_eq!(after_rows.len(), rows.len() + 1);
+        assert_eq!(
+            after_rows.iter().find(|r| r.id == rows[0].id),
+            Some(&rows[0])
+        );
+        assert_eq!(
+            after_rows
+                .iter()
+                .filter(|r| r.attribution.node.as_deref() == Some("node"))
+                .count(),
+            1
+        );
+        let input = format!("{:?}", h.f.providers[1].inputs.lock().unwrap());
+        assert!(input.contains("exact checkpoint output"), "{input}");
+        assert!(input.contains("| node | 7 |"), "{input}");
+        assert_eq!(*h.f.spawns.lock().unwrap(), vec!["target"]);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            deps.task_store.node_checkpoints(&task).await.unwrap().len(),
+            2
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[derive(Clone, Default)]
+struct RecoveryTrace(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for RecoveryTrace {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_reconciliation_classifies_independently() {
+    use bridge_coordinator::detached::reconcile_terminal_checkpoints;
+    for (case, expected) in [
+        ("completed", "Ok(Completed)"),
+        ("continuation", "Ok(Continuation)"),
+        ("mixed", "Ok(Mixed)"),
+        (
+            "checkpoint-output",
+            "candidate checked evidence unavailable",
+        ),
+    ] {
+        let (h, admitted) = recovery_candidate_fixture(case).await;
+        let deps = completed_recovery_deps(&h, &admitted, false).await;
+        let trace = RecoveryTrace::default();
+        let writer = trace.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        assert!(reconcile_terminal_checkpoints(&deps).await);
+        drop(guard);
+        let logs = String::from_utf8(trace.0.lock().unwrap().clone()).unwrap();
+        // This assertion precedes both consumers and fails if reconciliation
+        // merely leaves the task Working without classifying its evidence.
+        assert!(logs.contains(expected), "{case}: {logs}");
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_refuses_unreadable_completion() {
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture("checkpoint-unreadable-usage").await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let before = joint_receipt(&h);
+        let rows = h.f.rows();
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        assert_eq!(record.status, TaskRecordStatus::Interrupted);
+        assert!(record
+            .error
+            .unwrap()
+            .contains("candidate checkpoints unavailable"));
+        assert_eq!(record.resume_attempts, 0);
+        assert_eq!(joint_receipt(&h), before);
+        assert_eq!(h.f.rows(), rows);
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_mixed_refuses_without_effects() {
+    check_candidate_recovery_cases(
+        &[
+            ("mixed", "(mixed)"),
+            ("mixed-conflict", "candidate checked evidence unavailable"),
+        ],
+        false,
+    )
+    .await;
 }
 
 async fn check_candidate_recovery_cases(cases: &[(&str, &str)], persistence_failure: bool) {
@@ -2010,15 +2465,8 @@ async fn check_candidate_recovery_cases(cases: &[(&str, &str)], persistence_fail
 }
 
 #[tokio::test]
-async fn workflow_checked_recovery_classifies_completed_and_continuation() {
-    check_candidate_recovery_cases(
-        &[
-            ("completed", "(completed)"),
-            ("continuation", "(continuation)"),
-        ],
-        false,
-    )
-    .await;
+async fn workflow_checked_recovery_refuses_continuation() {
+    check_candidate_recovery_cases(&[("continuation", "(continuation)")], false).await;
 }
 
 #[tokio::test]
@@ -2119,7 +2567,7 @@ async fn workflow_checked_recovery_validates_terminal_checkpoints_before_shortcu
 
 #[tokio::test]
 async fn workflow_checked_recovery_failed_interruption_stays_working() {
-    check_candidate_recovery_cases(&[("continuation", ""), ("completed", "")], true).await;
+    check_candidate_recovery_cases(&[("continuation", ""), ("mixed", "")], true).await;
 }
 
 #[tokio::test]
@@ -4861,8 +5309,8 @@ async fn joint_startup_checkpoint_recovery(chain: bool) {
     } else {
         &[true][..]
     } {
-        // Missing negotiated evidence would fail CLI arbitration even though the
-        // node completed. Startup must not turn its candidate checkpoint into success.
+        // NodeCompletion is durable independently of later CLI arbitration.
+        // Recovery must preserve it even if negotiated run evidence was absent.
         let h = CandidateFixture::new(
             if chain { "v1-missing" } else { "final-only" },
             "final-only",
@@ -5006,19 +5454,11 @@ async fn joint_startup_checkpoint_recovery(chain: bool) {
         let record = h.f.store.get(&task).await.unwrap().unwrap();
         assert_eq!(
             record.status,
-            if chain {
-                TaskRecordStatus::Interrupted
-            } else {
-                TaskRecordStatus::Completed
-            },
+            TaskRecordStatus::Completed,
             "chain={chain}, history_consumed={history_consumed}"
         );
         if chain {
-            assert!(record
-                .error
-                .unwrap()
-                .contains("candidate recovery is not activated"));
-            assert!(record.result.is_none());
+            assert!(record.error.is_none());
             assert_eq!(Some(joint_receipt(&h)), before);
             assert_eq!(
                 h.f.store
@@ -5026,23 +5466,41 @@ async fn joint_startup_checkpoint_recovery(chain: bool) {
                     .await
                     .unwrap()
                     .workflow_outcome,
-                Some(WorkflowDurableOutcomeV1::Interrupted)
+                Some(WorkflowDurableOutcomeV1::Completed)
             );
-        } else {
-            assert_eq!(record.result.as_deref(), Some("answer"));
         }
+        assert_eq!(record.result.as_deref(), Some("answer"));
         let attempt =
             h.f.store
                 .attempt(&h.owner.attempt_id)
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(
-            attempt.terminal.unwrap().outcome,
-            if chain { "interrupted" } else { "completed" }
-        );
+        if history_consumed {
+            assert_eq!(attempt.terminal.unwrap().outcome, "completed");
+        } else {
+            // The checkpoint owns completion even if optional node history had
+            // not consumed the event. Retain ordinary telemetry-marker ordering.
+            assert!(attempt.terminal.is_none());
+            assert!(h
+                .f
+                .store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .telemetry_unavailable
+                .is_some());
+        }
         assert_eq!(record.resume_attempts, 0);
-        assert_eq!(h.f.store.get_attempt_locator(&task).await.unwrap(), locator);
+        assert_eq!(
+            h.f.store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .map(|l| l.identity),
+            locator.map(|l| l.identity)
+        );
         assert_eq!(
             h.f.store.node_checkpoints(&task).await.unwrap(),
             checkpoints
@@ -5059,7 +5517,7 @@ async fn joint_startup_checkpoint_recovery(chain: bool) {
 }
 
 #[tokio::test]
-async fn joint_startup_refuses_terminal_candidate_checkpoint() {
+async fn joint_startup_recovers_terminal_candidate_checkpoint() {
     joint_startup_checkpoint_recovery(true).await;
 }
 
