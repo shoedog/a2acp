@@ -789,6 +789,10 @@ impl WorkflowSink for DetachedProgressSink {
         let operation_id = self.operation_id()?;
         let seq = match terminal_json {
             Some(terminal_json) => {
+                // A candidate's structured NodeCompletion is already durable.
+                // V2 exact replay acknowledges it and returns its original seq
+                // without another checkpoint or journal completion. Conflicting
+                // output/usage/evidence refuses; ordinary nodes still write here.
                 self.store
                     .put_node_checkpoint_sequenced_v2(
                         &self.task,

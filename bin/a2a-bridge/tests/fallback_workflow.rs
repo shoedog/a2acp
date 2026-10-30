@@ -185,7 +185,12 @@ impl AgentBackend for BoundFixture {
         }
         if matches!(
             self.0.behavior,
-            "missing" | "native-missing" | "attested" | "attested-invalid" | "unsupported-prefix"
+            "missing"
+                | "native-missing"
+                | "attested"
+                | "attested-usage"
+                | "attested-invalid"
+                | "unsupported-prefix"
         ) {
             use bridge_core::attestation::*;
             use ring::digest::{digest, SHA256};
@@ -224,13 +229,20 @@ impl AgentBackend for BoundFixture {
             } else {
                 Default::default()
             };
-            return Ok(Box::pin(futures::stream::iter([
+            let usage = (self.0.behavior == "attested-usage").then(|| {
+                Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
+                    used: Some(7),
+                    size: Some(100),
+                    ..Default::default()
+                }))
+            });
+            return Ok(Box::pin(futures::stream::iter(usage.into_iter().chain([
                 Ok(Update::FinalAnswer(body.into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
                     prefix_attestation,
                 }),
-            ])));
+            ]))));
         }
         if self.0.behavior == "preflight-displaced" {
             self.0.prompts.fetch_add(1, Ordering::SeqCst);
@@ -3823,4 +3835,406 @@ async fn direct_candidate_defers_v1_run_arbitration() {
     );
     assert!(result.ok);
     assert_eq!(result.output, "answer");
+}
+
+// C2c2d2: inspect the real publication transaction before event consumption.
+async fn joint_admission(h: &CandidateFixture, chain: bool) -> AdmittedWorkflowRunV1 {
+    let initial = h.admission("source").await;
+    let graph = serde_json::from_value(serde_json::json!({
+        "id":"workflow", "controls": WorkflowControlDefaultsV1::default(),
+        "nodes":[
+            {"id":"node", "agent":"source", "prompt_template":"{{input}}", "inputs":[],
+             "harvest_sanitization":"attested_prefix_v1"},
+            {"id":"after", "agent":"target", "prompt_template":"{{node}}", "inputs":["node"]}
+        ]
+    }))
+    .unwrap();
+    let admitted = h
+        .builder()
+        .freeze(WorkflowAdmissionRequestV1 {
+            attempt_id: h.owner.attempt_id.clone(),
+            graph: Arc::new(graph),
+            requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+            policy_invocation: Default::default(),
+            ledger_admission: initial.run_spec.ledger_admission.clone(),
+            r2f1b: None,
+        })
+        .await
+        .unwrap();
+    if chain {
+        h.builder()
+            .bind_local_chains(admitted, &h.run.progress.chains)
+            .unwrap()
+    } else {
+        admitted
+    }
+}
+
+fn joint_stream(
+    h: &CandidateFixture,
+    admitted: AdmittedWorkflowRunV1,
+    cancel: CancellationToken,
+) -> WorkflowStream {
+    let graph = Arc::new(admitted.run_spec.graph.clone());
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: admitted.run_spec.requested_session_cwd.clone(),
+        harvest_audit_store: h.f.store.clone(),
+        task_id: Some(TaskId::parse(h.owner.execution_id.as_str()).unwrap()),
+        observer_key: Some(h.owner.execution_id.as_str().into()),
+        ..Default::default()
+    })
+    .with_accounting(h.accounting.clone())
+    .with_admitted_workflow_run(admitted.clone())
+    .unwrap();
+    WorkflowExecutor::new(h.registry.clone())
+        .with_local_fallback(
+            h.builder(),
+            admitted,
+            h.f.store.clone(),
+            TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+        )
+        .run_with_diagnostic_context(graph, "input".into(), "joint".into(), cancel, context)
+}
+
+// Retain raw durable bytes, sequence, timestamp and operation identity so later
+// sink consumption and run settlement cannot silently rewrite the completion.
+fn joint_receipt(h: &CandidateFixture) -> serde_json::Value {
+    let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let checkpoint: String = db.query_row(
+        "SELECT json_array(output,ok,usage_json,terminal_json,policy_trigger_json,seq,ts) FROM task_node_checkpoints WHERE node_id='node'",
+        [], |r| r.get(0)).unwrap();
+    let journal: Vec<String> = db
+        .prepare("SELECT event_json FROM task_journal ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|json| {
+            matches!(serde_json::from_str::<bridge_core::orch::OrchEvent>(json).unwrap().kind,
+            bridge_core::orch::OrchEventKind::NodeFinished { node, .. } if node == "node")
+        })
+        .collect();
+    assert_eq!(journal.len(), 1);
+    let progress: String = db
+        .query_row(
+            "SELECT progress_json FROM task_candidate_progress_v1 WHERE node_id='node'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    serde_json::json!({"checkpoint":checkpoint,"journal":journal,"progress":progress})
+}
+
+fn joint_assert_structured(h: &CandidateFixture, event: &WorkflowEvent) {
+    let WorkflowEvent::NodeFinished {
+        node,
+        output,
+        ok,
+        usage,
+        terminal_json,
+        policy_trigger_json,
+        ..
+    } = event
+    else {
+        panic!("{event:?}")
+    };
+    assert_eq!(node.as_str(), "node");
+    assert_eq!(output, "answer");
+    assert!(*ok);
+    assert_eq!(usage.as_ref().unwrap().used, Some(7));
+    let receipt = joint_receipt(h);
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(receipt["checkpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(checkpoint[0], *output);
+    assert_eq!(checkpoint[1], 1);
+    assert_eq!(
+        checkpoint[2],
+        serde_json::to_string(usage.as_ref().unwrap()).unwrap()
+    );
+    assert_eq!(
+        checkpoint[3],
+        terminal_json.as_deref().unwrap(),
+        "structured completion must precede emission"
+    );
+    assert_eq!(
+        checkpoint[4],
+        serde_json::to_value(policy_trigger_json).unwrap()
+    );
+    let terminal: NodeTerminalV1 = serde_json::from_str(terminal_json.as_deref().unwrap()).unwrap();
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Completed);
+    let progress: CandidateProgressV1 =
+        serde_json::from_str(receipt["progress"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        progress.terminal.unwrap(),
+        CandidateOutputV1 {
+            output: output.clone(),
+            ok: *ok,
+            usage: usage.clone()
+        }
+    );
+    let journal: bridge_core::orch::OrchEvent =
+        serde_json::from_str(receipt["journal"][0].as_str().unwrap()).unwrap();
+    assert!(
+        matches!(journal.kind, bridge_core::orch::OrchEventKind::NodeFinished {
+        output: o, ok: true, usage: u, terminal_json: t, policy_trigger_json: p, ..
+    } if o == *output && u == *usage && t == *terminal_json && p == *policy_trigger_json)
+    );
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+}
+
+async fn joint_first_completion(stream: &mut WorkflowStream) -> WorkflowEvent {
+    use futures::StreamExt;
+    loop {
+        let event = stream.next().await.expect("node completion").unwrap();
+        if matches!(&event, WorkflowEvent::NodeFinished { node, .. } if node.as_str() == "node") {
+            return event;
+        }
+    }
+}
+
+#[tokio::test]
+async fn joint_structured_completion_precedes_emission_and_dependent() {
+    use futures::StreamExt;
+    let h = CandidateFixture::new("attested-usage", "final-only").await;
+    let admitted = joint_admission(&h, true).await;
+    let mut stream = joint_stream(&h, admitted, CancellationToken::new());
+    let event = joint_first_completion(&mut stream).await;
+    joint_assert_structured(&h, &event);
+    let before = joint_receipt(&h);
+    let path = h.f.dir.path().join("tasks.sqlite");
+    let expected = before.clone();
+    *h.calls[1].entry_check.lock().unwrap() = Some(Box::new(move || {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let json: String = db
+            .query_row(
+                "SELECT terminal_json FROM task_node_checkpoints WHERE node_id='node'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let checkpoint: serde_json::Value =
+            serde_json::from_str(expected["checkpoint"].as_str().unwrap()).unwrap();
+        assert_eq!(json, checkpoint[3]);
+    }));
+    let events: Vec<_> = stream.collect().await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert_eq!(h.f.providers[1].inputs.lock().unwrap()[0][0].text, "answer");
+    assert_eq!(joint_receipt(&h), before);
+    assert!(h.f.rows().iter().all(|row| row.finalized));
+}
+
+async fn joint_later_exit(target: &'static str, canceled: bool) {
+    use futures::StreamExt;
+    let h = CandidateFixture::new("attested-usage", target).await;
+    let admitted = joint_admission(&h, true).await;
+    let cancel = CancellationToken::new();
+    let mut stream = joint_stream(&h, admitted, cancel.clone());
+    let event = joint_first_completion(&mut stream).await;
+    joint_assert_structured(&h, &event);
+    let before = joint_receipt(&h);
+    if canceled {
+        cancel.cancel();
+    }
+    let events: Vec<_> = stream.collect().await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Ok(WorkflowEvent::Terminal { outcome, .. })
+        if *outcome == if canceled { WorkflowOutcome::Canceled } else { WorkflowOutcome::Failed }))
+    );
+    assert_eq!(joint_receipt(&h), before);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    assert!(h.f.rows().iter().all(|row| row.finalized));
+}
+
+#[tokio::test]
+async fn joint_completion_survives_later_failure() {
+    joint_later_exit("setup", false).await;
+}
+
+#[tokio::test]
+async fn joint_completion_survives_later_cancellation() {
+    joint_later_exit("final-only", true).await;
+}
+
+async fn joint_failed_publication(audit: bool) {
+    use futures::StreamExt;
+    let h = CandidateFixture::new("attested-usage", "final-only").await;
+    let admitted = joint_admission(&h, true).await;
+    let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    db.execute_batch(if audit {
+        "CREATE TRIGGER joint_fault BEFORE INSERT ON harvest_raw_records_v1 BEGIN SELECT RAISE(ABORT,'joint audit fault'); END;"
+    } else {
+        // Fail after the structured checkpoint INSERT, while inserting its journal
+        // event. Progress and checkpoint must roll back with that same transaction.
+        "CREATE TRIGGER joint_fault BEFORE INSERT ON task_journal WHEN json_extract(NEW.event_json,'$.terminal_json') IS NOT NULL BEGIN SELECT RAISE(ABORT,'joint publication fault'); END;"
+    }).unwrap();
+    let events: Vec<_> = joint_stream(&h, admitted, CancellationToken::new())
+        .collect()
+        .await;
+    assert!(
+        events.iter().any(|e| if audit {
+            matches!(e, Err(BridgeError::HarvestAuditPersistFailed { .. }))
+        } else {
+            matches!(e, Err(BridgeError::StoreFailure))
+        }),
+        "{events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Ok(WorkflowEvent::NodeFinished { ok: true, .. }))));
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    assert!(h.f.store.node_checkpoints(&task).await.unwrap().is_empty());
+    assert!(h
+        .f
+        .store
+        .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .terminal
+        .is_none());
+    let completions: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM task_journal WHERE event_json LIKE '%node_finished%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(completions, 0);
+    assert!(h.f.rows().iter().all(|row| row.finalized));
+}
+
+#[tokio::test]
+async fn joint_audit_failure_blocks_completion_and_dependent() {
+    joint_failed_publication(true).await;
+}
+
+#[tokio::test]
+async fn joint_publication_failure_rolls_back_completion() {
+    joint_failed_publication(false).await;
+}
+
+#[tokio::test]
+async fn joint_detached_sink_acknowledges_once_and_refuses_conflicts() {
+    use bridge_coordinator::detached::{DetachedProgressSink, TaskProgressHub, WorkflowSink};
+    let h = CandidateFixture::new("attested-usage", "final-only").await;
+    let admitted = joint_admission(&h, true).await;
+    let cancel = CancellationToken::new();
+    let mut stream = joint_stream(&h, admitted, cancel.clone());
+    let event = joint_first_completion(&mut stream).await;
+    let WorkflowEvent::NodeFinished {
+        output,
+        ok,
+        usage,
+        terminal_json,
+        policy_trigger_json,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+    let before = joint_receipt(&h);
+    let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let seq_before: i64 = db
+        .query_row("SELECT last_event_seq FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    // Exact sink consumption must only acknowledge the publication, even when
+    // every possible checkpoint/journal write has been made unavailable.
+    db.execute_batch("CREATE TRIGGER joint_no_checkpoint BEFORE INSERT ON task_node_checkpoints BEGIN SELECT RAISE(ABORT,'duplicate checkpoint'); END;
+        CREATE TRIGGER joint_no_update BEFORE UPDATE ON task_node_checkpoints BEGIN SELECT RAISE(ABORT,'checkpoint rewrite'); END;
+        CREATE TRIGGER joint_no_journal BEFORE INSERT ON task_journal BEGIN SELECT RAISE(ABORT,'duplicate journal'); END;").unwrap();
+    let hub = Arc::new(TaskProgressHub::new());
+    let mut frames = hub.subscribe();
+    let mut sink = DetachedProgressSink::new(
+        h.f.store.clone(),
+        TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+        hub,
+    );
+    for _ in 0..2 {
+        sink.node_finished(
+            "node",
+            ok,
+            &output,
+            usage.as_ref(),
+            terminal_json.as_deref(),
+            policy_trigger_json.as_deref(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let first = frames.try_recv().unwrap();
+    assert_eq!(frames.try_recv().unwrap().seq, first.seq);
+    let seq_after: i64 = db
+        .query_row("SELECT last_event_seq FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seq_before, seq_after);
+    for changed in ["output", "usage", "terminal", "trigger"] {
+        let mut terminal: NodeTerminalV1 =
+            serde_json::from_str(terminal_json.as_deref().unwrap()).unwrap();
+        terminal.degraded_ancestry = true;
+        let altered_terminal = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+        let mut altered_usage = usage.clone().unwrap();
+        altered_usage.used = Some(8);
+        let result = sink
+            .node_finished(
+                "node",
+                ok,
+                if changed == "output" {
+                    "different"
+                } else {
+                    &output
+                },
+                if changed == "usage" {
+                    Some(&altered_usage)
+                } else {
+                    usage.as_ref()
+                },
+                if changed == "terminal" {
+                    Some(&altered_terminal)
+                } else {
+                    terminal_json.as_deref()
+                },
+                if changed == "trigger" {
+                    Some("{}")
+                } else {
+                    policy_trigger_json.as_deref()
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(BridgeError::StoreFailure)),
+            "{changed}: {result:?}"
+        );
+    }
+    assert!(frames.try_recv().is_err());
+    assert_eq!(joint_receipt(&h), before);
+    cancel.cancel();
+    use futures::StreamExt;
+    let _: Vec<_> = stream.collect().await;
+}
+
+#[tokio::test]
+async fn joint_absent_chain_keeps_local_completion_without_checkpoint() {
+    use futures::StreamExt;
+    let h = CandidateFixture::new("attested-usage", "final-only").await;
+    let admitted = joint_admission(&h, false).await;
+    let events: Vec<_> = joint_stream(&h, admitted, CancellationToken::new())
+        .collect()
+        .await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert!(events.iter().any(|e| matches!(e, Ok(WorkflowEvent::NodeFinished { output, ok: true, terminal_json: Some(_), .. }) if output == "answer")));
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    assert!(h.f.store.node_checkpoints(&task).await.unwrap().is_empty());
+    assert!(h
+        .f
+        .store
+        .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+        .await
+        .unwrap()
+        .is_none());
 }
