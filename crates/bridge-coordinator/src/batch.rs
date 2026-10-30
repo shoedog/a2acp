@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
     decode_workflow_spec, encode_workflow_run_spec, encode_workflow_spec, finalize_detached,
-    finalize_detached_with_barrier, load_structured_resume_seed, spawn_detached_workflow_accounted,
+    finalize_detached_with_barrier, load_structured_resume_seed,
+    refuse_workflow_candidate_recovery, spawn_detached_workflow_accounted,
     workflow_prompt_dispatch_barrier_with_state, workflow_terminal_summary_barrier,
     AttemptTelemetryState, TaskProgressHub,
 };
@@ -453,14 +454,10 @@ async fn resumed_child_future(
         .as_ref()
         .is_some_and(|spec| spec.fallback_chains.is_some())
     {
-        let _ = finalize_detached(
-            &deps.detached.task_store,
-            &deps.detached.progress_hubs,
+        refuse_workflow_candidate_recovery(
+            &deps.detached,
             &task,
-            TaskRecordStatus::Interrupted,
-            None,
-            Some("not resumable: workflow candidate recovery is not activated"),
-            None,
+            frozen_run_spec.as_ref().expect("chain-bearing V2 spec"),
         )
         .await;
         drop(permit);
