@@ -899,6 +899,26 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         Err(BridgeError::StoreFailure)
     }
 
+    /// Candidate NodeCompletion publication, including canonical V2 checkpoint
+    /// evidence and any selected policy trigger, atomically with progress/journal.
+    /// Exact replay preserves the original sequence, timestamp and operation;
+    /// changed output, usage, terminal or trigger refuses. None retains the legacy
+    /// evidence-free contract and grants no structured recovery authority.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_candidate_v2(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _expected: &CandidateProgressV1,
+        _next: &CandidateProgressV1,
+        _operation: &OperationId,
+        _ts: i64,
+        _terminal_json: Option<&str>,
+        _policy_trigger_json: Option<&str>,
+    ) -> Result<CandidatePublicationV1, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
     /// Recovery read: bind visits to accounting and admitted attempt lineage.
     /// Completion must agree with the write-once node checkpoint, including usage.
     /// Either publication order interrupts while only one record is durable;
