@@ -4577,26 +4577,6 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             Ok(DecodedWorkflowSpec::BoundV2(run_spec)) => (run_spec.graph.clone(), Some(run_spec)),
             Err(_) => continue,
         };
-        if run_spec
-            .as_ref()
-            .is_some_and(|spec| spec.fallback_chains.is_some())
-        {
-            let classification = classify_workflow_candidates(
-                deps,
-                &record.id,
-                run_spec.as_ref().expect("chain-bearing V2 spec"),
-            )
-            .await;
-            tracing::warn!(
-                task = record.id.as_str(),
-                ?classification,
-                "checkpoint reconciliation: candidate recovery remains disabled"
-            );
-            // Preserve attempt-first ordering: the boot sweep settles the prior
-            // attempt before either consumer publishes its checked refusal.
-            // Even a valid completed classification cannot shortcut to success.
-            continue;
-        }
         let Some(terminal_node) = graph.terminal() else {
             continue;
         };
@@ -4608,10 +4588,35 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
                     error = ?error,
                     "checkpoint reconciliation: checkpoint read failed"
                 );
-                safe_to_interrupt = false;
+                // Candidate evidence read failures remain consumer refusals after
+                // the prior-attempt sweep, as before completed recovery activation.
+                if run_spec
+                    .as_ref()
+                    .is_none_or(|spec| spec.fallback_chains.is_none())
+                {
+                    safe_to_interrupt = false;
+                }
                 continue;
             }
         };
+        if let Some(spec) = run_spec
+            .as_ref()
+            .filter(|spec| spec.fallback_chains.is_some())
+        {
+            let checked = classify_workflow_candidates(deps, &record.id, spec, &checkpoints).await;
+            tracing::warn!(
+                task = record.id.as_str(),
+                classification = ?checked.as_ref().map(|(classification, _)| classification),
+                "checkpoint reconciliation: candidate classification"
+            );
+            if !matches!(checked, Ok((WorkflowCandidateRecovery::Completed, _))) {
+                // Preserve attempt-first ordering for invalid or unfinished chains:
+                // the boot sweep settles the prior attempt before consumer refusal.
+                continue;
+            }
+            // A checked completed candidate is ordinary node completion. The exact
+            // prior attempt still owns terminal settlement through the barriers below.
+        }
         let Some((_, output, ok, _)) = checkpoints
             .iter()
             .find(|(node, _, _, _)| node.as_str() == terminal_node.id.as_str())
@@ -4973,33 +4978,25 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
     safe_to_interrupt
 }
 
-/// Classification is evidence only. Neither variant grants a Preparing CAS or
-/// permits checkpoint replay; activation belongs to the later recovery slices.
+/// Completed nodes may seed ordinary recovery. No classification grants a
+/// Preparing CAS; every unfinished chained node remains refused.
 #[derive(Debug)]
 enum WorkflowCandidateRecovery {
     Completed,
     Continuation,
     Mixed,
 }
-impl WorkflowCandidateRecovery {
-    fn refusal(&self) -> &'static str {
-        match self {
-            Self::Completed => {
-                "not resumable: workflow candidate recovery is not activated (completed)"
-            }
-            Self::Continuation => {
-                "not resumable: workflow candidate recovery is not activated (continuation)"
-            }
-            Self::Mixed => "not resumable: workflow candidate recovery is not activated (mixed)",
-        }
-    }
-}
-
 async fn classify_workflow_candidates(
     deps: &DetachedDeps,
     task: &TaskId,
     run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
-) -> Result<WorkflowCandidateRecovery, &'static str> {
+    checkpoints: &[(
+        NodeId,
+        String,
+        bool,
+        Option<bridge_core::orch::UsageSnapshot>,
+    )],
+) -> Result<(WorkflowCandidateRecovery, StructuredWorkflowSeedV1), &'static str> {
     use bridge_core::execution_policy::NodePrimaryDispositionV1;
     use bridge_core::fallback_runtime::{CandidateRecoveryV1, FrozenFallbackInvocationV1};
 
@@ -5044,12 +5041,7 @@ async fn classify_workflow_candidates(
             return Err("not resumable: candidate source authority drift");
         }
     }
-    let checkpoints = deps
-        .task_store
-        .node_checkpoints(task)
-        .await
-        .map_err(|_| "not resumable: candidate checkpoints unavailable")?;
-    let seed = load_structured_resume_seed(deps, task, &checkpoints).await?;
+    let seed = load_structured_resume_seed(deps, task, checkpoints).await?;
     for (node, checkpoint) in &seed.nodes {
         let graph_node = run_spec
             .graph
@@ -5135,45 +5127,33 @@ async fn classify_workflow_candidates(
         }
     }
     match (completed, continuation) {
-        (true, false) => Ok(WorkflowCandidateRecovery::Completed),
-        (false, true) => Ok(WorkflowCandidateRecovery::Continuation),
-        (true, true) => Ok(WorkflowCandidateRecovery::Mixed),
+        (true, false) => Ok((WorkflowCandidateRecovery::Completed, seed)),
+        (false, true) => Ok((WorkflowCandidateRecovery::Continuation, seed)),
+        (true, true) => Ok((WorkflowCandidateRecovery::Mixed, seed)),
         _ => Err("not resumable: candidate evidence missing"),
     }
 }
 
-/// Shared by both consumers and the attempt-first terminal reconciliation pass.
-/// Failed persistence leaves the task untouched; no synthetic terminal or
-/// successor attempt is returned to the caller.
-pub(crate) async fn refuse_workflow_candidate_recovery(
+/// Only completed-only candidate graphs may enter ordinary seeded recovery.
+/// Return the validated seed itself; do not re-harvest or republish its nodes.
+pub(crate) async fn load_completed_candidate_seed(
     deps: &DetachedDeps,
     task: &TaskId,
     run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
-) -> bool {
-    let reason = match classify_workflow_candidates(deps, task, run_spec).await {
-        Ok(classification) => classification.refusal(),
-        Err(reason) => reason,
-    };
-    match finalize_detached(
-        &deps.task_store,
-        &deps.progress_hubs,
-        task,
-        TaskRecordStatus::Interrupted,
-        None,
-        Some(reason),
-        None,
-    )
-    .await
-    {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                task = task.as_str(),
-                ?error,
-                reason,
-                "candidate recovery: interruption persistence failed"
-            );
-            false
+    checkpoints: &[(
+        NodeId,
+        String,
+        bool,
+        Option<bridge_core::orch::UsageSnapshot>,
+    )],
+) -> Result<StructuredWorkflowSeedV1, &'static str> {
+    match classify_workflow_candidates(deps, task, run_spec, checkpoints).await? {
+        (WorkflowCandidateRecovery::Completed, seed) => Ok(seed),
+        (WorkflowCandidateRecovery::Continuation, _) => {
+            Err("not resumable: workflow candidate recovery is not activated (continuation)")
+        }
+        (WorkflowCandidateRecovery::Mixed, _) => {
+            Err("not resumable: workflow candidate recovery is not activated (mixed)")
         }
     }
 }
@@ -5347,18 +5327,6 @@ pub async fn resume_one_working_task_with_accounting(
         }
     };
     let (graph, frozen_run_spec) = decoded.into_parts();
-    if frozen_run_spec
-        .as_ref()
-        .is_some_and(|spec| spec.fallback_chains.is_some())
-    {
-        refuse_workflow_candidate_recovery(
-            deps,
-            &task,
-            frozen_run_spec.as_ref().expect("chain-bearing V2 spec"),
-        )
-        .await;
-        return;
-    }
     let is_v2 = frozen_run_spec.is_some();
 
     // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
@@ -5366,6 +5334,21 @@ pub async fn resume_one_working_task_with_accounting(
         Ok(cps) => cps,
         Err(e) => {
             tracing::warn!(task = task.as_str(), error = ?e, "resume scan: node_checkpoints() failed; skipping task");
+            if frozen_run_spec
+                .as_ref()
+                .is_some_and(|spec| spec.fallback_chains.is_some())
+            {
+                let _ = finalize_detached(
+                    &deps.task_store,
+                    &deps.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: candidate checkpoints unavailable"),
+                    None,
+                )
+                .await;
+            }
             return;
         }
     };
@@ -5382,7 +5365,14 @@ pub async fn resume_one_working_task_with_accounting(
         })
         .collect();
     let structured_seed = if is_v2 {
-        match load_structured_resume_seed(deps, &task, &cps).await {
+        let checked = match frozen_run_spec
+            .as_ref()
+            .filter(|spec| spec.fallback_chains.is_some())
+        {
+            Some(spec) => load_completed_candidate_seed(deps, &task, spec, &cps).await,
+            None => load_structured_resume_seed(deps, &task, &cps).await,
+        };
+        match checked {
             Ok(seed) => Some(seed),
             Err(reason) => {
                 let _ = finalize_detached(
