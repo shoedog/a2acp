@@ -13,6 +13,10 @@ type Result<T, E = BridgeError> = std::result::Result<T, E>;
 
 #[derive(Default)]
 struct Calls {
+    resolution_errors: Mutex<Vec<BridgeError>>,
+    setup_errors: Mutex<Vec<BridgeError>>,
+    cleanup_results: Mutex<Vec<Result<BackendCleanupDispositionV1>>>,
+    prompt_error: Mutex<Option<BridgeError>>,
     resolution_cancel: Mutex<Option<CancellationToken>>,
     entry_check: Mutex<Option<Box<dyn Fn() + Send>>>,
     canceled: Mutex<Vec<SessionId>>,
@@ -63,6 +67,9 @@ impl AgentBackend for BoundFixture {
             self.0.configure.1.notified().await;
         }
         let setup = self.1.setups.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.1.setup_errors.lock().unwrap().pop() {
+            return Err(error);
+        }
         if self.0.behavior == "unpolled-timeout"
             || self.0.behavior == "retry-unpolled" && setup == 1
         {
@@ -107,6 +114,13 @@ impl AgentBackend for BoundFixture {
         if self.0.behavior == "retry-setup" && self.0.prompts.load(Ordering::SeqCst) > 0 {
             return Err(BridgeError::ModelNotAvailable);
         }
+        if self.0.behavior == "setup-budget" {
+            return Err(BridgeError::BudgetRefused {
+                refusal: Box::new(bridge_core::governance::BudgetRefusalV1::new(
+                    bridge_core::governance::BudgetRefusalReasonV1::LimitExceeded,
+                )),
+            });
+        }
         if self.0.behavior == "blocked-setup-error" {
             self.0.configure.0.notify_one();
             self.0.configure.1.notified().await;
@@ -131,6 +145,10 @@ impl AgentBackend for BoundFixture {
         parts: Vec<Part>,
         obs: BackendObservers,
     ) -> Result<BackendStream> {
+        if let Some(error) = self.1.prompt_error.lock().unwrap().take() {
+            self.0.prompts.fetch_add(1, Ordering::SeqCst);
+            return Err(error);
+        }
         if self.0.behavior == "preflight-pass" && parts[0].text.contains("PONG") {
             self.0.prompts.fetch_add(1, Ordering::SeqCst);
             self.0.inputs.lock().unwrap().push(parts);
@@ -412,6 +430,10 @@ impl AgentBackend for BoundFixture {
         &self,
         session: &SessionId,
     ) -> Result<BackendCleanupDispositionV1, bridge_core::error::BridgeError> {
+        if let Some(result) = self.1.cleanup_results.lock().unwrap().pop() {
+            self.1.cleaned.lock().unwrap().push(session.clone());
+            return result;
+        }
         if self.0.behavior == "deadline" {
             self.0.cleanup.0.notify_one();
             self.0.cleanup.1.notified().await;
@@ -550,6 +572,9 @@ impl CandidateFixture {
             let backend = providers[i].clone();
             let record = records[i].clone();
             Box::pin(async move {
+                if let Some(error) = record.resolution_errors.lock().unwrap().pop() {
+                    return Err(error);
+                }
                 if backend.behavior == "retry-unpolled-resolve" && resolving == 1 {
                     return Err(BridgeError::AgentTimedOut);
                 }
@@ -1511,7 +1536,16 @@ async fn workflow_authority_scope_and_barrier_refusals() {
 // Seed durable crash boundaries without running a provider: all recovery effects
 // can therefore be asserted absolutely zero, including preparation and accounting.
 async fn recovery_candidate_fixture(case: &str) -> (CandidateFixture, AdmittedWorkflowRunV1) {
-    let h = CandidateFixture::new("reject", "success").await;
+    recovery_candidate_fixture_target(case, "success").await
+}
+async fn recovery_candidate_fixture_target(
+    case: &str,
+    target: &'static str,
+) -> (CandidateFixture, AdmittedWorkflowRunV1) {
+    let mut h = CandidateFixture::new("reject", target).await;
+    if case == "precedence" {
+        h.run.progress.chains[0].steps.truncate(1);
+    }
     let mut initial = h.admission("source").await;
     if case == "checkpoint-dependencies" {
         let mut graph = initial.run_spec.graph.clone();
@@ -5032,4 +5066,1517 @@ async fn joint_startup_refuses_terminal_candidate_checkpoint() {
 #[tokio::test]
 async fn joint_startup_recovers_ordinary_terminal_checkpoint() {
     joint_startup_checkpoint_recovery(false).await;
+}
+
+// C2c2d4: executor composition only; public recovery still refuses these snapshots.
+async fn restored_owner(
+    h: &CandidateFixture,
+    source: &AdmittedWorkflowRunV1,
+    retries: u32,
+) -> (AdmittedWorkflowRunV1, WorkflowAccountingInvocationV1) {
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let previous = h.f.store.get_attempt_locator(&task).await.unwrap().unwrap();
+    let owner = previous.identity.resume().unwrap();
+    assert!(matches!(
+        h.f.store
+            .claim_resume_attempt_with_locator(
+                &task,
+                3,
+                2,
+                &previous,
+                &TaskAttemptLocator {
+                    identity: owner.clone(),
+                    telemetry_unavailable: None
+                }
+            )
+            .await
+            .unwrap(),
+        ResumeClaim::Resumable { .. }
+    ));
+    let mut graph = source.run_spec.graph.clone();
+    graph.nodes[0].retry = Some(bridge_workflow::graph::RetryPolicy {
+        max_attempts: retries,
+        backoff_ms: 0,
+        backoff_cap_ms: None,
+    });
+    let admitted = h
+        .builder()
+        .freeze(WorkflowAdmissionRequestV1 {
+            attempt_id: owner.attempt_id.clone(),
+            graph: Arc::new(graph),
+            requested_session_cwd: source.run_spec.requested_session_cwd.clone(),
+            policy_invocation: Default::default(),
+            ledger_admission: source.run_spec.ledger_admission.clone(),
+            r2f1b: None,
+        })
+        .await
+        .unwrap();
+    let admitted = h
+        .builder()
+        .bind_local_chains(
+            admitted,
+            source
+                .run_spec
+                .fallback_chains
+                .as_ref()
+                .unwrap()
+                .get(&NodeId::parse("node").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    (
+        admitted,
+        WorkflowAccountingInvocationV1::new(
+            AccountingV1::new(h.f.store.clone()),
+            owner,
+            WorkflowId::parse("workflow").unwrap(),
+        ),
+    )
+}
+
+async fn restored_executor(
+    h: &CandidateFixture,
+    admitted: &AdmittedWorkflowRunV1,
+    accounting: &WorkflowAccountingInvocationV1,
+) -> Result<WorkflowExecutor> {
+    WorkflowExecutor::new(h.registry.clone())
+        .with_restored_fallback_v1(
+            h.builder(),
+            admitted.clone(),
+            h.f.store.clone(),
+            TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+            accounting,
+            |diagnostic| BridgeError::agent_failure(diagnostic.clone()),
+        )
+        .await
+}
+
+async fn drive_restored(
+    h: &CandidateFixture,
+    executor: &WorkflowExecutor,
+    admitted: AdmittedWorkflowRunV1,
+    accounting: Option<WorkflowAccountingInvocationV1>,
+) -> Vec<Result<WorkflowEvent>> {
+    drive_restored_accounted(h, executor, admitted, accounting, None)
+        .await
+        .into_iter()
+        .map(|event| event.map_err(|failure| failure.surfaced_error()))
+        .collect()
+}
+
+async fn drive_restored_accounted(
+    h: &CandidateFixture,
+    executor: &WorkflowExecutor,
+    admitted: AdmittedWorkflowRunV1,
+    accounting: Option<WorkflowAccountingInvocationV1>,
+    structured_seed: Option<StructuredWorkflowSeedV1>,
+) -> Vec<Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>> {
+    drive_restored_controlled(
+        h,
+        executor,
+        admitted,
+        accounting,
+        structured_seed,
+        CancellationToken::new(),
+        None,
+    )
+    .await
+}
+
+async fn drive_restored_controlled(
+    h: &CandidateFixture,
+    executor: &WorkflowExecutor,
+    admitted: AdmittedWorkflowRunV1,
+    accounting: Option<WorkflowAccountingInvocationV1>,
+    structured_seed: Option<StructuredWorkflowSeedV1>,
+    cancel: CancellationToken,
+    barrier: Option<PromptDispatchBarrier>,
+) -> Vec<Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>> {
+    use futures::StreamExt;
+    let graph = Arc::new(admitted.run_spec.graph.clone());
+    let mut context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: admitted.run_spec.requested_session_cwd.clone(),
+        harvest_audit_store: h.f.store.clone(),
+        task_id: Some(TaskId::parse(h.owner.execution_id.as_str()).unwrap()),
+        observer_key: Some(h.owner.execution_id.as_str().into()),
+        ..Default::default()
+    })
+    .with_admitted_workflow_run(admitted)
+    .unwrap();
+    if let Some(barrier) = barrier {
+        context = context.with_prompt_dispatch_barrier(barrier);
+    }
+    if let Some(accounting) = accounting {
+        context = context.with_accounting(accounting);
+    }
+    let seed = structured_seed
+        .as_ref()
+        .map(|seed| {
+            seed.nodes
+                .iter()
+                .map(|(node, checkpoint)| {
+                    (
+                        node.as_str().to_owned(),
+                        (
+                            checkpoint.output.clone(),
+                            checkpoint.ok,
+                            checkpoint.usage.clone(),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    executor
+        .run_from_with_accounting_failures(
+            graph,
+            "restored input".into(),
+            "restored".into(),
+            cancel,
+            seed,
+            structured_seed,
+            context,
+        )
+        .collect()
+        .await
+}
+
+async fn checked_progress(h: &CandidateFixture) -> CandidateProgressV1 {
+    h.f.store
+        .candidate_progress_v1(
+            &TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+            &NodeId::parse("node").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+// Extend the real checked store at a settled crash boundary, without provider work.
+async fn seed_rejected_visit(h: &CandidateFixture, position: usize) {
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let node = NodeId::parse("node").unwrap();
+    let mut progress = checked_progress(h).await;
+    let prior = progress.visits.last().unwrap().clone();
+    let candidate = if position == 0 {
+        &progress.source
+    } else {
+        &progress.chains[0].steps[position - 1]
+    };
+    let id = AttemptId::mint().unwrap().as_str().to_owned();
+    let mut row = h.f.rows()[0].clone();
+    row.id = id.clone();
+    row.dispatched = false;
+    row.finalized = false;
+    row.attribution.agent = candidate.agent.as_str().into();
+    row.attribution.effective_model = Some(candidate.model.clone());
+    row.attribution.effective_mode = candidate.posture.mode.clone();
+    h.f.store.start_usage_attempt_v1(&row).await.unwrap();
+    for phase in [
+        CandidatePhaseV1::Preparing,
+        CandidatePhaseV1::Prepared,
+        CandidatePhaseV1::PollFenced,
+        CandidatePhaseV1::Polled,
+    ] {
+        let old = progress.clone();
+        if phase == CandidatePhaseV1::Preparing {
+            progress.retries_consumed += u32::from(position == prior.position);
+            progress.visits.push(CandidateVisitV1 {
+                position,
+                accounting_id: id.clone(),
+                owner: h.owner.clone(),
+                cold_context: ContextId::parse(id.clone()).unwrap(),
+                phase,
+                rejection: None,
+            });
+        } else {
+            progress.visits.last_mut().unwrap().phase = phase;
+        }
+        h.f.store
+            .put_candidate_progress_v1(&task, &node, Some(&old), &progress)
+            .await
+            .unwrap();
+    }
+    h.f.store
+        .update_usage_attempt_v1(&id, true, None, true)
+        .await
+        .unwrap();
+    let old = progress.clone();
+    progress.visits.last_mut().unwrap().rejection = prior.rejection;
+    h.f.store
+        .put_candidate_progress_v1(&task, &node, Some(&old), &progress)
+        .await
+        .unwrap();
+}
+
+async fn restored_governed_refusal(execute: bool) {
+    use bridge_core::governance::*;
+    for turns in [0, 10] {
+        for preflight in [false, true] {
+            let (h, initial) =
+                recovery_candidate_fixture_target("continuation", "preflight-pass").await;
+            let mut snapshot = h.f.snapshot();
+            snapshot.entries[1].preflight = preflight;
+            h.registry.apply(snapshot).await.unwrap();
+            let (admitted, ungoverned) = restored_owner(&h, &initial, 2).await;
+            let owner =
+                h.f.store
+                    .get_attempt_locator(&TaskId::parse(h.owner.execution_id.as_str()).unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .identity;
+            let mut service = AccountingV1::new(h.f.store.clone());
+            service.budget_policy = Some(Arc::new(
+                BudgetPolicyV1::new(
+                    vec![BudgetRuleV1 {
+                        id: "restored-cap".into(),
+                        selector: BudgetSelectorV1::EachRequest,
+                        limits: BudgetLimitsV1 {
+                            turns: Some(turns),
+                            terminal_tokens: None,
+                        },
+                    }],
+                    vec![],
+                )
+                .unwrap(),
+            ));
+            let governed = WorkflowAccountingInvocationV1::new(
+                service,
+                owner,
+                WorkflowId::parse("workflow").unwrap(),
+            );
+            let prior_rows = h.f.rows();
+            let prior_progress = checked_progress(&h).await;
+            let expected = BridgeError::ConfigInvalid {
+                reason: "governed restored fallback is unsupported".into(),
+            };
+            if execute {
+                let executor = restored_executor(&h, &admitted, &ungoverned).await.unwrap();
+                let events = drive_restored(&h, &executor, admitted, Some(governed)).await;
+                assert!(
+                    events.iter().any(|e| e.as_ref().err() == Some(&expected)),
+                    "{events:?}"
+                );
+            } else {
+                let result = restored_executor(&h, &admitted, &governed).await;
+                assert_eq!(
+                    result.err(),
+                    Some(expected),
+                    "turns={turns}, preflight={preflight}"
+                );
+            }
+            assert_eq!(h.f.rows(), prior_rows, "no new accounting rows");
+            assert_eq!(checked_progress(&h).await, prior_progress);
+            let db =
+                rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                    .unwrap();
+            let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='governance_reservations_v1')", [], |r| r.get(0)).unwrap();
+            if exists {
+                let reservations: u64 = db
+                    .query_row("SELECT COUNT(*) FROM governance_reservations_v1", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(reservations, 0);
+            }
+            assert!(h.f.spawns.lock().unwrap().is_empty());
+            for (provider, calls) in h.f.providers.iter().zip(&h.calls) {
+                assert_eq!(calls.setups.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.setup.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.prompts.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_composition_refuses_governed_before_effects() {
+    restored_governed_refusal(false).await;
+}
+
+#[tokio::test]
+async fn restored_execution_refuses_swapped_governed_before_effects() {
+    restored_governed_refusal(true).await;
+}
+
+#[tokio::test]
+async fn restored_unpolled_budget_refusal_remains_policy_stop() {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "setup-budget").await;
+    let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let prior = h.f.rows();
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let failure = events
+        .iter()
+        .find_map(|e| e.as_ref().err())
+        .expect("budget policy stop");
+    assert!(
+        matches!(failure.original, BridgeError::BudgetRefused { .. }),
+        "{events:?}"
+    );
+    assert!(failure.persistence.is_none());
+    assert_eq!(failure.surfaced_error(), failure.original);
+    precedence_cause(&events, Some(&failure.original));
+    let projected: Vec<_> = events
+        .iter()
+        .filter(|event| event.is_ok())
+        .cloned()
+        .collect();
+    precedence_output(&projected, "budget refused", WorkflowOutcome::Failed);
+    precedence_rows(&h, &prior, &[(false, true)]);
+    assert_eq!(h.calls[1].setups.load(Ordering::SeqCst), 1);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.f.rows().len(), 2);
+    assert!(h.f.rows().iter().all(|row| row.finalized));
+}
+
+#[tokio::test]
+async fn restored_successor_preserves_chain_position_and_prior_visits() {
+    for position in [1, 2] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        if position == 2 {
+            seed_rejected_visit(&h, 1).await;
+        }
+        let prior = checked_progress(&h).await;
+        let rows = h.f.rows();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        assert!(
+            h.f.spawns.lock().unwrap().is_empty(),
+            "restore grants no preparation"
+        );
+        let events = drive_restored(&h, &executor, admitted.clone(), Some(accounting)).await;
+        assert!(events.iter().any(|e| matches!(e, Ok(WorkflowEvent::Terminal { outcome, output }) if *outcome == if position == 1 { WorkflowOutcome::Completed } else { WorkflowOutcome::Failed } && (position != 1 || output == "answer"))), "{events:?}");
+        let progress = checked_progress(&h).await;
+        assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+        assert_eq!(progress.selected_chain, Some(0));
+        assert_eq!(progress.visits.last().unwrap().position, position);
+        assert_eq!(progress.retries_consumed, prior.retries_consumed);
+        assert_eq!(
+            progress.visits.last().unwrap().owner.attempt_id,
+            admitted.run_spec.attempt_id
+        );
+        for old in rows {
+            assert_eq!(h.f.rows().iter().find(|r| r.id == old.id), Some(&old));
+        }
+        assert_eq!(h.f.providers[0].setup.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.calls[position].setups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.f.providers[position].prompts.load(Ordering::SeqCst),
+            usize::from(position == 1)
+        );
+        assert_eq!(h.calls[position].cleaned.lock().unwrap().len(), 1);
+        if position == 1 {
+            assert_eq!(
+                h.f.providers[position].inputs.lock().unwrap()[0][0].text,
+                "restored input"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_successor_keeps_consumed_retry_budget() {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "retry-unpolled").await;
+    seed_rejected_visit(&h, 0).await;
+    let prior = checked_progress(&h).await;
+    let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let events = drive_restored(&h, &executor, admitted, Some(accounting)).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Ok(WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Failed,
+                ..
+            })
+        )),
+        "{events:?}"
+    );
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        h.f.providers[1].prompts.load(Ordering::SeqCst),
+        1,
+        "spent retry was reused"
+    );
+    let progress = checked_progress(&h).await;
+    assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+    assert_eq!(progress.retries_consumed, 1);
+    assert_eq!(progress.visits.len(), 3);
+    assert_eq!(h.f.rows().len(), 3);
+}
+
+#[tokio::test]
+async fn restored_composition_requires_claimed_accounting_and_checked_evidence() {
+    for fault in [
+        "fresh",
+        "missing",
+        "stale-owner",
+        "missing-row",
+        "authority",
+        "scope",
+        "diagnostic",
+    ] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        if fault == "fresh" {
+            assert!(restored_executor(&h, &initial, &h.accounting)
+                .await
+                .is_err());
+        } else {
+            let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+            if fault == "diagnostic" {
+                assert!(WorkflowExecutor::new(h.registry.clone())
+                    .with_restored_fallback_v1(
+                        h.builder(),
+                        admitted.clone(),
+                        h.f.store.clone(),
+                        TaskId::parse(h.owner.execution_id.as_str()).unwrap(),
+                        &accounting,
+                        |_| BridgeError::StoreFailure,
+                    )
+                    .await
+                    .is_err());
+            } else if fault == "missing-row" {
+                rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                    .unwrap()
+                    .execute("DELETE FROM usage_attempts_v1", [])
+                    .unwrap();
+                assert!(restored_executor(&h, &admitted, &accounting).await.is_err());
+            } else {
+                let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+                if fault == "stale-owner" {
+                    restored_owner(&h, &admitted, 2).await;
+                }
+                if fault == "authority" {
+                    let mut snapshot = h.f.snapshot();
+                    snapshot.entries[1].args.push("drift".into());
+                    h.registry.apply(snapshot).await.unwrap();
+                }
+                if fault == "scope" {
+                    let scope = h.f.dir.path().join("scope");
+                    std::fs::rename(&scope, h.f.dir.path().join("old-scope")).unwrap();
+                    std::fs::create_dir(scope).unwrap();
+                }
+                let events = drive_restored(
+                    &h,
+                    &executor,
+                    admitted,
+                    (fault != "missing").then_some(accounting),
+                )
+                .await;
+                assert!(events.iter().any(Result::is_err), "{fault}: {events:?}");
+            }
+        }
+        assert!(h.f.spawns.lock().unwrap().is_empty(), "{fault}");
+        assert_eq!(
+            h.f.rows().len(),
+            usize::from(fault != "missing-row"),
+            "{fault}"
+        );
+        for provider in &h.f.providers {
+            assert_eq!(provider.setup.load(Ordering::SeqCst), 0, "{fault}");
+            assert_eq!(provider.prompts.load(Ordering::SeqCst), 0, "{fault}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_replayed_preparation_never_reaches_provider() {
+    for preflight in [false, true] {
+        let (h, initial) =
+            recovery_candidate_fixture_target("continuation", "preflight-pass").await;
+        let mut snapshot = h.f.snapshot();
+        snapshot.entries[1].preflight = preflight;
+        h.registry.apply(snapshot).await.unwrap();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let first = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let replay = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let events = drive_restored(&h, &first, admitted.clone(), Some(accounting.clone())).await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Ok(WorkflowEvent::Terminal {
+                    outcome: WorkflowOutcome::Completed,
+                    ..
+                })
+            )),
+            "{events:?}"
+        );
+        let progress = checked_progress(&h).await;
+        let before = h.f.rows();
+        let events = drive_restored(&h, &replay, admitted, Some(accounting)).await;
+        assert!(events.iter().any(Result::is_err), "{events:?}");
+        assert_eq!(checked_progress(&h).await, progress);
+        // A losing accounting reservation is settled without any provider preparation.
+        assert!(h
+            .f
+            .rows()
+            .iter()
+            .filter(|r| !before.iter().any(|old| old.id == r.id))
+            .all(|r| !r.dispatched && r.finalized));
+        assert_eq!(
+            h.calls[1].setups.load(Ordering::SeqCst),
+            1 + usize::from(preflight)
+        );
+        assert_eq!(
+            h.f.providers[1].prompts.load(Ordering::SeqCst),
+            1 + usize::from(preflight)
+        );
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    }
+}
+#[tokio::test]
+async fn restored_unpolled_failure_retains_primary_and_persistence_errors() {
+    for persistence in [false, true] {
+        let (h, initial) = recovery_candidate_fixture_target("continuation", "setup").await;
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let prior = h.f.rows();
+        let progress = checked_progress(&h).await;
+        if persistence {
+            rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap().execute_batch(
+                "CREATE TRIGGER fail_restored_prepare BEFORE INSERT ON usage_attempts_v1 BEGIN SELECT RAISE(ABORT,'accounting fault'); END;"
+            ).unwrap();
+        }
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+        precedence_rows(&h, &prior, if persistence { &[] } else { &[(false, true)] });
+        if !persistence {
+            let primary = BridgeError::agent_failure(
+                *progress.visits[0]
+                    .rejection
+                    .as_ref()
+                    .unwrap()
+                    .diagnostic
+                    .clone(),
+            );
+            precedence_cause(&events, Some(&primary));
+            precedence_output(&events, "fixture.rejected", WorkflowOutcome::Failed);
+        }
+        if persistence {
+            precedence_error(
+                &events,
+                BridgeError::StoreFailure,
+                Some(BridgeError::StoreFailure),
+            );
+            let failure = events
+                .iter()
+                .find_map(|event| event.as_ref().err())
+                .unwrap();
+            assert_eq!(failure.original, BridgeError::StoreFailure);
+            assert_eq!(failure.persistence, Some(BridgeError::StoreFailure));
+            assert_eq!(failure.surfaced_error(), BridgeError::StoreFailure);
+        }
+        assert!(
+            format!("{events:?}").contains(if persistence {
+                "StoreFailure"
+            } else {
+                "fixture.rejected"
+            }),
+            "{events:?}"
+        );
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            h.calls[1].setups.load(Ordering::SeqCst),
+            usize::from(!persistence)
+        );
+    }
+}
+
+async fn restored_preflight_accounting_failure(settlement_fails: bool) {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "preflight-pass").await;
+    let prior_rows = h.f.rows();
+    let mut snapshot = h.f.snapshot();
+    snapshot.entries[1].preflight = true;
+    h.registry.apply(snapshot).await.unwrap();
+    let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let db =
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=PERSIST; CREATE TRIGGER fail_preflight_insert BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.attempt_kind')='preflight' BEGIN SELECT RAISE(ABORT,'preflight accounting fault'); END;").unwrap();
+    if settlement_fails {
+        db.execute_batch("CREATE TRIGGER fail_node_settlement BEFORE UPDATE ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' AND json_extract(NEW.record_json,'$.finalized')=1 BEGIN SELECT RAISE(ABORT,'node settlement fault'); END;").unwrap();
+    }
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let rows = h.f.rows();
+    assert_eq!(rows.len(), 2, "rows={rows:?}; events={events:?}");
+    let node = rows
+        .iter()
+        .find(|row| row.attribution.agent == "target")
+        .unwrap();
+    assert_eq!(node.attribution.attempt_kind, "node");
+    assert!(!node.dispatched);
+    assert_eq!(node.finalized, !settlement_fails, "{events:?}");
+    for prior in prior_rows {
+        assert_eq!(rows.iter().find(|row| row.id == prior.id), Some(&prior));
+    }
+    let failure = events
+        .iter()
+        .find_map(|event| event.as_ref().err())
+        .unwrap();
+    assert_eq!(failure.original, BridgeError::StoreFailure);
+    assert_eq!(failure.persistence, Some(BridgeError::StoreFailure));
+    assert_eq!(failure.surfaced_error(), BridgeError::StoreFailure);
+    assert!(h.f.spawns.lock().unwrap().is_empty());
+    for (provider, calls) in h.f.providers.iter().zip(&h.calls) {
+        assert_eq!(calls.setups.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.prompts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn restored_preflight_failure_settles_reserved_node() {
+    restored_preflight_accounting_failure(false).await;
+}
+
+#[tokio::test]
+async fn restored_preflight_settlement_failure_retains_both_errors() {
+    restored_preflight_accounting_failure(true).await;
+}
+
+#[tokio::test]
+async fn restored_structured_seed_reuses_ordinary_checkpoint_and_refuses_candidate_seed() {
+    use bridge_core::attestation::HarvestSanitizationMode;
+    use bridge_core::orch::UsageSnapshot;
+    for include_candidate in [false, true] {
+        let (h, initial) = recovery_candidate_fixture("continuation").await;
+        let mut graph = initial.run_spec.graph.clone();
+        let mut upstream = graph.nodes[0].clone();
+        upstream.id = NodeId::parse("upstream").unwrap();
+        upstream.agent = AgentId::parse("target").unwrap();
+        upstream.harvest_sanitization = Some(HarvestSanitizationMode::AttestedPrefixV1);
+        graph.nodes[0].inputs = vec![upstream.id.clone()];
+        graph.nodes[0].prompt_template = "{{upstream}}\n{{workflow.costs}}".into();
+        graph.nodes.push(upstream.clone());
+        let initial = h
+            .builder()
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: h.owner.attempt_id.clone(),
+                graph: Arc::new(graph),
+                requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+                policy_invocation: Default::default(),
+                ledger_admission: initial.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        let initial = h
+            .builder()
+            .bind_local_chains(initial, &h.run.progress.chains)
+            .unwrap();
+        let (admitted, accounting) = restored_owner(&h, &initial, 2).await;
+        let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+        let checkpoint = StructuredNodeSeedV1 {
+            output: "process\nexact predecessor output".into(),
+            ok: true,
+            usage: Some(UsageSnapshot {
+                used: Some(41),
+                size: Some(100),
+                at_ms: 7,
+                ..Default::default()
+            }),
+            terminal: NodeTerminalV1 {
+                schema_version: 1,
+                primary: NodePrimaryDispositionV1::Completed,
+                cleanup: NodeCleanupV1 {
+                    disposition: NodeCleanupDispositionV1::Complete,
+                    duration_ms: 0,
+                },
+                cause: None,
+                prompt_may_have_been_accepted: false,
+                degraded_ancestry: false,
+                policy_trigger_id: None,
+            },
+        };
+        let mut seed = StructuredWorkflowSeedV1::default();
+        seed.nodes.insert(upstream.id.clone(), checkpoint.clone());
+        if include_candidate {
+            seed.nodes
+                .insert(NodeId::parse("node").unwrap(), checkpoint.clone());
+        }
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER forbid_seed_harvest BEFORE INSERT ON harvest_raw_records_v1 BEGIN SELECT RAISE(ABORT,'seed reharvested'); END;").unwrap();
+        let prior = checked_progress(&h).await;
+        let prior_rows = h.f.rows();
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), Some(seed)).await;
+        if include_candidate {
+            assert!(events.iter().any(Result::is_err), "{events:?}");
+            assert_eq!(checked_progress(&h).await, prior);
+            assert_eq!(h.f.rows(), prior_rows);
+            assert!(h.f.spawns.lock().unwrap().is_empty());
+        } else {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Ok(WorkflowEvent::Terminal {
+                        outcome: WorkflowOutcome::Completed,
+                        ..
+                    })
+                )),
+                "{events:?}"
+            );
+            let input = &h.f.providers[1].inputs.lock().unwrap()[0][0].text;
+            assert!(
+                input.starts_with(&format!("{}\n", checkpoint.output)),
+                "{input}"
+            );
+            assert!(
+                input.contains("| upstream | 41 | 100 | 0.4100 | n/a |"),
+                "{input}"
+            );
+            assert_eq!(h.calls[1].setups.load(Ordering::SeqCst), 1);
+            assert_eq!(h.f.rows().len(), prior_rows.len() + 1);
+            assert!(!events.iter().any(|event| matches!(event, Ok(WorkflowEvent::NodeStarted { node, .. }) if node == &upstream.id)));
+        }
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM harvest_raw_records_v1", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+// Each matrix run starts with checked A evidence and has exactly one successor B.
+async fn precedence_fixture(
+    target: &'static str,
+    retries: u32,
+) -> (
+    CandidateFixture,
+    AdmittedWorkflowRunV1,
+    WorkflowAccountingInvocationV1,
+    WorkflowExecutor,
+) {
+    let (h, initial) = recovery_candidate_fixture_target("precedence", target).await;
+    let (admitted, accounting) = restored_owner(&h, &initial, retries).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    (h, admitted, accounting, executor)
+}
+
+fn precedence_rows(h: &CandidateFixture, prior: &[UsageAttemptV1], states: &[(bool, bool)]) {
+    let rows = h.f.rows();
+    for old in prior {
+        assert_eq!(rows.iter().find(|row| row.id == old.id), Some(old));
+    }
+    let rows: Vec<_> = rows
+        .iter()
+        .filter(|r| !prior.iter().any(|old| old.id == r.id))
+        .collect();
+    assert_eq!(rows.len(), states.len(), "{rows:?}");
+    let mut actual = Vec::new();
+    for row in rows {
+        assert_eq!(row.attribution.agent, "target");
+        assert_eq!(row.attribution.effective_model.as_deref(), Some("target"));
+        assert_eq!(row.attribution.node.as_deref(), Some("node"));
+        assert_eq!(row.attribution.attempt_kind, "node");
+        actual.push((row.dispatched, row.finalized));
+    }
+    actual.sort();
+    let mut expected = states.to_vec();
+    expected.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.f.providers[2].prompts.load(Ordering::SeqCst), 0);
+}
+
+fn precedence_output(
+    events: &[Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>],
+    cause: &str,
+    outcome: WorkflowOutcome,
+) {
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let nodes: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Ok(WorkflowEvent::NodeFinished { ok, output, .. }) => Some((*ok, output)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nodes.len(), 1, "{events:?}");
+    assert_eq!(nodes[0].0, outcome == WorkflowOutcome::Completed);
+    let terminal = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(WorkflowEvent::NodeFinished {
+                terminal_json: Some(json),
+                ..
+            }) => Some(serde_json::from_str::<NodeTerminalV1>(json).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        terminal.primary,
+        match outcome {
+            WorkflowOutcome::Completed => NodePrimaryDispositionV1::Completed,
+            WorkflowOutcome::Canceled => NodePrimaryDispositionV1::CanceledWorkflow,
+            _ if cause == "AgentTimedOut" => NodePrimaryDispositionV1::TimedOut,
+            _ => NodePrimaryDispositionV1::Failed,
+        }
+    );
+    assert!(nodes[0].1.contains(cause), "{events:?}");
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Ok(WorkflowEvent::Terminal { outcome: actual, output })
+        if *actual == outcome && output.contains(cause))
+        ),
+        "{events:?}"
+    );
+    if cause != "fixture.rejected" {
+        assert!(!nodes[0].1.contains("fixture.rejected"), "{events:?}");
+    }
+}
+
+fn precedence_cause(
+    events: &[Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>],
+    expected: Option<&BridgeError>,
+) {
+    let terminal = events
+        .iter()
+        .find_map(|event| match event {
+            Ok(WorkflowEvent::NodeFinished {
+                terminal_json: Some(json),
+                ..
+            }) => Some(serde_json::from_str::<NodeTerminalV1>(json).unwrap()),
+            _ => None,
+        })
+        .expect("typed node terminal");
+    assert_eq!(terminal.cause, expected.map(NodeCauseV1::from_bridge_error));
+}
+
+fn precedence_error(
+    events: &[Result<WorkflowEvent, bridge_core::translator::AccountingFailureV1>],
+    original: BridgeError,
+    persistence: Option<BridgeError>,
+) {
+    let failure = events
+        .iter()
+        .find_map(|e| e.as_ref().err())
+        .expect("error exit");
+    assert_eq!(failure.original, original, "{events:?}");
+    assert_eq!(failure.persistence, persistence);
+    assert_eq!(failure.surfaced_error(), persistence.unwrap_or(original));
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Ok(WorkflowEvent::NodeFinished { .. } | WorkflowEvent::Terminal { .. })
+        )),
+        "{events:?}"
+    );
+}
+
+async fn precedence_preparation(
+    resolution: bool,
+    error: BridgeError,
+    failures: usize,
+    retries: u32,
+    expected: &str,
+) {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", retries).await;
+    let prior = h.f.rows();
+    let progress = checked_progress(&h).await;
+    let errors = if resolution {
+        &h.calls[1].resolution_errors
+    } else {
+        &h.calls[1].setup_errors
+    };
+    *errors.lock().unwrap() = vec![error.clone(); failures];
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let success = expected == "answer";
+    let primary = BridgeError::agent_failure(
+        *progress.visits[0]
+            .rejection
+            .as_ref()
+            .unwrap()
+            .diagnostic
+            .clone(),
+    );
+    precedence_cause(
+        &events,
+        if success {
+            None
+        } else if expected == "fixture.rejected" {
+            Some(&primary)
+        } else {
+            Some(&error)
+        },
+    );
+    precedence_output(
+        &events,
+        expected,
+        if success {
+            WorkflowOutcome::Completed
+        } else {
+            WorkflowOutcome::Failed
+        },
+    );
+    assert_eq!(
+        h.f.providers[1].prompts.load(Ordering::SeqCst),
+        usize::from(success)
+    );
+    let attempts = if success { failures + 1 } else { failures };
+    let mut states = vec![(false, true); attempts];
+    if success {
+        states[attempts - 1] = (true, true);
+    }
+    precedence_rows(&h, &prior, &states);
+    let after = checked_progress(&h).await;
+    assert_eq!(after.visits[..progress.visits.len()], progress.visits);
+    assert_eq!(after.visits.len(), progress.visits.len() + attempts);
+    assert_eq!(after.retries_consumed, (attempts - 1) as u32);
+}
+
+#[tokio::test]
+async fn restored_precedence_model_resolution() {
+    precedence_preparation(
+        true,
+        BridgeError::ModelNotAvailable,
+        1,
+        2,
+        "fixture.rejected",
+    )
+    .await;
+}
+#[tokio::test]
+async fn restored_precedence_model_configuration() {
+    precedence_preparation(
+        false,
+        BridgeError::ModelNotAvailable,
+        1,
+        2,
+        "fixture.rejected",
+    )
+    .await;
+}
+#[tokio::test]
+async fn restored_precedence_timeout_exhausted() {
+    for resolution in [false, true] {
+        precedence_preparation(
+            resolution,
+            BridgeError::AgentTimedOut,
+            2,
+            2,
+            "fixture.rejected",
+        )
+        .await;
+    }
+}
+async fn precedence_preparation_cleanup(error: BridgeError, failures: usize, cleanup_fails: bool) {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", 2).await;
+    let prior = h.f.rows();
+    let progress = checked_progress(&h).await;
+    *h.calls[1].setup_errors.lock().unwrap() = vec![error.clone(); failures];
+    // Results are popped: only the exhausted attempt fails cleanup.
+    let mut cleanup = vec![Ok(BackendCleanupDispositionV1::Complete); failures];
+    if cleanup_fails {
+        cleanup[0] = Err(BridgeError::StoreFailure);
+    }
+    *h.calls[1].cleanup_results.lock().unwrap() = cleanup;
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let primary = BridgeError::agent_failure(
+        *progress.visits[0]
+            .rejection
+            .as_ref()
+            .unwrap()
+            .diagnostic
+            .clone(),
+    );
+    precedence_cause(&events, Some(if cleanup_fails { &error } else { &primary }));
+    precedence_output(
+        &events,
+        &if cleanup_fails {
+            format!("{error:?}")
+        } else {
+            "fixture.rejected".into()
+        },
+        WorkflowOutcome::Failed,
+    );
+    let ordinary: Vec<_> = events
+        .into_iter()
+        .map(|e| e.map_err(|f| f.surfaced_error()))
+        .collect();
+    assert_eq!(
+        node_terminal(&ordinary).cleanup.disposition,
+        if cleanup_fails {
+            NodeCleanupDispositionV1::Failed
+        } else {
+            NodeCleanupDispositionV1::Complete
+        },
+    );
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls[1].setups.load(Ordering::SeqCst), failures);
+    assert_eq!(h.calls[1].cleaned.lock().unwrap().len(), failures);
+    precedence_rows(&h, &prior, &vec![(false, true); failures]);
+    let after = checked_progress(&h).await;
+    assert_eq!(after.visits[..progress.visits.len()], progress.visits);
+    assert_eq!(after.visits.len(), progress.visits.len() + failures);
+    assert_eq!(after.retries_consumed, (failures - 1) as u32);
+}
+
+#[tokio::test]
+async fn restored_precedence_model_cleanup_failure() {
+    precedence_preparation_cleanup(BridgeError::ModelNotAvailable, 1, true).await;
+}
+
+#[tokio::test]
+async fn restored_precedence_timeout_cleanup_failure() {
+    precedence_preparation_cleanup(BridgeError::AgentTimedOut, 2, true).await;
+}
+
+#[tokio::test]
+async fn restored_precedence_preparation_cleanup_success() {
+    precedence_preparation_cleanup(BridgeError::ModelNotAvailable, 1, false).await;
+    precedence_preparation_cleanup(BridgeError::AgentTimedOut, 2, false).await;
+}
+
+#[tokio::test]
+async fn restored_precedence_timeout_retry_success() {
+    for resolution in [false, true] {
+        precedence_preparation(resolution, BridgeError::AgentTimedOut, 1, 2, "answer").await;
+    }
+}
+#[tokio::test]
+async fn restored_precedence_unknown_configuration() {
+    for error in [
+        BridgeError::FrameError,
+        BridgeError::ResourceFlightUnsupported,
+        BridgeError::IdentityUnavailable,
+        BridgeError::AgentOverloaded,
+        BridgeError::ConfigMismatch {
+            field: "adapter_setup",
+        },
+        BridgeError::AgentNotAuthenticated,
+    ] {
+        let cause = format!("{error:?}");
+        precedence_preparation(false, error, 1, 1, &cause).await;
+    }
+}
+#[tokio::test]
+async fn restored_precedence_unknown_resolution() {
+    for error in [
+        BridgeError::FrameError,
+        BridgeError::ResourceFlightUnsupported,
+        BridgeError::IdentityUnavailable,
+        BridgeError::AgentOverloaded,
+        BridgeError::ConfigMismatch {
+            field: "adapter_resolution",
+        },
+        BridgeError::AgentNotAuthenticated,
+    ] {
+        let cause = format!("{error:?}");
+        precedence_preparation(true, error, 1, 1, &cause).await;
+    }
+}
+
+#[tokio::test]
+async fn restored_precedence_setup_settlement_failure() {
+    for original in [BridgeError::ModelNotAvailable, BridgeError::FrameError] {
+        let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+        let prior = h.f.rows();
+        h.calls[1]
+            .setup_errors
+            .lock()
+            .unwrap()
+            .push(original.clone());
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite")).unwrap()
+            .execute_batch("PRAGMA journal_mode=PERSIST; CREATE TRIGGER fail_settlement BEFORE UPDATE ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' AND json_extract(NEW.record_json,'$.finalized')=1 BEGIN SELECT RAISE(ABORT,'settlement fault'); END;").unwrap();
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+        precedence_error(&events, original, Some(BridgeError::StoreFailure));
+        precedence_rows(&h, &prior, &[(false, false)]);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+    }
+}
+
+async fn precedence_persistence_boundary(boundary: &str) {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+    let prior = h.f.rows();
+    let (path, sql) = if boundary == "publication" {
+        ("tasks.sqlite", "CREATE TRIGGER fail_publication BEFORE UPDATE ON task_candidate_progress_v1 BEGIN SELECT RAISE(ABORT,'publication fault'); END;")
+    } else {
+        (
+            "tasks.sqlite.usage-v1.sqlite",
+            if boundary == "reservation" {
+                "CREATE TRIGGER fail_reservation BEFORE INSERT ON usage_attempts_v1 BEGIN SELECT RAISE(ABORT,'reservation fault'); END;"
+            } else {
+                "CREATE TRIGGER fail_pre_poll BEFORE UPDATE ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' AND json_extract(NEW.record_json,'$.dispatched')=0 AND json_extract(NEW.record_json,'$.finalized')=0 BEGIN SELECT RAISE(ABORT,'pre-poll fault'); END;"
+            },
+        )
+    };
+    rusqlite::Connection::open(h.f.dir.path().join(path))
+        .unwrap()
+        .execute_batch(&format!("PRAGMA journal_mode=PERSIST; {sql}"))
+        .unwrap();
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    precedence_error(
+        &events,
+        BridgeError::StoreFailure,
+        Some(BridgeError::StoreFailure),
+    );
+    precedence_rows(
+        &h,
+        &prior,
+        if boundary == "reservation" {
+            &[]
+        } else {
+            &[(false, true)]
+        },
+    );
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn restored_precedence_reservation_failure() {
+    precedence_persistence_boundary("reservation").await;
+}
+#[tokio::test]
+async fn restored_precedence_publication_failure() {
+    precedence_persistence_boundary("publication").await;
+}
+#[tokio::test]
+async fn restored_precedence_pre_poll_write_failure() {
+    precedence_persistence_boundary("pre-poll").await;
+}
+
+#[tokio::test]
+async fn restored_precedence_scope_dispatch_barrier() {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+    let prior = h.f.rows();
+    let scope = h.f.dir.path().join("scope");
+    let barrier: PromptDispatchBarrier = Arc::new(move || {
+        let scope = scope.clone();
+        Box::pin(async move {
+            std::fs::rename(&scope, scope.with_file_name("old-scope")).unwrap();
+            std::fs::create_dir(scope).unwrap();
+        })
+    });
+    let events = drive_restored_controlled(
+        &h,
+        &executor,
+        admitted,
+        Some(accounting),
+        None,
+        CancellationToken::new(),
+        Some(barrier),
+    )
+    .await;
+    precedence_output(
+        &events,
+        "ConfigMismatch { field: \"fallback_scope\" }",
+        WorkflowOutcome::Failed,
+    );
+    precedence_cause(
+        &events,
+        Some(&BridgeError::ConfigMismatch {
+            field: "fallback_scope",
+        }),
+    );
+    precedence_rows(&h, &prior, &[(false, true)]);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+}
+
+async fn precedence_prompt_outcome(target: &'static str) {
+    let (h, admitted, accounting, executor) = precedence_fixture(target, 1).await;
+    let prior = h.f.rows();
+    // Distinguish B's safe rejection from A's checked diagnostic.
+    let mut rejection = checked_progress(&h).await.visits[0]
+        .rejection
+        .as_ref()
+        .unwrap()
+        .diagnostic
+        .as_ref()
+        .clone();
+    let mut json = serde_json::to_value(&rejection).unwrap();
+    json["code"] = "fixture.target".into();
+    rejection = serde_json::from_value(json).unwrap();
+    if matches!(target, "reject" | "forget-unknown" | "accepted") {
+        if target == "accepted" {
+            let mut json = serde_json::to_value(&rejection).unwrap();
+            json["prompt_may_have_been_accepted"] = true.into();
+            rejection = serde_json::from_value(json).unwrap();
+        }
+        *h.calls[1].prompt_error.lock().unwrap() =
+            Some(BridgeError::agent_failure(rejection.clone()));
+    }
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    let (cause, finalized, outcome) = match target {
+        "final-only" => ("answer", true, WorkflowOutcome::Completed),
+        "parity-error" => ("PermissionDenied", false, WorkflowOutcome::Failed),
+        "accepted" => ("fixture.target", false, WorkflowOutcome::Failed),
+        "missing" => ("AgentCrashed", false, WorkflowOutcome::Failed),
+        "local-cancel" => ("", true, WorkflowOutcome::Failed),
+        "reject" => ("fixture.target", true, WorkflowOutcome::Failed),
+        _ => ("fixture.target", false, WorkflowOutcome::Failed),
+    };
+    precedence_output(&events, cause, outcome);
+    let typed = match target {
+        "final-only" | "local-cancel" => None,
+        "parity-error" => Some(BridgeError::PermissionDenied),
+        "missing" => Some(BridgeError::AgentCrashed {
+            reason: "backend stream ended before terminal Done".into(),
+        }),
+        _ => Some(BridgeError::agent_failure(rejection.clone())),
+    };
+    precedence_cause(&events, typed.as_ref());
+    precedence_rows(&h, &prior, &[(true, finalized)]);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+    if matches!(target, "reject" | "forget-unknown") {
+        assert_eq!(
+            *checked_progress(&h)
+                .await
+                .visits
+                .last()
+                .unwrap()
+                .rejection
+                .as_ref()
+                .unwrap()
+                .diagnostic,
+            rejection
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_precedence_success() {
+    precedence_prompt_outcome("final-only").await;
+}
+#[tokio::test]
+async fn restored_precedence_terminal_failure() {
+    precedence_prompt_outcome("parity-error").await;
+}
+#[tokio::test]
+async fn restored_precedence_uncertain_acceptance() {
+    precedence_prompt_outcome("accepted").await;
+}
+#[tokio::test]
+async fn restored_precedence_incomplete_terminal() {
+    precedence_prompt_outcome("missing").await;
+}
+#[tokio::test]
+async fn restored_precedence_terminal_provider_failure() {
+    precedence_prompt_outcome("local-cancel").await;
+}
+#[tokio::test]
+async fn restored_precedence_safe_rejection() {
+    precedence_prompt_outcome("reject").await;
+}
+#[tokio::test]
+async fn restored_precedence_incomplete_cleanup() {
+    precedence_prompt_outcome("forget-unknown").await;
+}
+
+async fn precedence_cancellation(target: &'static str) {
+    let (h, admitted, accounting, executor) = precedence_fixture(target, 1).await;
+    let prior = h.f.rows();
+    let cancel = CancellationToken::new();
+    let before = target == "final-only";
+    let barrier = before.then(|| {
+        let cancel = cancel.clone();
+        Arc::new(move || {
+            let cancel = cancel.clone();
+            Box::pin(async move {
+                cancel.cancel();
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        }) as PromptDispatchBarrier
+    });
+    let drive = drive_restored_controlled(
+        &h,
+        &executor,
+        admitted,
+        Some(accounting),
+        None,
+        cancel.clone(),
+        barrier,
+    );
+    let stop = async {
+        if !before {
+            h.f.providers[1].configure.0.notified().await;
+            cancel.cancel();
+        }
+    };
+    let (events, ()) = tokio::join!(drive, stop);
+    let cause = match target {
+        "parity-cancel-error" => "PermissionDenied",
+        "parity-cancel-cleanup-error" => "StoreFailure",
+        _ => "cancel",
+    };
+    precedence_output(&events, cause, WorkflowOutcome::Canceled);
+    precedence_rows(&h, &prior, &[(!before, before)]);
+    assert_eq!(
+        h.f.providers[1].prompts.load(Ordering::SeqCst),
+        usize::from(!before)
+    );
+}
+#[tokio::test]
+async fn restored_precedence_cancel_before_prompt() {
+    precedence_cancellation("final-only").await;
+}
+#[tokio::test]
+async fn restored_precedence_cancel_after_prompt() {
+    precedence_cancellation("parity-cancel").await;
+}
+#[tokio::test]
+async fn restored_precedence_cancel_error() {
+    precedence_cancellation("parity-cancel-error").await;
+}
+#[tokio::test]
+async fn restored_precedence_cancel_cleanup_error() {
+    precedence_cancellation("parity-cancel-cleanup-error").await;
+}
+
+#[tokio::test]
+async fn restored_precedence_refusal_before_reservation() {
+    for fault in ["owner", "authority", "scope", "accounting"] {
+        let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+        let prior = h.f.rows();
+        let progress = checked_progress(&h).await;
+        if fault == "owner" {
+            restored_owner(&h, &admitted, 1).await;
+        }
+        if fault == "authority" {
+            let mut snapshot = h.f.snapshot();
+            snapshot.entries[1].args.push("drift".into());
+            h.registry.apply(snapshot).await.unwrap();
+        }
+        if fault == "scope" {
+            let scope = h.f.dir.path().join("scope");
+            std::fs::rename(&scope, scope.with_file_name("old-scope")).unwrap();
+            std::fs::create_dir(scope).unwrap();
+        }
+        let events = drive_restored_accounted(
+            &h,
+            &executor,
+            admitted,
+            (fault != "accounting").then_some(accounting),
+            None,
+        )
+        .await;
+        precedence_error(
+            &events,
+            if fault == "authority" {
+                BridgeError::ConfigMismatch {
+                    field: "fallback_authority",
+                }
+            } else {
+                BridgeError::InvalidStateTransition
+            },
+            None,
+        );
+        precedence_rows(&h, &prior, &[]);
+        assert_eq!(checked_progress(&h).await, progress);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn restored_precedence_accounting_refusal_after_reservation() {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+    let prior = h.f.rows();
+    let replay = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    let events = drive_restored_accounted(
+        &h,
+        &executor,
+        admitted.clone(),
+        Some(accounting.clone()),
+        None,
+    )
+    .await;
+    precedence_output(&events, "answer", WorkflowOutcome::Completed);
+    precedence_rows(&h, &prior, &[(true, true)]);
+    let prior = h.f.rows();
+    let progress = checked_progress(&h).await;
+    let events = drive_restored_accounted(&h, &replay, admitted, Some(accounting), None).await;
+    precedence_error(
+        &events,
+        BridgeError::InvalidStateTransition,
+        Some(BridgeError::InvalidStateTransition),
+    );
+    precedence_rows(&h, &prior, &[(false, true)]);
+    assert_eq!(checked_progress(&h).await, progress);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn restored_precedence_preparation_canceled() {
+    let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+    let prior = h.f.rows();
+    let cancel = CancellationToken::new();
+    let cancel_setup = cancel.clone();
+    *h.calls[1].entry_check.lock().unwrap() = Some(Box::new(move || cancel_setup.cancel()));
+    h.calls[1]
+        .setup_errors
+        .lock()
+        .unwrap()
+        .push(BridgeError::ModelNotAvailable);
+    let events = drive_restored_controlled(
+        &h,
+        &executor,
+        admitted,
+        Some(accounting),
+        None,
+        cancel,
+        None,
+    )
+    .await;
+    precedence_output(&events, "ModelNotAvailable", WorkflowOutcome::Canceled);
+    precedence_cause(&events, Some(&BridgeError::ModelNotAvailable));
+    precedence_rows(&h, &prior, &[(false, true)]);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn restored_precedence_allowlisted_variant_at_prompt_keeps_own_cause() {
+    for original in [BridgeError::ModelNotAvailable, BridgeError::AgentTimedOut] {
+        let (h, admitted, accounting, executor) = precedence_fixture("final-only", 1).await;
+        let prior = h.f.rows();
+        *h.calls[1].prompt_error.lock().unwrap() = Some(original.clone());
+        let events =
+            drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+        precedence_output(&events, &format!("{original:?}"), WorkflowOutcome::Failed);
+        precedence_cause(&events, Some(&original));
+        precedence_rows(&h, &prior, &[(true, false)]);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn restored_precedence_later_preparation_keeps_own_cause() {
+    let (h, initial) = recovery_candidate_fixture_target("continuation", "reject").await;
+    let prior_rows = h.f.rows();
+    let prior = checked_progress(&h).await;
+    let (admitted, accounting) = restored_owner(&h, &initial, 1).await;
+    let executor = restored_executor(&h, &admitted, &accounting).await.unwrap();
+    h.calls[2]
+        .setup_errors
+        .lock()
+        .unwrap()
+        .push(BridgeError::FrameError);
+    let events = drive_restored_accounted(&h, &executor, admitted, Some(accounting), None).await;
+    precedence_output(&events, "FrameError", WorkflowOutcome::Failed);
+    precedence_cause(&events, Some(&BridgeError::FrameError));
+    let rows = h.f.rows();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().find(|row| row.id == prior_rows[0].id),
+        Some(&prior_rows[0])
+    );
+    for (agent, dispatched) in [("target", true), ("last", false)] {
+        let row = rows
+            .iter()
+            .find(|row| row.attribution.agent == agent)
+            .unwrap();
+        assert_eq!(row.attribution.effective_model.as_deref(), Some(agent));
+        assert_eq!((row.dispatched, row.finalized), (dispatched, true));
+    }
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+    assert_eq!(h.f.providers[2].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        checked_progress(&h).await.visits[..prior.visits.len()],
+        prior.visits
+    );
 }
