@@ -4581,9 +4581,20 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             .as_ref()
             .is_some_and(|spec| spec.fallback_chains.is_some())
         {
-            // Candidate checkpoints attest node completion, not run arbitration.
-            // Leave these snapshots to the recovery consumers' existing refusal,
-            // even when every node has a durable structured terminal checkpoint.
+            let classification = classify_workflow_candidates(
+                deps,
+                &record.id,
+                run_spec.as_ref().expect("chain-bearing V2 spec"),
+            )
+            .await;
+            tracing::warn!(
+                task = record.id.as_str(),
+                ?classification,
+                "checkpoint reconciliation: candidate recovery remains disabled"
+            );
+            // Preserve attempt-first ordering: the boot sweep settles the prior
+            // attempt before either consumer publishes its checked refusal.
+            // Even a valid completed classification cannot shortcut to success.
             continue;
         }
         let Some(terminal_node) = graph.terminal() else {
@@ -4962,6 +4973,211 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
     safe_to_interrupt
 }
 
+/// Classification is evidence only. Neither variant grants a Preparing CAS or
+/// permits checkpoint replay; activation belongs to the later recovery slices.
+#[derive(Debug)]
+enum WorkflowCandidateRecovery {
+    Completed,
+    Continuation,
+    Mixed,
+}
+impl WorkflowCandidateRecovery {
+    fn refusal(&self) -> &'static str {
+        match self {
+            Self::Completed => {
+                "not resumable: workflow candidate recovery is not activated (completed)"
+            }
+            Self::Continuation => {
+                "not resumable: workflow candidate recovery is not activated (continuation)"
+            }
+            Self::Mixed => "not resumable: workflow candidate recovery is not activated (mixed)",
+        }
+    }
+}
+
+async fn classify_workflow_candidates(
+    deps: &DetachedDeps,
+    task: &TaskId,
+    run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
+) -> Result<WorkflowCandidateRecovery, &'static str> {
+    use bridge_core::execution_policy::NodePrimaryDispositionV1;
+    use bridge_core::fallback_runtime::{CandidateRecoveryV1, FrozenFallbackInvocationV1};
+
+    run_spec
+        .validate()
+        .map_err(|_| "not resumable: candidate frozen authority refused")?;
+    let admission = deps
+        .workflow_admission
+        .as_ref()
+        .ok_or("not resumable: candidate frozen admission unavailable")?;
+    // bind_local_chains preserves an existing map when no source is eligible.
+    // Rebuild the unchained authority first so that refusal cannot retain stale chains.
+    let unchained = bridge_workflow::run_spec::WorkflowRunSpecV1::build(
+        run_spec.attempt_id.clone(),
+        run_spec.graph.clone(),
+        run_spec.controls.clone(),
+        run_spec.requested_session_cwd.clone(),
+        run_spec.node_execution_identities.clone(),
+        run_spec.ledger_admission.clone(),
+    )
+    .map_err(|_| "not resumable: candidate frozen authority refused")?;
+    let admitted = admission
+        .restore(unchained)
+        .map_err(|_| "not resumable: candidate frozen authority refused")?;
+    let chains = run_spec
+        .fallback_chains
+        .as_ref()
+        .ok_or("not resumable: candidate frozen chains missing")?;
+    // Reuse admission's effect-free source binding, including effective model,
+    // command, MCP and checkout posture. No target resolution or preparation.
+    for (node, declarations) in chains {
+        let rebound = admission
+            .bind_local_chains(admitted.clone(), declarations)
+            .map_err(|_| "not resumable: candidate source authority drift")?;
+        if rebound
+            .run_spec
+            .fallback_chains
+            .as_ref()
+            .and_then(|map| map.get(node))
+            != Some(declarations)
+        {
+            return Err("not resumable: candidate source authority drift");
+        }
+    }
+    let checkpoints = deps
+        .task_store
+        .node_checkpoints(task)
+        .await
+        .map_err(|_| "not resumable: candidate checkpoints unavailable")?;
+    let seed = load_structured_resume_seed(deps, task, &checkpoints).await?;
+    for (node, checkpoint) in &seed.nodes {
+        let graph_node = run_spec
+            .graph
+            .nodes
+            .iter()
+            .find(|entry| entry.id == *node)
+            .ok_or("not resumable: candidate checkpoint references unknown node")?;
+        if graph_node
+            .inputs
+            .iter()
+            .any(|input| !seed.nodes.contains_key(input))
+        {
+            return Err("not resumable: candidate checkpoints are not closed under inputs");
+        }
+        if checkpoint.ok != (checkpoint.terminal.primary == NodePrimaryDispositionV1::Completed) {
+            return Err("not resumable: candidate checkpoint disposition mismatch");
+        }
+    }
+    // A lineage must exist even for missing/empty progress. Never consume a slot
+    // merely to discover whether a snapshot can be recovered.
+    deps.task_store
+        .get_attempt_locator(task)
+        .await
+        .map_err(|_| "not resumable: candidate lineage unavailable")?
+        .ok_or("not resumable: candidate lineage missing")?;
+    let mut completed = false;
+    let mut continuation = false;
+    for node in &run_spec.graph.nodes {
+        let progress = deps
+            .task_store
+            .candidate_progress_v1(task, &node.id)
+            .await
+            .map_err(|_| "not resumable: candidate checked evidence unavailable")?;
+        let Some(node_chains) = chains.get(&node.id) else {
+            if progress.is_some() {
+                return Err("not resumable: candidate progress without frozen authority");
+            }
+            continue;
+        };
+        let progress = progress.ok_or("not resumable: candidate progress missing")?;
+        let source = node_chains
+            .first()
+            .ok_or("not resumable: candidate frozen chains empty")?
+            .source
+            .clone();
+        let frozen = FrozenFallbackInvocationV1::freeze(node_chains.clone(), source)
+            .ok_or("not resumable: candidate scope unavailable")?;
+        let (_, recovery) = frozen
+            .restore(&progress, |candidate| {
+                // restore selects only from the frozen chain. This comparison is
+                // not a grant: live successor revalidation and exclusive Preparing
+                // publication remain mandatory before continuation is activated.
+                if node_chains
+                    .iter()
+                    .any(|chain| chain.steps.contains(candidate))
+                {
+                    Ok(candidate.clone())
+                } else {
+                    Err(BridgeError::InvalidStateTransition)
+                }
+            })
+            .map_err(|_| "not resumable: candidate state or frozen scope invalid")?;
+        match recovery {
+            CandidateRecoveryV1::Completed(output) => {
+                let checkpoint = seed
+                    .nodes
+                    .get(&node.id)
+                    .ok_or("not resumable: candidate completed checkpoint missing")?;
+                if checkpoint.output != output.output
+                    || checkpoint.ok != output.ok
+                    || checkpoint.usage != output.usage
+                {
+                    return Err("not resumable: candidate completed checkpoint conflict");
+                }
+                completed = true;
+            }
+            CandidateRecoveryV1::Continue { .. } => {
+                if seed.nodes.contains_key(&node.id) {
+                    return Err("not resumable: candidate continuation checkpoint conflict");
+                }
+                continuation = true;
+            }
+        }
+    }
+    match (completed, continuation) {
+        (true, false) => Ok(WorkflowCandidateRecovery::Completed),
+        (false, true) => Ok(WorkflowCandidateRecovery::Continuation),
+        (true, true) => Ok(WorkflowCandidateRecovery::Mixed),
+        _ => Err("not resumable: candidate evidence missing"),
+    }
+}
+
+/// Shared by both consumers and the attempt-first terminal reconciliation pass.
+/// Failed persistence leaves the task untouched; no synthetic terminal or
+/// successor attempt is returned to the caller.
+pub(crate) async fn refuse_workflow_candidate_recovery(
+    deps: &DetachedDeps,
+    task: &TaskId,
+    run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
+) -> bool {
+    let reason = match classify_workflow_candidates(deps, task, run_spec).await {
+        Ok(classification) => classification.refusal(),
+        Err(reason) => reason,
+    };
+    match finalize_detached(
+        &deps.task_store,
+        &deps.progress_hubs,
+        task,
+        TaskRecordStatus::Interrupted,
+        None,
+        Some(reason),
+        None,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                task = task.as_str(),
+                ?error,
+                reason,
+                "candidate recovery: interruption persistence failed"
+            );
+            false
+        }
+    }
+}
+
 /// Validate the same V2 checkpoint evidence for detached and batch recovery.
 /// Refusals precede resume claims and preserve the prior attempt's evidence.
 pub(crate) async fn load_structured_resume_seed(
@@ -5135,14 +5351,10 @@ pub async fn resume_one_working_task_with_accounting(
         .as_ref()
         .is_some_and(|spec| spec.fallback_chains.is_some())
     {
-        let _ = finalize_detached(
-            &deps.task_store,
-            &deps.progress_hubs,
+        refuse_workflow_candidate_recovery(
+            deps,
             &task,
-            TaskRecordStatus::Interrupted,
-            None,
-            Some("not resumable: workflow candidate recovery is not activated"),
-            None,
+            frozen_run_spec.as_ref().expect("chain-bearing V2 spec"),
         )
         .await;
         return;
