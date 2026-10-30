@@ -79,7 +79,7 @@ jobs:
   build-macos-arm64:
     name: Build (aarch64-apple-darwin)
     needs: preflight
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       TARGET: aarch64-apple-darwin
       VERSION: ${{ needs.preflight.outputs.version }}

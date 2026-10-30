@@ -152,8 +152,8 @@ jobs:
           cargo test --workspace --doc --locked
 
   bridge-store-macos:
-    name: Bridge Store (macOS 14)
-    runs-on: macos-14
+    name: Bridge Store (macOS 15)
+    runs-on: macos-15
 
     steps:
       - name: Checkout
