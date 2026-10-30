@@ -789,6 +789,10 @@ impl WorkflowSink for DetachedProgressSink {
         let operation_id = self.operation_id()?;
         let seq = match terminal_json {
             Some(terminal_json) => {
+                // A candidate's structured NodeCompletion is already durable.
+                // V2 exact replay acknowledges it and returns its original seq
+                // without another checkpoint or journal completion. Conflicting
+                // output/usage/evidence refuses; ordinary nodes still write here.
                 self.store
                     .put_node_checkpoint_sequenced_v2(
                         &self.task,
@@ -4573,6 +4577,15 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             Ok(DecodedWorkflowSpec::BoundV2(run_spec)) => (run_spec.graph.clone(), Some(run_spec)),
             Err(_) => continue,
         };
+        if run_spec
+            .as_ref()
+            .is_some_and(|spec| spec.fallback_chains.is_some())
+        {
+            // Candidate checkpoints attest node completion, not run arbitration.
+            // Leave these snapshots to the recovery consumers' existing refusal,
+            // even when every node has a durable structured terminal checkpoint.
+            continue;
+        }
         let Some(terminal_node) = graph.terminal() else {
             continue;
         };

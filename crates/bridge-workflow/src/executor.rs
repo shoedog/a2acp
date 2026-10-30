@@ -838,7 +838,12 @@ struct CandidateCompletionV1 {
     expected: CandidateProgressV1,
 }
 impl CandidateCompletionV1 {
-    async fn publish(self, output: CandidateOutputV1) -> Result<CandidateProgressV1, BridgeError> {
+    async fn publish(
+        self,
+        output: CandidateOutputV1,
+        terminal_json: Option<&str>,
+        policy_trigger_json: Option<&str>,
+    ) -> Result<CandidateProgressV1, BridgeError> {
         let mut next = self.expected.clone();
         next.terminal = Some(output);
         let operation = OperationId::parse(format!(
@@ -851,13 +856,15 @@ impl CandidateCompletionV1 {
                 .as_str()
         ))?;
         self.store
-            .complete_candidate_v1(
+            .complete_candidate_v2(
                 &self.task,
                 &self.node,
                 &self.expected,
                 &next,
                 &operation,
                 bridge_core::task_store::system_wall_now_ms(),
+                terminal_json,
+                policy_trigger_json,
             )
             .await?;
         Ok(next)
@@ -2735,7 +2742,7 @@ impl WorkflowExecutor {
             };
             if let Some(completion) = output.candidate_completion.take() {
                 run.progress = completion
-                    .publish(completed.clone())
+                    .publish(completed.clone(), None, None)
                     .await
                     .map_err(|error| AccountingFailureV1 {
                         persistence: Some(error.clone()),
@@ -8139,7 +8146,25 @@ impl WorkflowExecutor {
                                 (Some(terminal), trigger, barrier)
                             })
                             .unwrap_or((None, None, None));
-                    let event = WorkflowEvent::NodeFinished {
+                    // NodeCompletion: commit the effective node result before emitting
+                    // completion or exposing its output to downstream scheduling. Later
+                    // run arbitration, errors and cancellation cannot revoke this node.
+                    if let Some(completion) = candidate_completion.filter(|_| ok) {
+                        // Project the scheduler's settled evidence verbatim. Direct
+                        // candidate callers retain their evidence-free contract.
+                        if terminal_json.is_none() || matches!(
+                            policy_trigger_barrier_result,
+                            Some(PolicyTriggerBarrierResultV1::PrimaryFailed)
+                        ) {
+                            settle_error_before_yield!(BridgeError::StoreFailure);
+                        }
+                        if let Err(error) = completion.publish(CandidateOutputV1 {
+                            output: text.clone(), ok, usage: usage.clone(),
+                        }, terminal_json.as_deref(), policy_trigger_json.as_deref()).await {
+                            settle_error_before_yield!(error);
+                        }
+                    }
+                    yield Ok(WorkflowEvent::NodeFinished {
                         node: node_id.clone(),
                         ok,
                         output: text.clone(),
@@ -8147,18 +8172,7 @@ impl WorkflowExecutor {
                         terminal_json,
                         policy_trigger_json,
                         policy_trigger_barrier_result,
-                    };
-                    // NodeCompletion: commit the effective node result before emitting
-                    // completion or exposing its output to downstream scheduling. Later
-                    // run arbitration, errors and cancellation cannot revoke this node.
-                    if let Some(completion) = candidate_completion.filter(|_| ok) {
-                        if let Err(error) = completion.publish(CandidateOutputV1 {
-                            output: text.clone(), ok, usage: usage.clone(),
-                        }).await {
-                            settle_error_before_yield!(error);
-                        }
-                    }
-                    yield Ok(event);
+                    });
                     done.insert(node_id.as_str().to_string());
                     dispositions.insert(node_id.as_str().to_string(), disposition);
                     outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
