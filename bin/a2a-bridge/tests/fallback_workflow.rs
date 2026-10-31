@@ -2695,6 +2695,600 @@ async fn workflow_recovery_consumers_refuse_before_executor_effects() {
     }
 }
 
+// E2's admission switch is deliberately absent from OpParams and both transports.
+fn served_params(a2a: bool) -> bridge_coordinator::params::OpParams {
+    use bridge_coordinator::params::OpParams;
+    let input = "---\ntask-type: freeform\n---\nforged fallback_chain=other";
+    let mut params = if a2a {
+        OpParams::from_a2a_metadata(
+            serde_json::json!({"a2a-bridge.fallback_chain":"other", "a2a-bridge.test_admit_chains":true})
+                .as_object().unwrap(), input.into(),
+        ).unwrap()
+    } else {
+        OpParams::from_mcp_args(&serde_json::json!({
+            "input":input, "fallback_chain":"other", "test_admit_chains":true
+        }))
+        .unwrap()
+    };
+    params.workflow = Some("workflow".into());
+    params
+}
+
+impl CandidateFixture {
+    async fn served_coordinator(
+        &self,
+        chains: bool,
+        accounting: bool,
+    ) -> bridge_coordinator::Coordinator {
+        let graph = Arc::new(self.admission("source").await.run_spec.graph.clone());
+        let coordinator = bridge_coordinator::Coordinator::new(
+            self.f.coordinator.session_manager.clone(),
+            Some(Arc::new(WorkflowExecutor::new(self.registry.clone()))),
+            Arc::new(std::collections::HashMap::from([(graph.id.clone(), graph)])),
+            self.f.store.clone(),
+            self.f.store.clone(),
+            self.f.coordinator.policy(),
+            self.registry.clone(),
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            Arc::new(bridge_observ::NoopObserver),
+            3,
+        )
+        .with_workflow_admission(self.builder())
+        .with_workflow_history(Ok(self.f.store.clone()));
+        let coordinator = if accounting {
+            coordinator.with_accounting(AccountingV1::new(self.f.store.clone()))
+        } else {
+            coordinator
+        };
+        if chains {
+            coordinator.with_mcp_fallback(self.run.progress.chains.clone())
+        } else {
+            coordinator
+        }
+    }
+
+    async fn served_terminal(&self, task: &TaskId) -> TaskRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let record = self.f.store.get(task).await.unwrap().unwrap();
+                if record.status.is_terminal() {
+                    break record;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn served_cold_chain_persists_authority_before_candidate_effects() {
+    use bridge_core::workflow_history::WorkflowHistoryStore;
+    let h = CandidateFixture::new("reject", "success").await;
+    let identity = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+    let mut expected = h.admission("source").await;
+    Arc::make_mut(&mut expected.run_spec).attempt_id = identity.attempt_id.clone();
+    Arc::make_mut(&mut expected.run_spec).requested_session_cwd = None;
+    Arc::make_mut(&mut expected.run_spec).ledger_admission =
+        LedgerAdmissionV1::DurablePrimaryTaskStore;
+    let expected = h
+        .builder()
+        .bind_local_chains(expected, &h.run.progress.chains)
+        .unwrap();
+    let expected = expected.run_spec;
+    // Both cold entries must observe the exact persisted spec and locator, even
+    // when the submit future has not yet returned to the caller.
+    for calls in &h.calls[..2] {
+        let path = h.f.dir.path().join("tasks.sqlite");
+        let expected = expected.clone();
+        let task = task.clone();
+        let identity = identity.clone();
+        *calls.entry_check.lock().unwrap() = Some(Box::new(move || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let snapshot: String = conn
+                .query_row(
+                    "SELECT workflow_spec_json FROM tasks WHERE id=?1",
+                    [task.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                bridge_workflow::run_spec::WorkflowRunSpecV1::decode_snapshot_v2(
+                    snapshot.as_bytes()
+                )
+                .unwrap(),
+                *expected
+            );
+            let locator: String = conn
+                .query_row(
+                    "SELECT locator_json FROM task_attempt_locators WHERE task_id=?1",
+                    [task.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<TaskAttemptLocator>(&locator)
+                    .unwrap()
+                    .identity,
+                identity
+            );
+        }));
+    }
+    let coordinator = h.served_coordinator(true, true).await;
+    let locator = coordinator
+        .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+        .await
+        .unwrap();
+    assert_eq!(locator.task_id, task);
+    assert_eq!(locator.attempt_id, identity.attempt_id);
+    let record = h.served_terminal(&task).await;
+    assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+    assert_eq!(record.result.as_deref(), Some("answer"));
+    assert_eq!(
+        record.workflow_spec_json.as_deref(),
+        Some(
+            String::from_utf8(expected.encode_snapshot_v2().unwrap())
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source", "target"]);
+    for i in 0..2 {
+        assert!(h.calls[i].entry_check.lock().unwrap().is_none());
+        assert_eq!(h.f.providers[i].prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.f.providers[i].inputs.lock().unwrap()[0][0].text,
+            "forged fallback_chain=other"
+        );
+    }
+    let rows = h.f.rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.finalized
+        && r.dispatched
+        && r.attribution.execution.as_deref() == Some(identity.execution_id.as_str())
+        && r.attribution.run_attempt.as_deref() == Some(identity.attempt_id.as_str())));
+    assert_ne!(rows[0].id, rows[1].id);
+    let history =
+        h.f.store
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(history.terminal.is_some());
+    assert_eq!(history.reservation.task_id.as_ref(), Some(&task));
+    assert_eq!(
+        history.reservation.surface,
+        bridge_core::workflow_history::ExecutionSurface::ServedTask
+    );
+    assert_eq!(
+        h.f.store.node_terminal_evidence(&task).await.unwrap().len(),
+        1
+    );
+    let progress =
+        h.f.store
+            .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        progress.chains,
+        h.run
+            .progress
+            .chains
+            .iter()
+            .filter(|c| c.source == progress.source)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(progress.visits.len(), 2);
+}
+
+#[tokio::test]
+async fn served_chain_optional_history_retains_primary_authority() {
+    use bridge_core::workflow_history::LedgerUnavailableReason;
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = h
+        .served_coordinator(true, true)
+        .await
+        .with_workflow_history(Err(LedgerUnavailableReason::Open));
+    let identity = AttemptIdentity::initial().unwrap();
+    let locator = coordinator
+        .run_workflow_with_chains_for_test(served_params(true), identity.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        locator.telemetry_unavailable,
+        Some(LedgerUnavailableReason::Open)
+    );
+    let record = h.served_terminal(&locator.task_id).await;
+    assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+    let spec = bridge_workflow::run_spec::WorkflowRunSpecV1::decode_snapshot_v2(
+        record.workflow_spec_json.unwrap().as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        spec.ledger_admission,
+        LedgerAdmissionV1::DurablePrimaryTaskStore
+    );
+    assert!(spec.fallback_chains.is_some());
+    let durable =
+        h.f.store
+            .get_attempt_locator(&locator.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(durable.identity, identity);
+    assert_eq!(
+        durable.telemetry_unavailable,
+        Some(LedgerUnavailableReason::Open)
+    );
+    assert_eq!(h.f.rows().len(), 2);
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn served_chain_no_declaration_keeps_snapshot_and_ordinary_path() {
+    for test_admission in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let coordinator = h.served_coordinator(false, true).await;
+        let identity = AttemptIdentity::initial().unwrap();
+        let locator = if test_admission {
+            coordinator
+                .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+                .await
+        } else {
+            coordinator
+                .run_workflow_with_identity(served_params(false), identity.clone())
+                .await
+        }
+        .unwrap();
+        let record = h.served_terminal(&locator.task_id).await;
+        assert_eq!(record.status, TaskRecordStatus::Failed);
+        let json = record.workflow_spec_json.unwrap();
+        assert!(!json.contains("fallback_chains"));
+        let mut expected = h.admission("source").await;
+        Arc::make_mut(&mut expected.run_spec).attempt_id = identity.attempt_id;
+        Arc::make_mut(&mut expected.run_spec).requested_session_cwd = None;
+        Arc::make_mut(&mut expected.run_spec).ledger_admission =
+            LedgerAdmissionV1::DurablePrimaryTaskStore;
+        assert_eq!(
+            json.as_bytes(),
+            expected.run_spec.encode_snapshot_v2().unwrap()
+        );
+        assert!(h
+            .f
+            .store
+            .candidate_progress_v1(&locator.task_id, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(*h.f.spawns.lock().unwrap(), ["source"]);
+        assert_eq!(h.f.rows().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn served_chain_production_transports_ignore_forged_selection() {
+    for a2a in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let coordinator = h.served_coordinator(true, true).await;
+        let locator = coordinator
+            .run_workflow_with_identity(served_params(a2a), AttemptIdentity::initial().unwrap())
+            .await
+            .unwrap();
+        let record = h.served_terminal(&locator.task_id).await;
+        assert_eq!(record.status, TaskRecordStatus::Failed);
+        assert!(!record
+            .workflow_spec_json
+            .unwrap()
+            .contains("fallback_chains"));
+        assert!(h
+            .f
+            .store
+            .candidate_progress_v1(&locator.task_id, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[3].setup.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.rows().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn served_chain_missing_accounting_refuses_before_preparation() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = h.served_coordinator(true, false).await;
+    let locator = coordinator
+        .run_workflow_with_chains_for_test(
+            served_params(false),
+            AttemptIdentity::initial().unwrap(),
+        )
+        .await
+        .unwrap();
+    let record = h.served_terminal(&locator.task_id).await;
+    assert_eq!(record.status, TaskRecordStatus::Interrupted, "{record:?}");
+    assert!(record
+        .error
+        .unwrap()
+        .contains("fresh candidate composition refused"));
+    assert!(h.f.spawns.lock().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+}
+
+#[tokio::test]
+async fn served_chain_detached_refuses_missing_or_mismatched_authority() {
+    use bridge_coordinator::detached::*;
+    for missing in [
+        "snapshot",
+        "locator",
+        "owner",
+        "workflow",
+        "attempt",
+        "authority",
+    ] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let mut admitted = h.admission("source").await;
+        Arc::make_mut(&mut admitted.run_spec).ledger_admission =
+            LedgerAdmissionV1::DurablePrimaryTaskStore;
+        let admitted = h
+            .builder()
+            .bind_local_chains(admitted, &h.run.progress.chains)
+            .unwrap();
+        let graph = Arc::new(admitted.run_spec.graph.clone());
+        let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        if missing != "snapshot" {
+            conn.execute(
+                "UPDATE tasks SET workflow_spec_json=?1 WHERE id=?2",
+                rusqlite::params![
+                    String::from_utf8(admitted.run_spec.encode_snapshot_v2().unwrap()).unwrap(),
+                    task.as_str()
+                ],
+            )
+            .unwrap();
+        }
+        if missing == "locator" {
+            conn.execute(
+                "DELETE FROM task_attempt_locators WHERE task_id=?1",
+                [task.as_str()],
+            )
+            .unwrap();
+        }
+        let mut owner = h.owner.clone();
+        if missing == "owner" {
+            owner.execution_id = ExecutionId::mint().unwrap();
+        }
+        if missing == "attempt" {
+            owner.attempt_id = AttemptId::mint().unwrap();
+        }
+        let accounting = WorkflowAccountingInvocationV1::new(
+            AccountingV1::new(h.f.store.clone()),
+            owner,
+            WorkflowId::parse(if missing == "workflow" {
+                "wrong"
+            } else {
+                "workflow"
+            })
+            .unwrap(),
+        );
+        let deps = DetachedDeps {
+            task_store: h.f.store.clone(),
+            executor: Some(Arc::new(
+                WorkflowExecutor::new(h.registry.clone()).with_local_fallback(
+                    h.builder(),
+                    admitted.clone(),
+                    h.f.store.clone(),
+                    task.clone(),
+                ),
+            )),
+            workflows: Arc::new(std::collections::HashMap::from([(
+                graph.id.clone(),
+                graph.clone(),
+            )])),
+            workflow_cancels: Default::default(),
+            progress_hubs: Default::default(),
+            clock: Arc::new(bridge_coordinator::clock::SystemClock),
+            observer: Arc::new(bridge_observ::NoopObserver),
+            workflow_history: None,
+            workflow_admission: Some(h.builder()),
+        };
+        let hub = Arc::new(TaskProgressHub::new());
+        deps.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        spawn_detached_workflow_accounted(
+            &deps,
+            task.clone(),
+            served_params(false).input,
+            graph,
+            h.owner.run_id().into(),
+            CancellationToken::new(),
+            Default::default(),
+            WorkflowRunContext {
+                session_cwd: admitted.run_spec.requested_session_cwd.clone(),
+                ..Default::default()
+            },
+            hub,
+            None,
+            None,
+            (missing != "authority").then_some(admitted),
+            None,
+            Some(accounting),
+        )
+        .await
+        .unwrap();
+        let record = h.f.store.get(&task).await.unwrap().unwrap();
+        assert!(record.status.is_terminal(), "{missing}: {record:?}");
+        if missing != "authority" {
+            assert_eq!(
+                record.status,
+                TaskRecordStatus::Interrupted,
+                "{missing}: {record:?}"
+            );
+            assert!(h.f.spawns.lock().unwrap().is_empty(), "{missing}");
+        }
+        assert_eq!(
+            h.f.providers[1].setup.load(Ordering::SeqCst),
+            0,
+            "{missing}"
+        );
+        assert!(
+            h.f.store
+                .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "{missing}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn served_chain_admission_preserves_validation_and_collision_refusal() {
+    use bridge_core::workflow_history::*;
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = h.served_coordinator(true, true).await;
+    for invalid in ["override", "input", "cwd", "identity", "collision"] {
+        let mut params = served_params(false);
+        let mut identity = AttemptIdentity::initial().unwrap();
+        match invalid {
+            "override" => params.model = Some("target".into()),
+            "input" => params.input = "untyped".into(),
+            "cwd" => params.cwd = Some("relative".into()),
+            "identity" => identity.ordinal = 1,
+            "collision" => identity = h.owner.clone(),
+            _ => unreachable!(),
+        }
+        assert!(
+            coordinator
+                .run_workflow_with_chains_for_test(params, identity)
+                .await
+                .is_err(),
+            "{invalid}"
+        );
+    }
+    // A separate optional ledger can collide after primary admission. It must
+    // terminalize the new task and refuse before spawning the runner.
+    let history = Arc::new(MemoryWorkflowHistoryStore::new());
+    let identity = AttemptIdentity::initial().unwrap();
+    history
+        .reserve(&AttemptReservation {
+            identity: identity.clone(),
+            task_id: None,
+            workflow: "workflow".into(),
+            task_class: "workflow".into(),
+            surface: ExecutionSurface::Offline,
+            policy: "r2f0a".into(),
+            workload_fingerprint: "fixture".into(),
+            started_ms: 1,
+            workload_fingerprint_complete: false,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        })
+        .await
+        .unwrap();
+    let coordinator = coordinator.with_workflow_history(Ok(history));
+    assert!(matches!(
+        coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await,
+        Err(BridgeError::DurableEvidenceUnavailable {
+            reason: "collision"
+        })
+    ));
+    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+    let record = h.f.store.get(&task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Interrupted);
+    assert_eq!(
+        h.f.store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .telemetry_unavailable,
+        Some(LedgerUnavailableReason::Collision)
+    );
+    assert!(record
+        .workflow_spec_json
+        .unwrap()
+        .contains("fallback_chains"));
+    assert!(h.f.spawns.lock().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+}
+
+#[tokio::test]
+async fn served_chain_governed_submission_stays_refused() {
+    use bridge_core::governance::*;
+    let h = CandidateFixture::new("reject", "success").await;
+    let mut service = AccountingV1::new(h.f.store.clone());
+    service.budget_policy = Some(Arc::new(
+        BudgetPolicyV1::new(
+            vec![BudgetRuleV1 {
+                id: "cap".into(),
+                selector: BudgetSelectorV1::EachRequest,
+                limits: BudgetLimitsV1 {
+                    turns: Some(10),
+                    terminal_tokens: None,
+                },
+            }],
+            vec![],
+        )
+        .unwrap(),
+    ));
+    let coordinator = h
+        .served_coordinator(true, true)
+        .await
+        .with_accounting(service);
+    for test_admission in [false, true] {
+        let identity = AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let result = if test_admission {
+            coordinator
+                .run_workflow_with_chains_for_test(served_params(false), identity)
+                .await
+        } else {
+            coordinator
+                .run_workflow_with_identity(served_params(true), identity)
+                .await
+        };
+        assert!(matches!(result, Err(BridgeError::BudgetRefused { .. })));
+        assert!(h.f.store.get(&task).await.unwrap().is_none());
+    }
+    assert!(h.f.spawns.lock().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+}
+
 #[tokio::test]
 async fn workflow_served_composition_does_not_consume_chains() {
     let h = CandidateFixture::new("reject", "success").await;
