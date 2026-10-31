@@ -5344,6 +5344,12 @@ pub async fn resume_one_working_task_with_accounting(
     accounting: Option<AccountingV1>,
 ) {
     let task = wt.id.clone();
+    // A queued Working observation may outlive completion. The interruption
+    // writer also guards completion racing with this read.
+    match deps.task_store.get(&task).await {
+        Ok(Some(current)) if current.status == TaskRecordStatus::Working => {}
+        _ => return,
+    }
 
     // (1) No snapshot → cannot reconstruct the graph that was running. Interrupt.
     let Some(spec_json) = wt.workflow_spec_json.as_deref() else {
@@ -7866,6 +7872,58 @@ mod resume_tests {
             TaskRecordStatus::Working
         );
         assert!(prompts.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_recovery_refusal_preserves_memory_terminal_projection() {
+        for status in [
+            TaskRecordStatus::Completed,
+            TaskRecordStatus::Failed,
+            TaskRecordStatus::Canceled,
+            TaskRecordStatus::Interrupted,
+        ] {
+            let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+            let record = make_task_record("late-recovery-refusal");
+            store.create(&record).await.unwrap();
+            let hubs = Arc::new(Mutex::new(HashMap::new()));
+            // Recovery observed Working, but another finalizer won before its
+            // refusal publication. Exercise the actual finalization boundary.
+            finalize_detached(
+                &store,
+                &hubs,
+                &record.id,
+                status,
+                (status == TaskRecordStatus::Completed).then_some("answer"),
+                (status != TaskRecordStatus::Completed).then_some("prior terminal"),
+                None,
+            )
+            .await
+            .unwrap();
+            let before = store.get(&record.id).await.unwrap();
+            let outcome = store.workflow_task_evidence(&record.id).await.unwrap();
+            let journal =
+                serde_json::to_value(store.journal_from(&record.id, -1).await.unwrap()).unwrap();
+            assert!(finalize_detached(
+                &store,
+                &hubs,
+                &record.id,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("late refusal"),
+                None,
+            )
+            .await
+            .is_err());
+            assert_eq!(store.get(&record.id).await.unwrap(), before);
+            assert_eq!(
+                store.workflow_task_evidence(&record.id).await.unwrap(),
+                outcome
+            );
+            assert_eq!(
+                serde_json::to_value(store.journal_from(&record.id, -1).await.unwrap()).unwrap(),
+                journal
+            );
+        }
     }
 
     #[tokio::test]

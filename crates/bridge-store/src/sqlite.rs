@@ -6851,7 +6851,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         };
         let conn = self.conn.lock().unwrap();
         let tx = immediate_transaction(&conn)?;
-        // Allocate seq.
+        // Reject a late recovery refusal in the same transaction that allocates
+        // its sequence: a preceding coordinator read cannot fence completion.
         let n = tx
             .execute(
                 "UPDATE tasks SET
@@ -6860,8 +6861,13 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                         WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
                         ELSE last_artifact_ms
                     END
-                 WHERE id=?1 AND terminal_projection_ready=1",
-                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
+                 WHERE id=?1 AND terminal_projection_ready=1
+                   AND (?3 <> 'interrupted' OR status='working')",
+                rusqlite::params![
+                    task.as_str(),
+                    durable_retention_ms((self.now_ms)()),
+                    status.as_str()
+                ],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
         if n == 0 {

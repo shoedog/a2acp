@@ -1007,6 +1007,8 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
     }
 
     /// Set the terminal status + result/error, recording a seq for the event.
+    /// An Interrupted recovery refusal must atomically require Working status;
+    /// a late refusal returns an error without changing the task or journal.
     /// Returns the seq.
     async fn set_terminal_sequenced(
         &self,
@@ -3070,6 +3072,9 @@ impl TaskStore for MemoryTaskStore {
             let row = inner
                 .get_mut(task.as_str())
                 .ok_or(BridgeError::StoreFailure)?;
+            if status == TaskRecordStatus::Interrupted && row.status != TaskRecordStatus::Working {
+                return Err(BridgeError::StoreFailure);
+            }
             Self::bump_last_artifact(row, artifact_ms);
         }
         let seq = self.next_seq(task.as_str());
