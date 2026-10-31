@@ -582,6 +582,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
         container_reap_constructor_count: usize,
         in_container_infrastructure_failure: bool,
         container_infrastructure_constructor_count: usize,
+        in_checked_candidate_rehydration: bool,
+        checked_candidate_rehydration_count: usize,
     }
 
     impl<'ast> Visit<'ast> for ConstructorVisitor<'_> {
@@ -662,7 +664,13 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
             self.in_container_infrastructure_failure =
                 self.path.ends_with("crates/bridge-core/src/sandbox.rs")
                     && node.sig.ident == "container_infrastructure_failure_error";
+            let was_in_checked_candidate_rehydration = self.in_checked_candidate_rehydration;
+            self.in_checked_candidate_rehydration = self
+                .path
+                .ends_with("crates/bridge-coordinator/src/detached.rs")
+                && node.sig.ident == "rehydrate_checked_candidate_rejection";
             syn::visit::visit_item_fn(self, node);
+            self.in_checked_candidate_rehydration = was_in_checked_candidate_rehydration;
             self.in_container_reap_failure = was_in_container_reap_failure;
             self.in_container_infrastructure_failure = was_in_container_infrastructure_failure;
         }
@@ -722,6 +730,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
                     self.container_reap_constructor_count += 1;
                 } else if self.in_container_infrastructure_failure && exact_path {
                     self.container_infrastructure_constructor_count += 1;
+                } else if self.in_checked_candidate_rehydration && exact_path {
+                    self.checked_candidate_rehydration_count += 1;
                 } else {
                     self.violations.push(format!(
                         "{}: BridgeError::agent_failure outside an audited lifecycle builder",
@@ -765,6 +775,8 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
             container_reap_constructor_count: 0,
             in_container_infrastructure_failure: false,
             container_infrastructure_constructor_count: 0,
+            in_checked_candidate_rehydration: false,
+            checked_candidate_rehydration_count: 0,
         };
         visitor.visit_file(&file);
         if path.ends_with("crates/bridge-core/src/error.rs")
@@ -810,6 +822,15 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
                 "{}: container_infrastructure_failure_error contains {} agent_failure calls, expected 1",
                 path.display(),
                 visitor.container_infrastructure_constructor_count
+            ));
+        }
+        if path.ends_with("crates/bridge-coordinator/src/detached.rs")
+            && visitor.checked_candidate_rehydration_count != 1
+        {
+            visitor.violations.push(format!(
+                "{}: checked candidate rehydration contains {} agent_failure calls, expected 1",
+                path.display(),
+                visitor.checked_candidate_rehydration_count
             ));
         }
         visitor.violations
@@ -871,6 +892,24 @@ fn production_sources_construct_agent_failure_only_through_central_builder() {
         std::path::Path::new("crates/bridge-container/src/lib.rs"),
         "fn container_reap_failure_error() { \
          let _ = BridgeError::agent_failure(diagnostic); }"
+    )
+    .is_empty());
+    let recovery_path = std::path::Path::new("crates/bridge-coordinator/src/detached.rs");
+    let recovery_builder = "fn rehydrate_checked_candidate_rejection() { \
+        BridgeError::agent_failure(diagnostic); }";
+    assert!(source_violations_at(recovery_path, recovery_builder).is_empty());
+    assert!(!source_violations(recovery_builder).is_empty());
+    assert!(!source_violations_at(
+        recovery_path,
+        &format!("{recovery_builder} fn arbitrary() {{ BridgeError::agent_failure(diagnostic); }}")
+    )
+    .is_empty());
+    assert!(!source_violations_at(
+        recovery_path,
+        &recovery_builder.replace(
+            "BridgeError::agent_failure(diagnostic);",
+            "BridgeError::agent_failure(diagnostic); BridgeError::agent_failure(diagnostic);"
+        )
     )
     .is_empty());
     assert!(
