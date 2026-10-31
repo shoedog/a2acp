@@ -5566,6 +5566,656 @@ async fn joint_startup_recovers_ordinary_terminal_checkpoint() {
     joint_startup_checkpoint_recovery(false).await;
 }
 
+// C2c2d7: duplicate claims and repeated crashes use the actual two consumers.
+// Each scan has its own batch runtime, as separate recovering processes would.
+async fn duplicate_recovery_scan(
+    deps: bridge_coordinator::detached::DetachedDeps,
+    record: TaskRecord,
+    batch: bool,
+    accounting: AccountingV1,
+) {
+    if batch {
+        let runtime = bridge_coordinator::batch::BatchRuntime::new(
+            1,
+            1,
+            Arc::new(bridge_observ::NoopObserver),
+        );
+        bridge_coordinator::batch::resume_batches_with_accounting(
+            &bridge_coordinator::batch::BatchDeps {
+                detached: deps,
+                runtime: runtime.clone(),
+                allowed_cwd_root: None,
+            },
+            3,
+            Some(accounting),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !runtime.batch_cancels.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(runtime.semaphore.available_permits(), 1);
+        })
+        .await
+        .unwrap();
+    } else {
+        bridge_coordinator::detached::resume_one_working_task_with_accounting(
+            &deps,
+            &record,
+            3,
+            Some(accounting),
+        )
+        .await;
+    }
+}
+
+async fn recovery_quiescent(
+    deps: &bridge_coordinator::detached::DetachedDeps,
+    task: &TaskId,
+) -> TaskRecord {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let record = deps.task_store.get(task).await.unwrap().unwrap();
+            if record.status != TaskRecordStatus::Working
+                && deps.workflow_cancels.lock().await.is_empty()
+                && deps.progress_hubs.lock().await.is_empty()
+            {
+                return record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+// In both consumers the first wall-clock read follows the locator read and
+// immediately precedes its CAS. Hold those two reads until BOTH scans hold the
+// same expected locator. This forces a stale loser without scheduler sleeps or
+// replacing the store's actual atomic claim / preparation / accounting methods.
+#[derive(Default)]
+struct RecoveryClaimRendezvous {
+    arrivals: Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+impl bridge_coordinator::clock::Clock for RecoveryClaimRendezvous {
+    fn now_instant(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn now_ms(&self) -> i64 {
+        let mut arrivals = self.arrivals.lock().unwrap();
+        if *arrivals < 2 {
+            *arrivals += 1;
+            self.changed.notify_all();
+            let (arrivals, _) = self
+                .changed
+                .wait_timeout_while(arrivals, std::time::Duration::from_secs(10), |n| *n < 2)
+                .unwrap();
+            assert_eq!(*arrivals, 2, "both consumers must reach the lineage claim");
+        }
+        bridge_core::task_store::system_wall_now_ms()
+    }
+}
+
+fn recovery_effect_counts(h: &CandidateFixture) -> Vec<(usize, usize)> {
+    h.calls
+        .iter()
+        .zip(&h.f.providers)
+        .map(|(calls, provider)| {
+            (
+                calls.setups.load(Ordering::SeqCst),
+                provider.prompts.load(Ordering::SeqCst),
+            )
+        })
+        .collect()
+}
+
+async fn recovery_duplicate_claims(batch: bool, case: &str) {
+    let (h, admitted) = if case == "ordinary" {
+        let h = CandidateFixture::new("success", "success").await;
+        h.f.store.ensure_usage_coverage_v1().await.unwrap();
+        let admitted = h.admission("target").await;
+        (h, admitted)
+    } else {
+        recovery_candidate_fixture(case).await
+    };
+    let h = h.reopen_recovery();
+    let mut deps = completed_recovery_deps(&h, &admitted, batch).await;
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let stale = deps.task_store.get(&task).await.unwrap().unwrap();
+    let rows = h.f.rows();
+    let prior = if case == "ordinary" {
+        None
+    } else {
+        Some(checked_progress(&h).await)
+    };
+    let receipt = (case == "completed-dependent").then(|| joint_receipt(&h));
+    let rendezvous = Arc::new(RecoveryClaimRendezvous::default());
+    deps.clock = rendezvous.clone();
+    // Interrupt old optional summaries before launching the two boot consumers.
+    use bridge_core::workflow_history::WorkflowHistoryStore;
+    h.f.store.interrupt_active(2).await.unwrap();
+    let first = tokio::spawn(duplicate_recovery_scan(
+        deps.clone(),
+        stale.clone(),
+        batch,
+        AccountingV1::new(h.f.store.clone()),
+    ));
+    let second = tokio::spawn(duplicate_recovery_scan(
+        deps.clone(),
+        stale.clone(),
+        batch,
+        AccountingV1::new(h.f.store.clone()),
+    ));
+    first.await.unwrap();
+    second.await.unwrap();
+    let record = recovery_quiescent(&deps, &task).await;
+    assert_eq!(*rendezvous.arrivals.lock().unwrap(), 2);
+    assert_eq!(
+        record.status,
+        TaskRecordStatus::Completed,
+        "batch={batch}/{case}: {:?}",
+        record.error
+    );
+    assert_eq!(record.resume_attempts, 1, "one lineage winner");
+    let counts = vec![(0, 0), (1, 1), (0, 0), (0, 0)];
+    assert_eq!(
+        recovery_effect_counts(&h),
+        counts,
+        "batch={batch}/{case}: preparation/poll counts"
+    );
+    let after = h.f.rows();
+    assert_eq!(
+        after.len(),
+        rows.len() + 1,
+        "one accounting row for the winner"
+    );
+    for row in &rows {
+        assert_eq!(after.iter().find(|now| now.id == row.id), Some(row));
+    }
+    let locator = deps
+        .task_store
+        .get_attempt_locator(&task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(locator.identity.ordinal, 1);
+    assert_eq!(
+        locator.identity.parent_attempt_id.as_ref(),
+        Some(&h.owner.attempt_id)
+    );
+    let new = after
+        .iter()
+        .find(|row| !rows.iter().any(|old| old.id == row.id))
+        .unwrap();
+    assert!(new.dispatched && new.finalized);
+    assert_eq!(
+        new.attribution.run_attempt.as_deref(),
+        Some(locator.identity.attempt_id.as_str())
+    );
+    if let Some(prior) = prior {
+        let progress = checked_progress(&h).await;
+        if case == "continuation" {
+            assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+            assert_eq!(progress.visits.len(), prior.visits.len() + 1);
+            assert_eq!(progress.visits.last().unwrap().owner, locator.identity);
+            assert_eq!(progress.retries_consumed, prior.retries_consumed);
+        } else {
+            assert_eq!(
+                progress, prior,
+                "completed candidate references are immutable"
+            );
+        }
+    } else {
+        assert!(deps
+            .task_store
+            .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(admitted.run_spec.fallback_chains.is_none());
+    }
+    if let Some(receipt) = receipt {
+        assert_eq!(joint_receipt(&h), receipt);
+    }
+    let checkpoints = deps.task_store.node_checkpoints(&task).await.unwrap();
+    let evidence = deps.task_store.node_terminal_evidence(&task).await.unwrap();
+    let outcome = deps.task_store.workflow_task_evidence(&task).await.unwrap();
+    let terminal_receipt = || {
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        let scalars: String = db.query_row(
+            "SELECT json_array(terminal_seq,last_event_seq,terminal_projection_ready,terminal_projection_attempt_id,terminal_projection_json) FROM tasks WHERE id=?1",
+            [task.as_str()], |row| row.get(0),
+        ).unwrap();
+        let journal: Vec<String> = db
+            .prepare("SELECT event_json FROM task_journal WHERE task_id=?1 ORDER BY seq")
+            .unwrap()
+            .query_map([task.as_str()], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (scalars, journal)
+    };
+    let terminal_before = terminal_receipt();
+    assert_eq!(record.result.as_deref(), Some("answer"));
+    assert!(record.error.is_none());
+    assert_eq!(
+        outcome.workflow_outcome,
+        Some(WorkflowDurableOutcomeV1::Completed)
+    );
+    // A stale detached task observation and repeated whole batch boot scans must
+    // not reopen the winner, create rows, or republish its completed checkpoint.
+    for _ in 0..2 {
+        duplicate_recovery_scan(
+            deps.clone(),
+            stale.clone(),
+            batch,
+            AccountingV1::new(h.f.store.clone()),
+        )
+        .await;
+        if batch {
+            // Exercise the stale child itself, even after its parent has settled;
+            // a whole boot scan would simply skip that inactive batch.
+            use bridge_coordinator::batch::*;
+            run_admission(
+                BatchDeps {
+                    detached: deps.clone(),
+                    runtime: BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+                    allowed_cwd_root: None,
+                },
+                stale.batch_id.clone().unwrap(),
+                [stale.clone()].into(),
+                Default::default(),
+                1,
+                CancellationToken::new(),
+                3,
+            )
+            .await;
+        }
+        assert_eq!(
+            deps.task_store.get(&task).await.unwrap(),
+            Some(record.clone()),
+            "batch={batch}/{case}: stale scan changed task projection"
+        );
+        assert_eq!(
+            deps.task_store.workflow_task_evidence(&task).await.unwrap(),
+            outcome
+        );
+        assert_eq!(
+            terminal_receipt(),
+            terminal_before,
+            "stale scan appended terminal evidence"
+        );
+        // Model a refusal already decided while the stale record was Working:
+        // completion won before the finalizer's write. An entry read cannot
+        // protect this boundary; the store must reject the late interruption.
+        assert!(bridge_coordinator::detached::finalize_detached(
+            &deps.task_store,
+            &deps.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("stale recovery refusal"),
+            None,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            deps.task_store.get(&task).await.unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(
+            deps.task_store.workflow_task_evidence(&task).await.unwrap(),
+            outcome
+        );
+        assert_eq!(
+            terminal_receipt(),
+            terminal_before,
+            "late refusal appended terminal evidence"
+        );
+    }
+    assert_eq!(h.f.rows(), after);
+    assert_eq!(recovery_effect_counts(&h), counts);
+    assert_eq!(
+        deps.task_store.get_attempt_locator(&task).await.unwrap(),
+        Some(locator)
+    );
+    assert_eq!(
+        deps.task_store.node_checkpoints(&task).await.unwrap(),
+        checkpoints
+    );
+    assert_eq!(
+        deps.task_store.node_terminal_evidence(&task).await.unwrap(),
+        evidence
+    );
+    assert_eq!(
+        deps.task_store
+            .get(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_attempts,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_settled_detached() {
+    recovery_duplicate_claims(false, "continuation").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_settled_batch() {
+    recovery_duplicate_claims(true, "continuation").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_completed_detached() {
+    recovery_duplicate_claims(false, "completed-dependent").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_completed_batch() {
+    recovery_duplicate_claims(true, "completed-dependent").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_ordinary_detached() {
+    recovery_duplicate_claims(false, "ordinary").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_duplicate_ordinary_batch() {
+    recovery_duplicate_claims(true, "ordinary").await;
+}
+
+// Crash after the real consumer's atomic claim, before optional history work or
+// any provider preparation. Dropping a private runtime kills the batch admission
+// task too; aborting only the top-level batch scanner would leave that task alive.
+fn recovery_crash_after_claim(
+    mut deps: bridge_coordinator::detached::DetachedDeps,
+    record: TaskRecord,
+    batch: bool,
+    accounting: AccountingV1,
+) {
+    let reached = Arc::new(tokio::sync::Notify::new());
+    deps.workflow_history = Some(Ok(Arc::new(recovery_history::CrashAfterClaim(
+        reached.clone(),
+    ))));
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    biased;
+                    () = reached.notified() => {},
+                    () = duplicate_recovery_scan(deps, record, batch, accounting) => panic!("consumer missed the crash boundary"),
+                }
+            }).await.unwrap();
+        });
+        drop(runtime);
+    }).join().unwrap();
+}
+
+async fn recovery_repeated_crashes(batch: bool, case: &str) {
+    let ordinary = case == "ordinary";
+    let completed = case == "completed";
+    let (mut h, mut admitted) = if completed {
+        recovery_candidate_fixture("completed-dependent").await
+    } else if ordinary {
+        let h = CandidateFixture::new("success", "success").await;
+        h.f.store.ensure_usage_coverage_v1().await.unwrap();
+        let admitted = h.admission("target").await;
+        (h, admitted)
+    } else {
+        let (h, initial) =
+            recovery_candidate_fixture_target("continuation", "retry-unpolled").await;
+        let mut graph = initial.run_spec.graph.clone();
+        graph.nodes[0].retry = Some(bridge_workflow::graph::RetryPolicy {
+            max_attempts: 2,
+            backoff_ms: 0,
+            backoff_cap_ms: None,
+        });
+        let admitted = h
+            .builder()
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: h.owner.attempt_id.clone(),
+                graph: Arc::new(graph),
+                requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+                policy_invocation: Default::default(),
+                ledger_admission: initial.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        let admitted = h
+            .builder()
+            .bind_local_chains(admitted, &h.run.progress.chains)
+            .unwrap();
+        seed_rejected_visit(&h, 0).await; // one retry was spent before the crash
+        (h, admitted)
+    };
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let receipt = completed.then(|| joint_receipt(&h));
+    let mut owners = vec![h.owner.clone()];
+    h = h.reopen_recovery();
+    let mut deps = completed_recovery_deps(&h, &admitted, batch).await;
+    for ordinal in 1..=2 {
+        let rows = h.f.rows();
+        let prior = if ordinary {
+            None
+        } else {
+            Some(checked_progress(&h).await)
+        };
+        let stale = deps.task_store.get(&task).await.unwrap().unwrap();
+        recovery_crash_after_claim(
+            deps.clone(),
+            stale,
+            batch,
+            AccountingV1::new(h.f.store.clone()),
+        );
+        let locator = deps
+            .task_store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(locator.identity.ordinal, ordinal);
+        assert_eq!(locator.identity.execution_id, h.owner.execution_id);
+        assert_eq!(
+            locator.identity.parent_attempt_id.as_ref(),
+            Some(&owners.last().unwrap().attempt_id)
+        );
+        assert!(owners
+            .iter()
+            .all(|old| old.attempt_id != locator.identity.attempt_id));
+        owners.push(locator.identity);
+        assert_eq!(
+            h.f.rows(),
+            rows,
+            "crash before preparation adds no accounting"
+        );
+        assert_eq!(recovery_effect_counts(&h), vec![(0, 0); 4]);
+        assert!(deps.workflow_cancels.lock().await.is_empty());
+        assert!(deps.progress_hubs.lock().await.is_empty());
+        if let Some(prior) = prior {
+            assert_eq!(checked_progress(&h).await, prior);
+        }
+        assert_eq!(
+            deps.task_store
+                .get(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .resume_attempts,
+            ordinal
+        );
+        if case == "position" && ordinal == 1 {
+            // Model a later settled B boundary under owner 1, using the same
+            // checked store writer as the initial durable crash fixture.
+            seed_rejected_visit(&h, 1).await;
+            assert_eq!(
+                checked_progress(&h).await.visits.last().unwrap().owner,
+                owners[1]
+            );
+        }
+        // The next boot uses a newly opened durable store and fresh consumer maps.
+        drop(deps);
+        h = h.reopen_recovery();
+        admitted = h.builder().restore((*admitted.run_spec).clone()).unwrap();
+        deps = bridge_coordinator::detached::DetachedDeps {
+            task_store: h.f.store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+            workflows: Arc::new(
+                [(
+                    admitted.run_spec.graph.id.clone(),
+                    Arc::new(admitted.run_spec.graph.clone()),
+                )]
+                .into(),
+            ),
+            workflow_cancels: Default::default(),
+            progress_hubs: Default::default(),
+            clock: Arc::new(bridge_coordinator::clock::SystemClock),
+            observer: Arc::new(bridge_observ::NoopObserver),
+            workflow_history: Some(Ok(h.f.store.clone())),
+            workflow_admission: Some(h.builder()),
+        };
+    }
+    let prior = if ordinary {
+        None
+    } else {
+        Some(checked_progress(&h).await)
+    };
+    let rows = h.f.rows();
+    let record = consume_completed_recovery(&h, &deps, batch).await;
+    assert_eq!(
+        record.status,
+        if ordinary || completed {
+            TaskRecordStatus::Completed
+        } else {
+            TaskRecordStatus::Failed
+        },
+        "batch={batch}/{case}: {:?}",
+        record.error
+    );
+    assert_eq!(record.resume_attempts, 3);
+    let owner = deps
+        .task_store
+        .get_attempt_locator(&task)
+        .await
+        .unwrap()
+        .unwrap()
+        .identity;
+    assert_eq!(owner.ordinal, 3);
+    assert_eq!(
+        owner.parent_attempt_id.as_ref(),
+        Some(&owners[2].attempt_id)
+    );
+    assert_eq!(owner.execution_id, h.owner.execution_id);
+    let after = h.f.rows();
+    assert_eq!(
+        after.len(),
+        rows.len() + 1,
+        "one resumed visit; spent retries cannot be reused"
+    );
+    for row in &rows {
+        assert_eq!(after.iter().find(|now| now.id == row.id), Some(row));
+    }
+    let new = after
+        .iter()
+        .find(|row| !rows.iter().any(|old| old.id == row.id))
+        .unwrap();
+    assert_eq!(
+        new.attribution.run_attempt.as_deref(),
+        Some(owner.attempt_id.as_str())
+    );
+    assert_eq!(
+        new.attribution.execution.as_deref(),
+        Some(owner.execution_id.as_str())
+    );
+    assert!(new.finalized);
+    let position = usize::from(case == "position") + 1;
+    let mut counts = vec![(0, 0); 4];
+    counts[position] = (1, usize::from(case != "position"));
+    assert_eq!(
+        recovery_effect_counts(&h),
+        counts,
+        "batch={batch}/{case}: preparation/poll counts"
+    );
+    if completed {
+        assert_eq!(checked_progress(&h).await, prior.unwrap());
+        assert_eq!(joint_receipt(&h), receipt.unwrap());
+        let input = format!("{:?}", h.f.providers[1].inputs.lock().unwrap());
+        assert!(input.contains("exact checkpoint output"));
+        assert!(input.contains("| node | 7 |"));
+    } else if let Some(prior) = prior {
+        // Failed execution publishes an ordinary failed checkpoint, so this is
+        // no longer executable recovery evidence. Inspect immutable references
+        // without weakening the checked reader's refusal of that combination.
+        assert!(deps
+            .task_store
+            .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+            .await
+            .is_err());
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        let json: String = db
+            .query_row(
+                "SELECT progress_json FROM task_candidate_progress_v1 WHERE node_id='node'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let progress: CandidateProgressV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(progress.visits[..prior.visits.len()], prior.visits);
+        assert_eq!(progress.selected_chain, prior.selected_chain);
+        assert_eq!(
+            progress.retries_consumed, 1,
+            "consumed retry survives every owner"
+        );
+        assert!(progress
+            .visits
+            .windows(2)
+            .all(|pair| pair[0].position <= pair[1].position));
+        let visit = progress.visits.last().unwrap();
+        assert_eq!(visit.position, position);
+        assert_eq!(visit.owner, owner);
+        assert_eq!(visit.accounting_id, new.id);
+    } else {
+        assert!(deps
+            .task_store
+            .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .is_none());
+    }
+    // The durable identity registry retains every prior owner, including crashed
+    // attempts that never reserved optional history and never prepared a visit.
+    let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+    let identities: Vec<(String, u32)> = db
+        .prepare("SELECT attempt_id,ordinal FROM attempt_identities ORDER BY ordinal")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    owners.push(owner);
+    assert_eq!(
+        identities,
+        owners
+            .iter()
+            .map(|owner| (owner.attempt_id.as_str().to_owned(), owner.ordinal))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn workflow_lineage_repeated_crashes_detached() {
+    for case in ["retry", "position", "completed", "ordinary"] {
+        recovery_repeated_crashes(false, case).await;
+    }
+}
+#[tokio::test]
+async fn workflow_lineage_repeated_crashes_batch() {
+    for case in ["retry", "position", "completed", "ordinary"] {
+        recovery_repeated_crashes(true, case).await;
+    }
+}
+
 // C2c2d6: production recovery consumers, with a reopened checked store.
 async fn workflow_continuation_success(case: &str) {
     for batch in [false, true] {
@@ -6265,6 +6915,47 @@ async fn continuation_delivery_failure(fault: &str) {
 mod recovery_history {
     use super::*;
     use bridge_core::workflow_history::*;
+    pub struct CrashAfterClaim(pub Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl WorkflowHistoryStore for CrashAfterClaim {
+        async fn latest_reservation_for_task(
+            &self,
+            _: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            unreachable!()
+        }
+        async fn reserve(&self, _: &AttemptReservation) -> Result<(), LedgerError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+        async fn reserve_v2(&self, _: &AttemptReservationV2) -> Result<(), LedgerError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+        async fn mark_prompt_acceptance(&self, _: &AttemptId, _: &str) -> Result<(), LedgerError> {
+            unreachable!()
+        }
+        async fn terminalize(
+            &self,
+            _: &AttemptId,
+            _: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            unreachable!()
+        }
+        async fn set_pinned(&self, _: &AttemptId, _: bool) -> Result<bool, LedgerError> {
+            unreachable!()
+        }
+        async fn interrupt_active(&self, _: i64) -> Result<u64, LedgerError> {
+            unreachable!()
+        }
+        async fn completed_between(
+            &self,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            unreachable!()
+        }
+    }
     pub struct PromptFailure(pub Arc<bridge_store::sqlite::SqliteStore>);
     #[async_trait::async_trait]
     impl WorkflowHistoryStore for PromptFailure {
@@ -6523,6 +7214,14 @@ async fn seed_rejected_visit(h: &CandidateFixture, position: usize) {
     row.id = id.clone();
     row.dispatched = false;
     row.finalized = false;
+    let owner =
+        h.f.store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .identity;
+    row.attribution.run_attempt = Some(owner.attempt_id.as_str().into());
     row.attribution.agent = candidate.agent.as_str().into();
     row.attribution.effective_model = Some(candidate.model.clone());
     row.attribution.effective_mode = candidate.posture.mode.clone();
@@ -6539,7 +7238,7 @@ async fn seed_rejected_visit(h: &CandidateFixture, position: usize) {
             progress.visits.push(CandidateVisitV1 {
                 position,
                 accounting_id: id.clone(),
-                owner: h.owner.clone(),
+                owner: owner.clone(),
                 cold_context: ContextId::parse(id.clone()).unwrap(),
                 phase,
                 rejection: None,
