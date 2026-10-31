@@ -2376,7 +2376,7 @@ impl Coordinator {
     /// behavior: it mints identity internally, and the detached runner may
     /// begin before the awaiting caller observes the returned task id.
     pub async fn run_workflow(&self, p: OpParams) -> Result<TaskId, BridgeError> {
-        Ok(self.run_workflow_inner(p, None).await?.task_id)
+        Ok(self.run_workflow_inner(p, None, false).await?.task_id)
     }
 
     /// Submit a detached workflow under an identity already visible to the
@@ -2393,13 +2393,25 @@ impl Coordinator {
         p: OpParams,
         identity: bridge_core::ids::AttemptIdentity,
     ) -> Result<WorkflowLocator, BridgeError> {
-        self.run_workflow_inner(p, Some(identity)).await
+        self.run_workflow_inner(p, Some(identity), false).await
+    }
+
+    /// Inactive served-chain admission fixture. Only this explicit test entry
+    /// binds operator declarations; A2A and MCP submissions never select it.
+    #[doc(hidden)]
+    pub async fn run_workflow_with_chains_for_test(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<WorkflowLocator, BridgeError> {
+        self.run_workflow_inner(p, Some(identity), true).await
     }
 
     async fn run_workflow_inner(
         &self,
         p: OpParams,
         supplied_identity: Option<bridge_core::ids::AttemptIdentity>,
+        test_admit_chains: bool,
     ) -> Result<WorkflowLocator, BridgeError> {
         self.refuse_governed_unsupported_route()?;
         if p.agent.is_some() || p.model.is_some() || p.effort.is_some() || p.mode.is_some() {
@@ -2447,6 +2459,21 @@ impl Coordinator {
                     .await?,
             ),
             None => None,
+        };
+        // Share the local binder and retain its final Arc through persistence,
+        // detached composition and the executor's exact-authority check. Neither
+        // input nor request metadata participates in chain selection.
+        let admitted = if test_admit_chains && !self.mcp_fallback.is_empty() {
+            let admission = self
+                .workflow_admission
+                .as_ref()
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            Some(admission.bind_local_chains(
+                admitted.ok_or(BridgeError::InvalidStateTransition)?,
+                &self.mcp_fallback,
+            )?)
+        } else {
+            admitted
         };
         let workflow_spec_json = match admitted.as_ref() {
             Some(authority) => Some(crate::detached::encode_workflow_run_spec(
@@ -2654,7 +2681,26 @@ impl Coordinator {
             attempt_started,
             0,
         );
-        let deps = self.detached_deps();
+        let mut deps = self.detached_deps();
+        if let (Some(authority), Some(admission), Some(_)) =
+            (&admitted, &self.workflow_admission, &self.executor)
+        {
+            if authority
+                .run_spec
+                .fallback_chains
+                .as_ref()
+                .is_some_and(|chains| !chains.is_empty())
+            {
+                deps.executor = Some(Arc::new(
+                    WorkflowExecutor::new(self.registry.clone()).with_local_fallback(
+                        admission.clone(),
+                        authority.clone(),
+                        self.task_store.clone(),
+                        task.clone(),
+                    ),
+                ));
+            }
+        }
         let run_context = WorkflowRunContext {
             session_cwd,
             task_id: Some(task.clone()),
