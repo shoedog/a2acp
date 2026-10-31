@@ -1859,7 +1859,12 @@ struct LocalWorkflowFallbackV1 {
     store: Arc<dyn TaskStore>,
     task: bridge_core::ids::TaskId,
     entries: Vec<Arc<AgentEntry>>,
-    restored: Option<std::sync::Mutex<HashMap<NodeId, WorkflowCandidateRunV1>>>,
+    restored: Option<RestoredWorkflowFallbackV1>,
+}
+
+struct RestoredWorkflowFallbackV1 {
+    pending: std::sync::Mutex<HashMap<NodeId, WorkflowCandidateRunV1>>,
+    completed: HashMap<NodeId, CandidateOutputV1>,
 }
 
 /// Durable execution boundary for explicitly admitted, cold candidates.
@@ -2719,14 +2724,14 @@ impl WorkflowExecutor {
         self
     }
 
-    /// Executor-only continuation composition. Public recovery consumers do not
-    /// call this seam. It requires an already claimed resumed accounting owner;
+    /// Continuation composition for checked recovery consumers. Requires an
+    /// already claimed resumed accounting owner;
     /// fresh local and served admission remain separate and unchanged. The caller
     /// rehydrates the retained error; its diagnostic must exactly match checked
     /// evidence. This seam cannot mint a new provider diagnosis.
     #[doc(hidden)]
     pub async fn with_restored_fallback_v1(
-        self,
+        &self,
         admission: Arc<crate::admission::WorkflowAdmissionV1>,
         admitted: crate::admission::AdmittedWorkflowRunV1,
         store: Arc<dyn TaskStore>,
@@ -2744,6 +2749,7 @@ impl WorkflowExecutor {
             .filter(|nodes| !nodes.is_empty())
             .ok_or(BridgeError::InvalidStateTransition)?;
         let mut restored = HashMap::new();
+        let mut completed = HashMap::new();
         for (node, chains) in chains {
             let source = chains
                 .first()
@@ -2762,6 +2768,17 @@ impl WorkflowExecutor {
             }
             let routing = FrozenFallbackInvocationV1::freeze(chains.clone(), source)
                 .ok_or(BridgeError::InvalidStateTransition)?;
+            let progress = store
+                .candidate_progress_v1(&task, node)
+                .await?
+                .ok_or(BridgeError::InvalidStateTransition)?;
+            let (routing, recovery) =
+                routing.restore(&progress, |candidate| Ok(candidate.clone()))?;
+            if let bridge_core::fallback_runtime::CandidateRecoveryV1::Completed(output) = recovery
+            {
+                completed.insert(node.clone(), output);
+                continue;
+            }
             restored.insert(
                 node.clone(),
                 WorkflowCandidateRunV1::restore(
@@ -2774,11 +2791,15 @@ impl WorkflowExecutor {
                 .await?,
             );
         }
-        let mut executor = self.with_local_fallback(admission, admitted, store, task);
+        let mut executor =
+            Self::new(self.registry.clone()).with_local_fallback(admission, admitted, store, task);
         // This newly constructed Arc has no other owners yet.
         Arc::get_mut(executor.local_fallback.as_mut().unwrap())
             .unwrap()
-            .restored = Some(std::sync::Mutex::new(restored));
+            .restored = Some(RestoredWorkflowFallbackV1 {
+            pending: std::sync::Mutex::new(restored),
+            completed,
+        });
         Ok(executor)
     }
 
@@ -5021,6 +5042,7 @@ impl WorkflowExecutor {
                     .is_some_and(|nodes| nodes.contains_key(&node.id))
                 {
                     let mut run = restored
+                        .pending
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&node.id)
@@ -7302,10 +7324,14 @@ impl WorkflowExecutor {
         };
         Box::pin(async_stream::stream! {
             if this.local_fallback.as_ref().is_some_and(|local| {
-                if local.restored.is_some() {
+                if let Some(restored) = &local.restored {
                     this.accounting.is_none() || frozen_authority.is_none()
-                        || local.admitted.run_spec.fallback_chains.as_ref().is_some_and(|nodes|
-                            nodes.keys().any(|node| seed.contains_key(node.as_str())))
+                        || restored.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .keys().any(|node| seed.contains_key(node.as_str()))
+                        || restored.completed.iter().any(|(node, output)| {
+                            seed.get(node.as_str()).is_none_or(|(text, ok, usage)|
+                                text != &output.output || *ok != output.ok || usage != &output.usage)
+                        })
                 } else {
                     !seed.is_empty() || structured_seed.is_some()
                 }
