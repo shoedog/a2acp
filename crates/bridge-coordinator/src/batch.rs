@@ -416,6 +416,11 @@ async fn resumed_child_future(
     accounting: Option<AccountingV1>,
 ) -> Option<(BoxFuture<'static, TaskId>, TaskId, CancellationToken)> {
     let task = child.id.clone();
+    // Admission may still hold a stale Working child after completion.
+    match deps.detached.task_store.get(&task).await {
+        Ok(Some(current)) if current.status == TaskRecordStatus::Working => {}
+        _ => return None,
+    }
     let Some(spec_json) = child.workflow_spec_json.as_deref() else {
         let _ = finalize_detached(
             &deps.detached.task_store,
