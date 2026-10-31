@@ -2475,6 +2475,19 @@ impl Coordinator {
         } else {
             admitted
         };
+        // Bound chains need the candidate executor. Refuse before any durable
+        // effect instead of persisting authority for a run that cannot use it.
+        if self.executor.is_none()
+            && admitted.as_ref().is_some_and(|authority| {
+                authority
+                    .run_spec
+                    .fallback_chains
+                    .as_ref()
+                    .is_some_and(|chains| !chains.is_empty())
+            })
+        {
+            return Err(BridgeError::InvalidStateTransition);
+        }
         let workflow_spec_json = match admitted.as_ref() {
             Some(authority) => Some(crate::detached::encode_workflow_run_spec(
                 &authority.run_spec,

@@ -651,15 +651,54 @@ impl CandidateFixture {
         self.admission_at(agent, cwd).await
     }
     async fn admission_at(&self, agent: &str, cwd: SessionCwd) -> AdmittedWorkflowRunV1 {
-        WorkflowAdmissionV1::new(self.registry.clone(), Arc::new(DirectWorkflowCheckoutPlannerV1), cwd.clone(), None)
-            .freeze(WorkflowAdmissionRequestV1 {
-                attempt_id: self.owner.attempt_id.clone(),
-                graph: Arc::new(serde_json::from_value(serde_json::json!({
+        self.admission_nodes(
+            serde_json::json!([{"id":"node", "agent":agent, "prompt_template":"{{input}}", "inputs":[]}]),
+            cwd,
+        )
+        .await
+    }
+    /// A chainless `first` node feeds the chain-bearing `node`.
+    async fn two_node_admission(&self) -> AdmittedWorkflowRunV1 {
+        let cwd =
+            SessionCwd::parse(&self.f.dir.path().join("scope").display().to_string()).unwrap();
+        self.admission_nodes(
+            serde_json::json!([
+                {"id":"first", "agent":"other", "prompt_template":"{{input}}", "inputs":[]},
+                {"id":"node", "agent":"source", "prompt_template":"{{first}}", "inputs":["first"]}
+            ]),
+            cwd,
+        )
+        .await
+    }
+    async fn admission_nodes(
+        &self,
+        nodes: serde_json::Value,
+        cwd: SessionCwd,
+    ) -> AdmittedWorkflowRunV1 {
+        WorkflowAdmissionV1::new(
+            self.registry.clone(),
+            Arc::new(DirectWorkflowCheckoutPlannerV1),
+            cwd.clone(),
+            None,
+        )
+        .freeze(WorkflowAdmissionRequestV1 {
+            attempt_id: self.owner.attempt_id.clone(),
+            graph: Arc::new(
+                serde_json::from_value(serde_json::json!({
                     "id":"workflow", "controls": WorkflowControlDefaultsV1::default(),
-                    "nodes":[{"id":"node", "agent":agent, "prompt_template":"{{input}}", "inputs":[]}]
-                })).unwrap()), requested_session_cwd: Some(cwd), policy_invocation: ExecutionPolicyInvocationV1::default(),
-                ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted { kind: HistoryAllocationKindV1::Configured }, r2f1b: None,
-            }).await.unwrap()
+                    "nodes":nodes
+                }))
+                .unwrap(),
+            ),
+            requested_session_cwd: Some(cwd),
+            policy_invocation: ExecutionPolicyInvocationV1::default(),
+            ledger_admission: LedgerAdmissionV1::HistoryLedgerAdmitted {
+                kind: HistoryAllocationKindV1::Configured,
+            },
+            r2f1b: None,
+        })
+        .await
+        .unwrap()
     }
     async fn execute(
         &mut self,
@@ -2721,9 +2760,28 @@ impl CandidateFixture {
         accounting: bool,
     ) -> bridge_coordinator::Coordinator {
         let graph = Arc::new(self.admission("source").await.run_spec.graph.clone());
+        self.served_coordinator_for(graph, chains, accounting)
+    }
+
+    fn served_coordinator_for(
+        &self,
+        graph: Arc<bridge_workflow::graph::WorkflowGraph>,
+        chains: bool,
+        accounting: bool,
+    ) -> bridge_coordinator::Coordinator {
+        self.served_coordinator_with(graph, chains, accounting, true)
+    }
+
+    fn served_coordinator_with(
+        &self,
+        graph: Arc<bridge_workflow::graph::WorkflowGraph>,
+        chains: bool,
+        accounting: bool,
+        executor: bool,
+    ) -> bridge_coordinator::Coordinator {
         let coordinator = bridge_coordinator::Coordinator::new(
             self.f.coordinator.session_manager.clone(),
-            Some(Arc::new(WorkflowExecutor::new(self.registry.clone()))),
+            executor.then(|| Arc::new(WorkflowExecutor::new(self.registry.clone()))),
             Arc::new(std::collections::HashMap::from([(graph.id.clone(), graph)])),
             self.f.store.clone(),
             self.f.store.clone(),
@@ -3017,32 +3075,34 @@ async fn served_chain_missing_accounting_refuses_before_preparation() {
         .error
         .unwrap()
         .contains("fresh candidate composition refused"));
-    assert!(h.f.spawns.lock().unwrap().is_empty());
-    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
-    let tables: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+    h.assert_no_candidate_effects("early refusal");
 }
 
 #[tokio::test]
 async fn served_chain_detached_refuses_missing_or_mismatched_authority() {
     use bridge_coordinator::detached::*;
-    for missing in [
+    // The chain lives on node 2 in the two-node graph; validation must cover
+    // every chain-bearing node, not just the first graph node.
+    for (missing, two_node) in [
         "snapshot",
         "locator",
         "owner",
         "workflow",
         "attempt",
         "authority",
-    ] {
+    ]
+    .into_iter()
+    // Without authority the plain graph runs, and its chainless node parks.
+    .flat_map(|missing| [(missing, false), (missing, true)])
+    .filter(|(missing, two_node)| !(*missing == "authority" && *two_node))
+    {
         let h = CandidateFixture::new("reject", "success").await;
         let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
-        let mut admitted = h.admission("source").await;
+        let mut admitted = if two_node {
+            h.two_node_admission().await
+        } else {
+            h.admission("source").await
+        };
         Arc::make_mut(&mut admitted.run_spec).ledger_admission =
             LedgerAdmissionV1::DurablePrimaryTaskStore;
         let admitted = h
@@ -3138,9 +3198,9 @@ async fn served_chain_detached_refuses_missing_or_mismatched_authority() {
             assert_eq!(
                 record.status,
                 TaskRecordStatus::Interrupted,
-                "{missing}: {record:?}"
+                "{missing}/{two_node}: {record:?}"
             );
-            assert!(h.f.spawns.lock().unwrap().is_empty(), "{missing}");
+            h.assert_no_candidate_effects(missing);
         }
         assert_eq!(
             h.f.providers[1].setup.load(Ordering::SeqCst),
@@ -3227,16 +3287,7 @@ async fn served_chain_admission_preserves_validation_and_collision_refusal() {
         .workflow_spec_json
         .unwrap()
         .contains("fallback_chains"));
-    assert!(h.f.spawns.lock().unwrap().is_empty());
-    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
-    let tables: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+    h.assert_no_candidate_effects("early refusal");
 }
 
 #[tokio::test]
@@ -3277,16 +3328,7 @@ async fn served_chain_governed_submission_stays_refused() {
         assert!(matches!(result, Err(BridgeError::BudgetRefused { .. })));
         assert!(h.f.store.get(&task).await.unwrap().is_none());
     }
-    assert!(h.f.spawns.lock().unwrap().is_empty());
-    let conn = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
-    let tables: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tables, 0, "refusal must precede accounting preparation");
+    h.assert_no_candidate_effects("early refusal");
 }
 
 #[tokio::test]
@@ -9127,4 +9169,601 @@ async fn restored_precedence_later_preparation_keeps_own_cause() {
         checked_progress(&h).await.visits[..prior.visits.len()],
         prior.visits
     );
+}
+
+// C2c2e3: served cancellation and accounting parity for the inactive
+// chain-bearing coordinator entry.
+mod served_history {
+    use super::*;
+    use bridge_core::workflow_history::*;
+    /// Forwards to the primary store, but gates the `at`th prompt dispatch
+    /// barrier, fails that and later ones, or refuses terminal summaries.
+    pub struct FaultHistory {
+        pub store: Arc<bridge_store::sqlite::SqliteStore>,
+        pub dispatches: std::sync::atomic::AtomicUsize,
+        pub at: usize,
+        pub gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+        pub fail_prompt: bool,
+        pub fail_terminal: bool,
+    }
+    #[async_trait::async_trait]
+    impl WorkflowHistoryStore for FaultHistory {
+        async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+            self.store.reserve(row).await
+        }
+        async fn reserve_v2(&self, row: &AttemptReservationV2) -> Result<(), LedgerError> {
+            self.store.reserve_v2(row).await
+        }
+        async fn commit_node_terminal_v2(
+            &self,
+            id: &AttemptId,
+            node: &NodeId,
+            terminal: &str,
+            trigger: Option<&str>,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.store
+                .commit_node_terminal_v2(id, node, terminal, trigger)
+                .await
+        }
+        async fn structured_evidence_v2(
+            &self,
+            id: &AttemptId,
+        ) -> Result<Option<AttemptStructuredEvidenceV1>, LedgerError> {
+            self.store.structured_evidence_v2(id).await
+        }
+        async fn mark_prompt_acceptance(
+            &self,
+            id: &AttemptId,
+            acceptance: &str,
+        ) -> Result<(), LedgerError> {
+            let dispatch = self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if dispatch == self.at {
+                if let Some(gate) = &self.gate {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+            }
+            if self.fail_prompt && dispatch >= self.at {
+                return Err(LedgerError::new(LedgerUnavailableReason::Io));
+            }
+            self.store.mark_prompt_acceptance(id, acceptance).await
+        }
+        async fn terminalize(
+            &self,
+            id: &AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            if self.fail_terminal {
+                return Err(LedgerError::new(LedgerUnavailableReason::Io));
+            }
+            self.store.terminalize(id, terminal).await
+        }
+        async fn settle_cleanup(
+            &self,
+            id: &AttemptId,
+            disposition: &str,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.store.settle_cleanup(id, disposition).await
+        }
+        async fn set_pinned(&self, id: &AttemptId, pinned: bool) -> Result<bool, LedgerError> {
+            self.store.set_pinned(id, pinned).await
+        }
+        async fn interrupt_active(&self, completed_ms: i64) -> Result<u64, LedgerError> {
+            self.store.interrupt_active(completed_ms).await
+        }
+        async fn latest_reservation_for_task(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            self.store.latest_reservation_for_task(task).await
+        }
+        async fn attempt(&self, id: &AttemptId) -> Result<Option<AttemptRecord>, LedgerError> {
+            self.store.attempt(id).await
+        }
+        async fn completed_between(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            self.store.completed_between(start_ms, end_ms).await
+        }
+    }
+}
+
+impl CandidateFixture {
+    fn fault_history(
+        &self,
+        at: usize,
+        gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+        fail_prompt: bool,
+        fail_terminal: bool,
+    ) -> Arc<served_history::FaultHistory> {
+        Arc::new(served_history::FaultHistory {
+            store: self.f.store.clone(),
+            dispatches: Default::default(),
+            at,
+            gate,
+            fail_prompt,
+            fail_terminal,
+        })
+    }
+
+    /// The runner owns `workflow_cancels` until its terminal publication and
+    /// accounted drain complete, so absence marks a fully settled invocation.
+    async fn served_settled(&self, coordinator: &bridge_coordinator::Coordinator, task: &TaskId) {
+        let cancels = coordinator.workflow_cancels();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while cancels.lock().await.contains_key(task) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("served runner never settled");
+    }
+
+    /// No registry resolution, adapter session, provider turn, or accounting
+    /// row exists for any candidate.
+    fn assert_no_candidate_effects(&self, label: &str) {
+        assert!(self.f.spawns.lock().unwrap().is_empty(), "{label}: spawns");
+        for (i, provider) in self.f.providers.iter().enumerate() {
+            assert_eq!(provider.setup.load(Ordering::SeqCst), 0, "{label}: {i}");
+            assert_eq!(provider.prompts.load(Ordering::SeqCst), 0, "{label}: {i}");
+            assert!(provider.sessions.lock().unwrap().is_empty(), "{label}: {i}");
+            assert_eq!(self.calls[i].setups.load(Ordering::SeqCst), 0, "{label}");
+        }
+        assert!(self.usage_rows().is_empty(), "{label}: accounting rows");
+    }
+
+    /// Accounting rows, or none when no reservation ever created the table.
+    fn usage_rows(&self) -> Vec<UsageAttemptV1> {
+        let path = self.f.dir.path().join("tasks.sqlite.usage-v1.sqlite");
+        let initialized = path.exists()
+            && rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='usage_attempts_v1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                != 0;
+        if initialized {
+            self.f.rows()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Raw durable progress. The validating reader intentionally refuses a
+    /// canceled node whose ordinary checkpoint exists without candidate output.
+    fn served_progress(&self, task: &TaskId) -> Option<CandidateProgressV1> {
+        rusqlite::Connection::open(self.f.dir.path().join("tasks.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT progress_json FROM task_candidate_progress_v1 WHERE task_id=?1",
+                [task.as_str()],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .map(|json| serde_json::from_str(&json).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn served_chain_cancellation_boundaries() {
+    for boundary in [
+        "latched",
+        "source-parked",
+        "source-cleanup",
+        "target-resolve",
+        "target-setup",
+        "target-first-poll",
+    ] {
+        let (source, target) = match boundary {
+            "source-parked" => ("parked", "success"),
+            "source-cleanup" => ("blocked-cleanup", "success"),
+            "target-resolve" => ("reject", "blocked-resolve"),
+            "target-setup" => ("reject", "blocked-setup"),
+            _ => ("reject", "success"),
+        };
+        let h = CandidateFixture::new(source, target).await;
+        let first_poll_gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let mut coordinator = h.served_coordinator(true, true).await;
+        if boundary == "target-first-poll" {
+            coordinator = coordinator.with_workflow_history(Ok(h.fault_history(
+                1,
+                Some(first_poll_gate.clone()),
+                false,
+                false,
+            )));
+        }
+        let identity = AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        if boundary == "latched" {
+            h.f.store.request_cancel(&task).await.unwrap();
+        }
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await
+            .unwrap();
+        assert_eq!(locator.task_id, task);
+        let gate = match boundary {
+            "latched" => None,
+            "source-cleanup" => Some(&h.f.providers[0].cleanup),
+            "target-first-poll" => Some(&first_poll_gate),
+            "source-parked" => {
+                while h.f.providers[0].prompts.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                None
+            }
+            _ => None,
+        };
+        let configure = matches!(boundary, "target-resolve" | "target-setup");
+        if configure {
+            h.f.providers[1].configure.0.notified().await;
+        } else if let Some(gate) = gate {
+            gate.0.notified().await;
+        }
+        assert!(coordinator.cancel_task(task.clone()).await.unwrap() || boundary == "latched");
+        if configure {
+            h.f.providers[1].configure.1.notify_one();
+        } else if let Some(gate) = gate {
+            gate.1.notify_one();
+        }
+        h.served_settled(&coordinator, &task).await;
+        let record = h.served_terminal(&task).await;
+        assert_eq!(record.status, TaskRecordStatus::Canceled, "{boundary}");
+        // No cancellation boundary authorizes a later successor.
+        for later in [2, 3] {
+            assert_eq!(h.f.providers[later].setup.load(Ordering::SeqCst), 0);
+            assert_eq!(h.f.providers[later].prompts.load(Ordering::SeqCst), 0);
+        }
+        let checkpoints = h.f.store.node_checkpoints(&task).await.unwrap();
+        // The ordinary served sink may record the canceled node, never a success.
+        assert!(
+            checkpoints.iter().all(|(_, _, ok, _)| !ok),
+            "{boundary}: {checkpoints:?}"
+        );
+        let rows = h.usage_rows();
+        let spawns = h.f.spawns.lock().unwrap().clone();
+        let target_prompts = h.f.providers[1].prompts.load(Ordering::SeqCst);
+        assert_eq!(target_prompts, 0, "{boundary}");
+        let target_rows = rows
+            .iter()
+            .filter(|r| r.attribution.agent == "target")
+            .collect::<Vec<_>>();
+        assert!(target_rows.iter().all(|r| !r.dispatched), "{boundary}");
+        match boundary {
+            "latched" => h.assert_no_candidate_effects(boundary),
+            "source-parked" | "source-cleanup" => {
+                assert_eq!(spawns, ["source"], "{boundary}");
+                assert_eq!(rows.len(), 1, "{boundary}");
+                assert!(rows[0].dispatched, "{boundary}");
+                assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    h.f.providers[0].cancels.load(Ordering::SeqCst),
+                    usize::from(boundary == "source-parked")
+                );
+            }
+            _ => {
+                assert_eq!(rows.len(), 2, "{boundary}");
+                assert!(
+                    target_rows[0].finalized,
+                    "{boundary}: ordinary cleanup settles B"
+                );
+                assert_eq!(
+                    h.f.providers[1].setup.load(Ordering::SeqCst),
+                    usize::from(boundary != "target-resolve")
+                );
+            }
+        }
+        if boundary != "latched" {
+            let progress = h.served_progress(&task).unwrap();
+            assert_eq!(
+                progress.visits.len(),
+                if matches!(boundary, "source-parked" | "source-cleanup") {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert!(
+                progress
+                    .visits
+                    .get(1)
+                    .is_none_or(|visit| !visit.phase.dispatched()),
+                "{boundary}: B was never polled"
+            );
+        }
+    }
+}
+
+type ParityShape = (
+    Vec<(String, bool, bool)>,
+    Vec<(usize, bool)>,
+    Option<(u32, Option<usize>)>,
+    bool,
+);
+
+impl CandidateFixture {
+    async fn retry_graph(&self, attempts: u32) -> Arc<bridge_workflow::graph::WorkflowGraph> {
+        let mut graph = self.admission("source").await.run_spec.graph.clone();
+        graph.nodes[0].retry = Some(bridge_workflow::graph::RetryPolicy {
+            max_attempts: attempts,
+            backoff_ms: 0,
+            backoff_cap_ms: None,
+        });
+        Arc::new(graph)
+    }
+
+    /// Owner-independent accounting and candidate evidence for one invocation.
+    fn parity_shape(&self, task: &TaskId, success: bool) -> ParityShape {
+        let progress = self.served_progress(task);
+        (
+            self.usage_rows()
+                .iter()
+                .map(|r| (r.attribution.agent.clone(), r.dispatched, r.finalized))
+                .collect(),
+            progress
+                .iter()
+                .flat_map(|p| p.visits.iter().map(|v| (v.position, v.phase.dispatched())))
+                .collect(),
+            progress.map(|p| (p.retries_consumed, p.selected_chain)),
+            success,
+        )
+    }
+}
+
+#[tokio::test]
+async fn served_chain_accounting_and_retries_match_local() {
+    for (source, target, attempts) in [
+        ("reject", "final-only", 1),
+        ("reject", "retry-unpolled-resolve", 2),
+        ("reject", "retry-unpolled-resolve", 1),
+        ("retry-unpolled", "final-only", 3),
+        ("retry-unpolled", "final-only", 2),
+    ] {
+        let case = format!("{source}/{target}/{attempts}");
+        let local = CandidateFixture::new(source, target).await;
+        let graph = local.retry_graph(attempts).await;
+        let initial = local.admission("source").await;
+        let admitted = local
+            .builder()
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: local.owner.attempt_id.clone(),
+                graph,
+                requested_session_cwd: initial.run_spec.requested_session_cwd.clone(),
+                policy_invocation: Default::default(),
+                ledger_admission: initial.run_spec.ledger_admission.clone(),
+                r2f1b: None,
+            })
+            .await
+            .unwrap();
+        let admitted = local
+            .builder()
+            .bind_local_chains(admitted, &local.run.progress.chains)
+            .unwrap();
+        let events = local.drive(admitted, CancellationToken::new(), None).await;
+        let local_success = events.iter().any(|e| {
+            matches!(e, Ok(WorkflowEvent::Terminal { outcome, .. })
+                if *outcome == WorkflowOutcome::Completed)
+        });
+        assert_eq!(
+            local_success,
+            (source, target) == ("reject", "final-only") || attempts == 3,
+            "{case}: {events:?}"
+        );
+        let local_task = TaskId::parse(local.owner.execution_id.as_str()).unwrap();
+        let expected = local.parity_shape(&local_task, local_success);
+
+        let h = CandidateFixture::new(source, target).await;
+        let coordinator = h.served_coordinator_for(h.retry_graph(attempts).await, true, true);
+        let identity = AttemptIdentity::initial().unwrap();
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await
+            .unwrap();
+        let record = h.served_terminal(&locator.task_id).await;
+        h.served_settled(&coordinator, &locator.task_id).await;
+        let completed = record.status == TaskRecordStatus::Completed;
+        assert_eq!(completed, local_success, "{case}: {record:?}");
+        assert_eq!(
+            h.parity_shape(&locator.task_id, completed),
+            expected,
+            "{case}"
+        );
+        // Every row is one concrete reservation under the same owner and node.
+        let rows = h.usage_rows();
+        let ids: std::collections::BTreeSet<_> = rows.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids.len(), rows.len(), "{case}: distinct concrete rows");
+        for row in &rows {
+            assert_eq!(
+                row.attribution.execution.as_deref(),
+                Some(identity.execution_id.as_str())
+            );
+            assert_eq!(
+                row.attribution.run_attempt.as_deref(),
+                Some(identity.attempt_id.as_str())
+            );
+            assert_eq!(row.attribution.node.as_deref(), Some("node"), "{case}");
+            assert_eq!(
+                row.attribution.effective_model.as_deref(),
+                Some(row.attribution.agent.as_str()),
+                "{case}: actual provider attribution"
+            );
+        }
+        if (source, target) == ("reject", "final-only") {
+            let agents: Vec<_> = rows.iter().map(|r| r.attribution.agent.as_str()).collect();
+            assert_eq!(agents, ["source", "target"]);
+            assert!(rows.iter().all(|r| r.dispatched && r.finalized));
+            assert_eq!(
+                h.served_progress(&locator.task_id)
+                    .unwrap()
+                    .retries_consumed,
+                0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn served_chain_persistence_and_cleanup_failures_never_authorize_a_successor() {
+    for fault in ["reservation", "publication", "cleanup"] {
+        let h = CandidateFixture::new("reject", "success").await;
+        match fault {
+            "reservation" => rusqlite::Connection::open(
+                h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"),
+            )
+            .unwrap()
+            .execute_batch("CREATE TABLE usage_coverage_v1 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), started_ms INTEGER NOT NULL); CREATE TABLE usage_attempts_v1 (id TEXT PRIMARY KEY, record_json TEXT NOT NULL); CREATE TRIGGER fail_successor BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' BEGIN SELECT RAISE(ABORT,'reservation fault'); END;")
+            .unwrap(),
+            "publication" => rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+                .unwrap()
+                .execute_batch("CREATE TRIGGER fail_preparation BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_array_length(NEW.progress_json,'$.visits')=2 BEGIN SELECT RAISE(ABORT,'publication fault'); END;")
+                .unwrap(),
+            _ => h.calls[0]
+                .cleanup_results
+                .lock()
+                .unwrap()
+                .push(Err(BridgeError::StoreFailure)),
+        }
+        let coordinator = h.served_coordinator(true, true).await;
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(
+                served_params(false),
+                AttemptIdentity::initial().unwrap(),
+            )
+            .await
+            .unwrap();
+        let record = h.served_terminal(&locator.task_id).await;
+        h.served_settled(&coordinator, &locator.task_id).await;
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Failed,
+            "{fault}: {record:?}"
+        );
+        if fault != "cleanup" {
+            assert!(record.error.as_deref().unwrap().contains("StoreFailure"));
+        }
+        for provider in &h.f.providers[1..] {
+            assert_eq!(provider.prompts.load(Ordering::SeqCst), 0, "{fault}");
+        }
+        assert_eq!(h.f.providers[2].setup.load(Ordering::SeqCst), 0, "{fault}");
+        assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0, "{fault}");
+        let spawns = h.f.spawns.lock().unwrap().clone();
+        let rows = h.usage_rows();
+        match fault {
+            "reservation" => {
+                assert_eq!(spawns, ["source"]);
+                assert_eq!(rows.len(), 1);
+            }
+            "publication" => {
+                assert_eq!(spawns, ["source"]);
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|r| r.finalized));
+            }
+            _ => {
+                assert_eq!(spawns, ["source"]);
+                assert_eq!(rows.len(), 1);
+            }
+        }
+        assert!(rows
+            .iter()
+            .filter(|r| r.attribution.agent == "target")
+            .all(|r| !r.dispatched));
+    }
+}
+
+#[tokio::test]
+async fn served_chain_optional_summary_failure_keeps_accounting_and_acceptance() {
+    use bridge_core::workflow_history::{LedgerUnavailableReason, WorkflowHistoryStore};
+    for (fail_prompt, fail_terminal) in [(true, false), (false, true)] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let coordinator = h
+            .served_coordinator(true, true)
+            .await
+            .with_workflow_history(Ok(h.fault_history(0, None, fail_prompt, fail_terminal)));
+        let identity = AttemptIdentity::initial().unwrap();
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await
+            .unwrap();
+        let record = h.served_terminal(&locator.task_id).await;
+        h.served_settled(&coordinator, &locator.task_id).await;
+        assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+        assert_eq!(record.result.as_deref(), Some("answer"));
+        let rows = h.usage_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.dispatched && r.finalized));
+        for provider in &h.f.providers[..2] {
+            assert_eq!(provider.prompts.load(Ordering::SeqCst), 1);
+        }
+        let durable =
+            h.f.store
+                .get_attempt_locator(&locator.task_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            durable.telemetry_unavailable,
+            Some(LedgerUnavailableReason::Io),
+            "optional summary failure must stay visible"
+        );
+        let history =
+            h.f.store
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+        if fail_prompt {
+            // A failed dispatch barrier never fabricates provider acceptance in
+            // history; accounting above still records the actual polls.
+            assert!(
+                matches!(
+                    history.reservation.prompt_acceptance.as_str(),
+                    "not_dispatched" | "unknown"
+                ),
+                "{}",
+                history.reservation.prompt_acceptance
+            );
+        }
+        assert_eq!(history.terminal.is_none(), fail_terminal);
+    }
+}
+
+#[tokio::test]
+async fn served_chain_without_executor_refuses_before_persistence() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
+    let coordinator = h.served_coordinator_with(graph, true, true, false);
+    let identity = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+    assert!(matches!(
+        coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await,
+        Err(BridgeError::InvalidStateTransition)
+    ));
+    assert!(h.f.store.get(&task).await.unwrap().is_none());
+    assert!(h
+        .f
+        .store
+        .get_attempt_locator(&task)
+        .await
+        .unwrap()
+        .is_none());
+    h.assert_no_candidate_effects("no executor");
+    // Without bound chains the ordinary route keeps its existing behaviour.
+    let locator = coordinator
+        .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
+        .await
+        .unwrap();
+    let record = h.served_terminal(&locator.task_id).await;
+    assert_eq!(record.status, TaskRecordStatus::Failed);
+    assert_eq!(record.error.as_deref(), Some("no executor wired"));
+    assert!(!record
+        .workflow_spec_json
+        .unwrap()
+        .contains("fallback_chains"));
 }
