@@ -3988,21 +3988,35 @@ async fn validate_fresh_candidates(
         .get(task)
         .await?
         .ok_or(BridgeError::InvalidStateTransition)?;
-    let node = spec
+    // Every chain-bearing node must be present in the frozen graph. Selection
+    // mints no reservation or provider authority; inspect each node's owner
+    // without preparing a candidate, since the executor owns preparation.
+    let chains = spec
+        .fallback_chains
+        .as_ref()
+        .ok_or(BridgeError::InvalidStateTransition)?;
+    let nodes: Vec<_> = spec
         .graph
         .nodes
-        .first()
-        .ok_or(BridgeError::InvalidStateTransition)?;
-    // Selection mints no reservation or provider authority. Inspect the owner
-    // without preparing a candidate; the existing executor owns preparation.
-    let selection = invocation.select(&node.id, &node.agent, "node", &Default::default())?;
-    let selected = selection.selection();
-    if locator.identity != selected.owner
-        || locator.identity.ordinal != 0
+        .iter()
+        .filter(|node| chains.contains_key(&node.id))
+        .collect();
+    if nodes.is_empty() || nodes.len() != chains.len() {
+        return Err(BridgeError::InvalidStateTransition);
+    }
+    for node in nodes {
+        let selection = invocation.select(&node.id, &node.agent, "node", &Default::default())?;
+        let selected = selection.selection();
+        if locator.identity != selected.owner
+            || selected.attribution.workflow.as_deref() != Some(spec.graph.id.as_str())
+        {
+            return Err(BridgeError::InvalidStateTransition);
+        }
+    }
+    if locator.identity.ordinal != 0
         || locator.identity.parent_attempt_id.is_some()
         || locator.identity.execution_id.as_str() != task.as_str()
         || locator.identity.attempt_id != spec.attempt_id
-        || selected.attribution.workflow.as_deref() != Some(spec.graph.id.as_str())
         || record.workflow != spec.graph.id.as_str()
         || record.status != bridge_core::task_store::TaskRecordStatus::Working
         || record.workflow_spec_json.as_deref() != Some(encode_workflow_run_spec(spec)?.as_str())
