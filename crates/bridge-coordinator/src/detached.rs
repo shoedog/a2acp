@@ -3968,6 +3968,52 @@ pub fn spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
     )
 }
 
+// Fresh candidate composition consumes the already admitted primary-store
+// authority. It does not mint identity, bind chains, or reserve optional history.
+async fn validate_fresh_candidates(
+    deps: &DetachedDeps,
+    task: &TaskId,
+    authority: &bridge_workflow::admission::AdmittedWorkflowRunV1,
+    accounting: Option<&WorkflowAccountingInvocationV1>,
+) -> Result<(), BridgeError> {
+    let spec = &authority.run_spec;
+    let invocation = accounting.ok_or(BridgeError::InvalidStateTransition)?;
+    let locator = deps
+        .task_store
+        .get_attempt_locator(task)
+        .await?
+        .ok_or(BridgeError::InvalidStateTransition)?;
+    let record = deps
+        .task_store
+        .get(task)
+        .await?
+        .ok_or(BridgeError::InvalidStateTransition)?;
+    let node = spec
+        .graph
+        .nodes
+        .first()
+        .ok_or(BridgeError::InvalidStateTransition)?;
+    // Selection mints no reservation or provider authority. Inspect the owner
+    // without preparing a candidate; the existing executor owns preparation.
+    let selection = invocation.select(&node.id, &node.agent, "node", &Default::default())?;
+    let selected = selection.selection();
+    if locator.identity != selected.owner
+        || locator.identity.ordinal != 0
+        || locator.identity.parent_attempt_id.is_some()
+        || locator.identity.execution_id.as_str() != task.as_str()
+        || locator.identity.attempt_id != spec.attempt_id
+        || selected.attribution.workflow.as_deref() != Some(spec.graph.id.as_str())
+        || record.workflow != spec.graph.id.as_str()
+        || record.status != bridge_core::task_store::TaskRecordStatus::Working
+        || record.workflow_spec_json.as_deref() != Some(encode_workflow_run_spec(spec)?.as_str())
+        || spec.ledger_admission
+            != bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+    {
+        return Err(BridgeError::InvalidStateTransition);
+    }
+    Ok(())
+}
+
 // This reconstructs retained checked evidence, rather than diagnosing a new
 // provider failure. The executor verifies exact equality with the rejection
 // returned by FrozenFallbackInvocationV1::restore before retaining this error.
@@ -4158,8 +4204,8 @@ pub fn spawn_detached_workflow_accounted(
             Some(barrier) => diagnostic_context.with_policy_trigger_barrier(barrier),
             None => diagnostic_context,
         };
-        // Only recovery supplies structured seeds. Fresh served admission never
-        // enters this composition, and completed-only recovery needs no fallback.
+        // Structured seeds retain the checked recovery composition. Fresh
+        // admitted chains use the same candidate executor without recovery seeds.
         let restore_candidates = authority.as_ref().is_some_and(|authority| {
             structured_seed.as_ref().is_some_and(|seed| {
                 authority
@@ -4169,8 +4215,44 @@ pub fn spawn_detached_workflow_accounted(
                     .is_some_and(|chains| chains.keys().any(|node| !seed.nodes.contains_key(node)))
             })
         });
+        let fresh_candidates = structured_seed.is_none()
+            && authority.as_ref().is_some_and(|authority| {
+                authority
+                    .run_spec
+                    .fallback_chains
+                    .as_ref()
+                    .is_some_and(|chains| !chains.is_empty())
+            });
         let mut authority = authority;
-        let executor = if restore_candidates {
+        let executor = if fresh_candidates {
+            match validate_fresh_candidates(
+                &deps,
+                &task,
+                authority.as_ref().unwrap(),
+                accounting.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => executor,
+                Err(error) => {
+                    let _ = finalize_detached_with_barrier(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Interrupted,
+                        None,
+                        Some(&format!("fresh candidate composition refused: {error:?}")),
+                        Some(&hub),
+                        terminal_barrier.as_ref(),
+                        "not_needed",
+                    )
+                    .await;
+                    fin.done = true;
+                    deps.workflow_cancels.lock().await.remove(&task);
+                    return false;
+                }
+            }
+        } else if restore_candidates {
             let restored = async {
                 let invocation = accounting
                     .as_ref()
