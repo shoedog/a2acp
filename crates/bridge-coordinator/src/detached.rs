@@ -3968,6 +3968,15 @@ pub fn spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
     )
 }
 
+// This reconstructs retained checked evidence, rather than diagnosing a new
+// provider failure. The executor verifies exact equality with the rejection
+// returned by FrozenFallbackInvocationV1::restore before retaining this error.
+fn rehydrate_checked_candidate_rejection(
+    diagnostic: &bridge_core::diagnostics::FailureDiagnostic,
+) -> BridgeError {
+    BridgeError::agent_failure(diagnostic.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Explicit invocation ownership, independent of optional history and observers.
 /// Compatibility entry points above intentionally pass no accounting service.
@@ -4148,6 +4157,75 @@ pub fn spawn_detached_workflow_accounted(
         let diagnostic_context = match policy_trigger_barrier {
             Some(barrier) => diagnostic_context.with_policy_trigger_barrier(barrier),
             None => diagnostic_context,
+        };
+        // Only recovery supplies structured seeds. Fresh served admission never
+        // enters this composition, and completed-only recovery needs no fallback.
+        let restore_candidates = authority.as_ref().is_some_and(|authority| {
+            structured_seed.as_ref().is_some_and(|seed| {
+                authority
+                    .run_spec
+                    .fallback_chains
+                    .as_ref()
+                    .is_some_and(|chains| chains.keys().any(|node| !seed.nodes.contains_key(node)))
+            })
+        });
+        let mut authority = authority;
+        let executor = if restore_candidates {
+            let restored = async {
+                let invocation = accounting
+                    .as_ref()
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+                let admission = deps
+                    .workflow_admission
+                    .clone()
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+                let admitted = authority
+                    .as_mut()
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+                let locator = deps
+                    .task_store
+                    .get_attempt_locator(&task)
+                    .await?
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+                // Change only the invocation owner after the consumer's atomic
+                // lineage claim. Retain controls, identities, chains and scope.
+                Arc::make_mut(&mut admitted.run_spec).attempt_id = locator.identity.attempt_id;
+                executor
+                    .with_restored_fallback_v1(
+                        admission,
+                        admitted.clone(),
+                        deps.task_store.clone(),
+                        task.clone(),
+                        invocation,
+                        rehydrate_checked_candidate_rejection,
+                    )
+                    .await
+            }
+            .await;
+            match restored {
+                Ok(executor) => Arc::new(executor),
+                Err(error) => {
+                    let _ = finalize_detached_with_barrier(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Interrupted,
+                        None,
+                        Some(&format!(
+                            "not resumable: restored candidate composition refused: {error:?}"
+                        )),
+                        Some(&hub),
+                        terminal_barrier.as_ref(),
+                        "not_needed",
+                    )
+                    .await;
+                    fin.done = true;
+                    deps.workflow_cancels.lock().await.remove(&task);
+                    return false;
+                }
+            }
+        } else {
+            executor
         };
         let diagnostic_context = match authority {
             Some(authority) => match diagnostic_context.with_admitted_workflow_run(authority) {
@@ -4978,8 +5056,8 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
     safe_to_interrupt
 }
 
-/// Completed nodes may seed ordinary recovery. No classification grants a
-/// Preparing CAS; every unfinished chained node remains refused.
+/// Checked completions seed recovery; checked continuations still require resumed
+/// ownership, live revalidation and an exclusive Preparing CAS before effects.
 #[derive(Debug)]
 enum WorkflowCandidateRecovery {
     Completed,
@@ -5134,9 +5212,9 @@ async fn classify_workflow_candidates(
     }
 }
 
-/// Only completed-only candidate graphs may enter ordinary seeded recovery.
-/// Return the validated seed itself; do not re-harvest or republish its nodes.
-pub(crate) async fn load_completed_candidate_seed(
+/// Return checked seeds for completed and settled-successor recovery. Classification
+/// grants no preparation permission; the accounted runner composes the restored seam.
+pub(crate) async fn load_candidate_resume_seed(
     deps: &DetachedDeps,
     task: &TaskId,
     run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
@@ -5147,15 +5225,9 @@ pub(crate) async fn load_completed_candidate_seed(
         Option<bridge_core::orch::UsageSnapshot>,
     )],
 ) -> Result<StructuredWorkflowSeedV1, &'static str> {
-    match classify_workflow_candidates(deps, task, run_spec, checkpoints).await? {
-        (WorkflowCandidateRecovery::Completed, seed) => Ok(seed),
-        (WorkflowCandidateRecovery::Continuation, _) => {
-            Err("not resumable: workflow candidate recovery is not activated (continuation)")
-        }
-        (WorkflowCandidateRecovery::Mixed, _) => {
-            Err("not resumable: workflow candidate recovery is not activated (mixed)")
-        }
-    }
+    classify_workflow_candidates(deps, task, run_spec, checkpoints)
+        .await
+        .map(|(_, seed)| seed)
 }
 
 /// Validate the same V2 checkpoint evidence for detached and batch recovery.
@@ -5369,7 +5441,7 @@ pub async fn resume_one_working_task_with_accounting(
             .as_ref()
             .filter(|spec| spec.fallback_chains.is_some())
         {
-            Some(spec) => load_completed_candidate_seed(deps, &task, spec, &cps).await,
+            Some(spec) => load_candidate_resume_seed(deps, &task, spec, &cps).await,
             None => load_structured_resume_seed(deps, &task, &cps).await,
         };
         match checked {

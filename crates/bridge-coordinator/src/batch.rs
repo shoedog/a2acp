@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
     decode_workflow_spec, encode_workflow_run_spec, encode_workflow_spec, finalize_detached,
-    finalize_detached_with_barrier, load_completed_candidate_seed, load_structured_resume_seed,
+    finalize_detached_with_barrier, load_candidate_resume_seed, load_structured_resume_seed,
     spawn_detached_workflow_accounted, workflow_prompt_dispatch_barrier_with_state,
     workflow_terminal_summary_barrier, AttemptTelemetryState, TaskProgressHub,
 };
@@ -487,7 +487,7 @@ async fn resumed_child_future(
             .as_ref()
             .filter(|spec| spec.fallback_chains.is_some())
         {
-            Some(spec) => load_completed_candidate_seed(&deps.detached, &task, spec, &cps).await,
+            Some(spec) => load_candidate_resume_seed(&deps.detached, &task, spec, &cps).await,
             None => load_structured_resume_seed(&deps.detached, &task, &cps).await,
         };
         match checked {

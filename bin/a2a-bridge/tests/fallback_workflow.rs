@@ -17,6 +17,7 @@ struct Calls {
     setup_errors: Mutex<Vec<BridgeError>>,
     cleanup_results: Mutex<Vec<Result<BackendCleanupDispositionV1>>>,
     prompt_error: Mutex<Option<BridgeError>>,
+    prompt_answer: Mutex<Option<&'static str>>,
     resolution_cancel: Mutex<Option<CancellationToken>>,
     entry_check: Mutex<Option<Box<dyn Fn() + Send>>>,
     canceled: Mutex<Vec<SessionId>>,
@@ -145,6 +146,14 @@ impl AgentBackend for BoundFixture {
         parts: Vec<Part>,
         obs: BackendObservers,
     ) -> Result<BackendStream> {
+        if let Some(answer) = *self.1.prompt_answer.lock().unwrap() {
+            self.0.prompts.fetch_add(1, Ordering::SeqCst);
+            self.0.inputs.lock().unwrap().push(parts);
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(Update::FinalAnswer(answer.into())),
+                Ok(Update::done("end_turn")),
+            ])));
+        }
         if let Some(error) = self.1.prompt_error.lock().unwrap().take() {
             self.0.prompts.fetch_add(1, Ordering::SeqCst);
             return Err(error);
@@ -170,6 +179,16 @@ impl AgentBackend for BoundFixture {
                 sink.record(bridge_core::orch::OrchEventKind::Progress {
                     progress: bridge_core::orch::ProgressPayload::legacy("fixture observation"),
                 });
+            }
+            if self.0.behavior == "parity-recovery" {
+                obs.diagnostic
+                    .record(
+                        serde_json::from_value(serde_json::json!({
+                            "transition": {"phase":"prompt_start", "status":"started", "at_ms":1, "code":"fixture.recovery"}
+                        }))
+                        .unwrap(),
+                    )
+                    .await?;
             }
             let usage = Ok(Update::Usage(bridge_core::orch::UsageSnapshot {
                 used: Some(7),
@@ -1548,7 +1567,8 @@ async fn recovery_candidate_fixture_target(
     }
     let mut initial = h.admission("source").await;
     if case == "checkpoint-dependencies"
-        || case == "completed-dependent"
+        || case.starts_with("completed-dependent")
+        || case == "continuation-dependent"
         || case.starts_with("mixed")
     {
         let mut graph = initial.run_spec.graph.clone();
@@ -1559,13 +1579,20 @@ async fn recovery_candidate_fixture_target(
         } else {
             upstream.id = NodeId::parse("after").unwrap();
             upstream.inputs = vec![graph.nodes[0].id.clone()];
-            if case == "completed-dependent" {
-                upstream.agent = AgentId::parse("target").unwrap();
+            if case.starts_with("completed-dependent") || case == "continuation-dependent" {
+                upstream.agent = AgentId::parse(if case == "continuation-dependent" {
+                    "other"
+                } else {
+                    "target"
+                })
+                .unwrap();
                 upstream.prompt_template = "{{node}}\n{{workflow.costs}}".into();
                 // A seeded node must never be harvested again, even if its frozen
                 // policy requires attestation that a new provider did not supply.
-                graph.nodes[0].harvest_sanitization =
-                    Some(bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1);
+                if case.starts_with("completed") {
+                    graph.nodes[0].harvest_sanitization =
+                        Some(bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1);
+                }
             }
         }
         graph.nodes.push(upstream);
@@ -1712,7 +1739,7 @@ async fn recovery_candidate_fixture_target(
             },
             cause: None,
             prompt_may_have_been_accepted: true,
-            degraded_ancestry: false,
+            degraded_ancestry: case == "completed-dependent-degraded",
             policy_trigger_id: None,
         };
         h.f.store
@@ -2049,7 +2076,9 @@ async fn completed_recovery_deps(
                     surface: ExecutionSurface::ServedTask,
                     policy: "r2f0a".into(),
                     workload_fingerprint: admitted.run_spec.workload_fingerprint.clone(),
-                    started_ms: 1,
+                    started_ms: bridge_coordinator::clock::Clock::now_ms(
+                        &bridge_coordinator::clock::SystemClock,
+                    ),
                     workload_fingerprint_complete: true,
                     prompt_acceptance: "not_dispatched".into(),
                     pinned: false,
@@ -2084,6 +2113,23 @@ async fn consume_completed_recovery(
     deps: &bridge_coordinator::detached::DetachedDeps,
     batch: bool,
 ) -> TaskRecord {
+    consume_recovery_runtime(
+        h,
+        deps,
+        batch,
+        bridge_coordinator::batch::BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+        Some(AccountingV1::new(h.f.store.clone())),
+    )
+    .await
+}
+
+async fn consume_recovery_runtime(
+    h: &CandidateFixture,
+    deps: &bridge_coordinator::detached::DetachedDeps,
+    batch: bool,
+    runtime: bridge_coordinator::batch::BatchRuntime,
+    accounting: Option<AccountingV1>,
+) -> TaskRecord {
     use bridge_coordinator::{batch::*, detached::*};
     let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
     if !batch {
@@ -2096,36 +2142,33 @@ async fn consume_completed_recovery(
         .await
         .unwrap();
     h.f.store
-        .interrupt_active_excluding(4, &excluded)
+        .interrupt_active_excluding(deps.clock.now_ms(), &excluded)
         .await
         .unwrap();
     if batch {
         resume_batches_with_accounting(
             &BatchDeps {
                 detached: deps.clone(),
-                runtime: BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+                runtime,
                 allowed_cwd_root: None,
             },
             3,
-            Some(AccountingV1::new(h.f.store.clone())),
+            accounting,
         )
         .await;
     } else {
         let record = deps.task_store.get(&task).await.unwrap().unwrap();
         if record.status == TaskRecordStatus::Working {
-            resume_one_working_task_with_accounting(
-                deps,
-                &record,
-                3,
-                Some(AccountingV1::new(h.f.store.clone())),
-            )
-            .await;
+            resume_one_working_task_with_accounting(deps, &record, 3, accounting).await;
         }
     }
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let record = deps.task_store.get(&task).await.unwrap().unwrap();
-            if record.status != TaskRecordStatus::Working {
+            if record.status != TaskRecordStatus::Working
+                && deps.workflow_cancels.lock().await.is_empty()
+                && deps.progress_hubs.lock().await.is_empty()
+            {
                 return record;
             }
             tokio::task::yield_now().await;
@@ -2296,12 +2339,9 @@ async fn workflow_completed_recovery_refuses_unreadable_completion() {
 }
 
 #[tokio::test]
-async fn workflow_completed_recovery_mixed_refuses_without_effects() {
+async fn workflow_completed_recovery_mixed_conflict_refuses_without_effects() {
     check_candidate_recovery_cases(
-        &[
-            ("mixed", "(mixed)"),
-            ("mixed-conflict", "candidate checked evidence unavailable"),
-        ],
+        &[("mixed-conflict", "candidate checked evidence unavailable")],
         false,
     )
     .await;
@@ -2465,8 +2505,8 @@ async fn check_candidate_recovery_cases(cases: &[(&str, &str)], persistence_fail
 }
 
 #[tokio::test]
-async fn workflow_checked_recovery_refuses_continuation() {
-    check_candidate_recovery_cases(&[("continuation", "(continuation)")], false).await;
+async fn workflow_checked_recovery_continues_settled_successor() {
+    workflow_continuation_success("continuation").await;
 }
 
 #[tokio::test]
@@ -2567,7 +2607,7 @@ async fn workflow_checked_recovery_validates_terminal_checkpoints_before_shortcu
 
 #[tokio::test]
 async fn workflow_checked_recovery_failed_interruption_stays_working() {
-    check_candidate_recovery_cases(&[("continuation", ""), ("mixed", "")], true).await;
+    check_candidate_recovery_cases(&[("prepared", ""), ("mixed-conflict", "")], true).await;
 }
 
 #[tokio::test]
@@ -5526,7 +5566,764 @@ async fn joint_startup_recovers_ordinary_terminal_checkpoint() {
     joint_startup_checkpoint_recovery(false).await;
 }
 
-// C2c2d4: executor composition only; public recovery still refuses these snapshots.
+// C2c2d6: production recovery consumers, with a reopened checked store.
+async fn workflow_continuation_success(case: &str) {
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture(case).await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        *h.calls[3].prompt_answer.lock().unwrap() = Some("answer");
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let node = NodeId::parse(if case == "mixed" { "after" } else { "node" }).unwrap();
+        let prior =
+            h.f.store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+        let rows = h.f.rows();
+        let seed_receipt = (case == "mixed").then(|| joint_receipt(&h));
+        if case == "continuation-dependent" {
+            let path = h.f.dir.path().join("tasks.sqlite");
+            *h.calls[3].entry_check.lock().unwrap() = Some(Box::new(move || {
+                let db = rusqlite::Connection::open(&path).unwrap();
+                let terminal: String = db
+                    .query_row(
+                        "SELECT terminal_json FROM task_node_checkpoints WHERE node_id='node'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    NodeTerminalV1::decode_canonical(terminal.as_bytes())
+                        .unwrap()
+                        .primary,
+                    NodePrimaryDispositionV1::Completed
+                );
+                let count: i64 = db
+                    .query_row(
+                        "SELECT COUNT(*) FROM task_journal WHERE event_json LIKE '%node_finished%'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "candidate publication must precede dependent preparation"
+                );
+            }));
+        }
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Completed,
+            "batch={batch}/{case}: {:?}",
+            record.error
+        );
+        assert_eq!(record.result.as_deref(), Some("answer"));
+        assert_eq!(record.resume_attempts, 1);
+        let progress =
+            h.f.store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(progress.visits.len(), 2);
+        assert_eq!(progress.visits[0], prior.visits[0]);
+        assert_eq!(progress.terminal.as_ref().unwrap().output, "answer");
+        assert_eq!(h.calls[1].setups.load(Ordering::SeqCst), 1);
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.calls[0].setups.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[2].prompts.load(Ordering::SeqCst), 0);
+        let after = h.f.rows();
+        assert!(after.iter().all(|row| row.finalized));
+        for row in &rows {
+            assert_eq!(after.iter().find(|now| now.id == row.id), Some(row));
+        }
+        assert_eq!(
+            after.len(),
+            rows.len()
+                + if case == "continuation-dependent" {
+                    2
+                } else {
+                    1
+                }
+        );
+        if let Some(before) = seed_receipt {
+            assert_eq!(joint_receipt(&h), before);
+        }
+        let owner = deps
+            .task_store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .identity;
+        assert_eq!(progress.visits[1].owner, owner);
+        use bridge_core::workflow_history::WorkflowHistoryStore;
+        let history =
+            h.f.store
+                .attempt(&owner.attempt_id)
+                .await
+                .unwrap()
+                .and_then(|row| row.terminal);
+        if let Some(history) = history {
+            assert_eq!(history.outcome, "completed");
+            assert_eq!(history.prompt_acceptance, "dispatch_uncertain");
+            assert_eq!(history.cleanup_disposition, "complete");
+        } else {
+            let marker = deps
+                .task_store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .telemetry_unavailable;
+            assert!(marker.is_some());
+        }
+        let checkpoints = deps.task_store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            if case == "continuation" { 1 } else { 2 }
+        );
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        let completions: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM task_journal WHERE event_json LIKE '%node_finished%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(completions as usize, checkpoints.len());
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_mixed_seeds_completed_and_runs_successor() {
+    workflow_continuation_success("mixed").await;
+}
+
+#[tokio::test]
+async fn workflow_continuation_publishes_before_dependent() {
+    workflow_continuation_success("continuation-dependent").await;
+}
+
+// The observer is synchronous at NodeStarted, before Preparing permission. It
+// exercises the public cancellation registry without a scheduler timing race.
+struct RecoveryStartHook(Mutex<Option<Box<dyn Fn() + Send>>>);
+impl Observer for RecoveryStartHook {
+    fn record(&self, event: &ObsEvent<'_>) {
+        if matches!(event, ObsEvent::NodeStarted { .. }) {
+            if let Some(hook) = self.0.lock().unwrap().take() {
+                hook();
+            }
+        }
+    }
+}
+
+async fn workflow_recovery_cancellation(phase: &str, ordinary: bool) {
+    for batch in [false, true] {
+        let (h, admitted) = if ordinary {
+            let h = CandidateFixture::new("parity-cancel", "parity-cancel").await;
+            h.f.store.ensure_usage_coverage_v1().await.unwrap();
+            let admitted = h.admission("target").await;
+            (h, admitted)
+        } else {
+            recovery_candidate_fixture_target("continuation", "parity-cancel").await
+        };
+        let h = h.reopen_recovery();
+        let mut deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let cancels = deps.workflow_cancels.clone();
+        let cancel_task = task.clone();
+        let cancel = move || {
+            cancels
+                .try_lock()
+                .unwrap()
+                .get(&cancel_task)
+                .unwrap()
+                .cancel()
+        };
+        match phase {
+            "before-permission" => {
+                deps.observer = Arc::new(RecoveryStartHook(Mutex::new(Some(Box::new(cancel)))))
+            }
+            "before-prompt" => *h.calls[1].entry_check.lock().unwrap() = Some(Box::new(cancel)),
+            _ => {}
+        }
+        let runtime = bridge_coordinator::batch::BatchRuntime::new(
+            1,
+            1,
+            Arc::new(bridge_observ::NoopObserver),
+        );
+        let drive = consume_recovery_runtime(
+            &h,
+            &deps,
+            batch,
+            runtime.clone(),
+            Some(AccountingV1::new(h.f.store.clone())),
+        );
+        let cancel_after_prompt = async {
+            if phase == "after-prompt" {
+                h.f.providers[1].configure.0.notified().await;
+                // Batch cancellation must reach its resumed child, which owns
+                // the shared permit just as an ordinary resumed child does.
+                if batch {
+                    runtime
+                        .batch_cancels
+                        .lock()
+                        .await
+                        .get(&BatchId::parse("batch-fixture").unwrap())
+                        .unwrap()
+                        .cancel();
+                } else {
+                    deps.workflow_cancels
+                        .lock()
+                        .await
+                        .get(&task)
+                        .unwrap()
+                        .cancel();
+                }
+            }
+        };
+        let (record, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(drive, cancel_after_prompt)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Canceled,
+            "batch={batch}/{phase}/ordinary={ordinary}: {:?}",
+            record.error
+        );
+        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            h.f.providers[1].prompts.load(Ordering::SeqCst),
+            usize::from(phase == "after-prompt")
+        );
+        assert_eq!(
+            h.calls[1].setups.load(Ordering::SeqCst),
+            usize::from(phase != "before-permission")
+        );
+        let rows = h.f.rows();
+        for row in rows.iter().filter(|row| row.attribution.agent == "target") {
+            // Accepted, interrupted prompts retain unknown final accounting,
+            // exactly as ordinary recovery does; unpolled reservations settle.
+            assert_eq!(row.finalized, phase != "after-prompt");
+            assert_eq!(row.dispatched, phase == "after-prompt");
+        }
+        if !ordinary {
+            // Cancellation publishes an ordinary failed checkpoint, so it is
+            // intentionally no longer a recoverable candidate snapshot.
+            let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+            let json: String = db
+                .query_row(
+                    "SELECT progress_json FROM task_candidate_progress_v1 WHERE node_id='node'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let p: CandidateProgressV1 = serde_json::from_str(&json).unwrap();
+            assert!(p.terminal.is_none());
+            assert_eq!(
+                p.visits.len(),
+                if phase == "before-permission" { 1 } else { 2 }
+            );
+        }
+        if phase != "before-permission" {
+            assert!(!h.calls[1].cleaned.lock().unwrap().is_empty());
+        }
+        if batch {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while runtime.semaphore.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_cancel_before_permission() {
+    workflow_recovery_cancellation("before-permission", false).await;
+}
+#[tokio::test]
+async fn workflow_continuation_cancel_before_prompt() {
+    workflow_recovery_cancellation("before-prompt", false).await;
+}
+#[tokio::test]
+async fn workflow_continuation_cancel_after_accepted_prompt() {
+    workflow_recovery_cancellation("after-prompt", false).await;
+}
+#[tokio::test]
+async fn workflow_continuation_ordinary_cancellation_controls() {
+    for phase in ["before-permission", "before-prompt", "after-prompt"] {
+        workflow_recovery_cancellation(phase, true).await;
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_scope_drift_before_permission() {
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture("continuation").await;
+        let h = h.reopen_recovery();
+        let mut deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let scope = h.f.dir.path().join("scope");
+        let old = h.f.dir.path().join("old-scope");
+        deps.observer = Arc::new(RecoveryStartHook(Mutex::new(Some(Box::new(move || {
+            std::fs::rename(&scope, &old).unwrap();
+            std::fs::create_dir(&scope).unwrap();
+        })))));
+        let rows = h.f.rows();
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Failed,
+            "{:?}",
+            record.error
+        );
+        assert_eq!(record.resume_attempts, 1);
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+        assert_eq!(h.f.rows(), rows);
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_requires_accounting_owner() {
+    for batch in [false, true] {
+        let (h, admitted) = recovery_candidate_fixture("continuation").await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let record = consume_recovery_runtime(
+            &h,
+            &deps,
+            batch,
+            bridge_coordinator::batch::BatchRuntime::new(
+                1,
+                1,
+                Arc::new(bridge_observ::NoopObserver),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(record.status, TaskRecordStatus::Interrupted);
+        assert!(record
+            .error
+            .unwrap()
+            .contains("restored candidate composition refused"));
+        assert!(h.f.spawns.lock().unwrap().is_empty());
+        assert_eq!(h.f.rows().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_nondefault_policy_and_durable_observers() {
+    use bridge_core::workflow_history::WorkflowHistoryStore;
+    for batch in [false, true] {
+        for fails in [false, true] {
+            let (h, mut admitted) =
+                recovery_candidate_fixture_target("continuation", "parity-recovery").await;
+            let spec = Arc::make_mut(&mut admitted.run_spec);
+            spec.ledger_admission = LedgerAdmissionV1::DurablePrimaryTaskStore;
+            spec.controls.fan_out = FanOutPolicyV1::FailFast;
+            spec.controls.synthesis = SynthesisModeV1::Strict;
+            spec.graph.controls.as_mut().unwrap().fan_out = Some(FanOutPolicyV1::FailFast);
+            spec.graph.controls.as_mut().unwrap().synthesis = Some(SynthesisModeV1::Strict);
+            admitted.run_spec = Arc::new(
+                bridge_workflow::run_spec::WorkflowRunSpecV1::build(
+                    spec.attempt_id.clone(),
+                    spec.graph.clone(),
+                    spec.controls.clone(),
+                    spec.requested_session_cwd.clone(),
+                    spec.node_execution_identities.clone(),
+                    spec.ledger_admission.clone(),
+                )
+                .unwrap()
+                .with_fallback_chains(spec.fallback_chains.clone().unwrap())
+                .unwrap(),
+            );
+            if fails {
+                *h.calls[1].prompt_error.lock().unwrap() = Some(BridgeError::PermissionDenied);
+            }
+            let h = h.reopen_recovery();
+            let deps = completed_recovery_deps(&h, &admitted, batch).await;
+            let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+            let record = consume_completed_recovery(&h, &deps, batch).await;
+            assert_eq!(
+                record.status,
+                if fails {
+                    TaskRecordStatus::Failed
+                } else {
+                    TaskRecordStatus::Completed
+                },
+                "{:?}",
+                record.error
+            );
+            assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+            let task_evidence = deps.task_store.workflow_task_evidence(&task).await.unwrap();
+            assert_eq!(task_evidence.policy_trigger_json.is_some(), fails);
+            if let Some(encoded) = task_evidence.policy_trigger_json {
+                let trigger = PolicyTriggerV1::decode_canonical(encoded.as_bytes()).unwrap();
+                assert_eq!(trigger.policy, FanOutPolicyNameV1::FailFast);
+            }
+            let owner = deps
+                .task_store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .identity;
+            let terminal =
+                h.f.store
+                    .attempt(&owner.attempt_id)
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.terminal);
+            if let Some(terminal) = terminal {
+                assert_eq!(terminal.prompt_acceptance, "dispatch_uncertain");
+            } else {
+                assert!(deps
+                    .task_store
+                    .get_attempt_locator(&task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .telemetry_unavailable
+                    .is_some());
+            }
+            let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+            let events: Vec<String> = db
+                .prepare("SELECT event_json FROM task_journal ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(
+                events.iter().any(|e| e.contains("fixture observation")),
+                !fails
+            );
+            assert_eq!(
+                events.iter().any(|e| e.contains("fixture.recovery")),
+                !fails
+            );
+            for row in
+                h.f.rows()
+                    .iter()
+                    .filter(|row| row.attribution.agent == "target")
+            {
+                assert_eq!(row.finalized, !fails);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_history_barrier_controls() {
+    use bridge_core::workflow_history::LedgerUnavailableReason as R;
+    for batch in [false, true] {
+        for ordinary in [false, true] {
+            for barrier in ["collision", "unavailable", "prompt"] {
+                let collision = barrier == "collision";
+                let (h, admitted) = if ordinary {
+                    let h = CandidateFixture::new("success", "success").await;
+                    let admitted = h.admission("target").await;
+                    (h, admitted)
+                } else {
+                    recovery_candidate_fixture("continuation").await
+                };
+                let h = h.reopen_recovery();
+                let mut deps = completed_recovery_deps(&h, &admitted, batch).await;
+                if collision {
+                    deps.workflow_history = Some(Err(R::Collision));
+                } else if barrier == "unavailable" {
+                    deps.workflow_history = Some(Err(R::Io));
+                } else {
+                    deps.workflow_history = Some(Ok(Arc::new(recovery_history::PromptFailure(
+                        h.f.store.clone(),
+                    ))));
+                }
+                let record = consume_completed_recovery(&h, &deps, batch).await;
+                assert_eq!(
+                    record.status,
+                    if collision {
+                        TaskRecordStatus::Interrupted
+                    } else {
+                        TaskRecordStatus::Completed
+                    },
+                    "{:?}",
+                    record.error
+                );
+                assert_eq!(
+                    h.f.providers[1].prompts.load(Ordering::SeqCst),
+                    usize::from(!collision)
+                );
+                let locator = deps
+                    .task_store
+                    .get_attempt_locator(&record.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    locator.telemetry_unavailable,
+                    Some(if collision {
+                        R::Collision
+                    } else if batch && barrier == "prompt" {
+                        R::UnsupportedConfiguration
+                    } else {
+                        R::Io
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_completed_recovery_degraded_ancestry_reaches_dependent() {
+    for batch in [false, true] {
+        for degraded in [false, true] {
+            let (h, admitted) = recovery_candidate_fixture(if degraded {
+                "completed-dependent-degraded"
+            } else {
+                "completed-dependent"
+            })
+            .await;
+            let h = h.reopen_recovery();
+            let deps = completed_recovery_deps(&h, &admitted, batch).await;
+            let before = joint_receipt(&h);
+            let record = consume_completed_recovery(&h, &deps, batch).await;
+            assert_eq!(
+                record.status,
+                TaskRecordStatus::Completed,
+                "{:?}",
+                record.error
+            );
+            assert_eq!(joint_receipt(&h), before);
+            let evidence = deps
+                .task_store
+                .node_terminal_evidence(&record.id)
+                .await
+                .unwrap();
+            let after = evidence
+                .iter()
+                .find(|e| e.node.as_str() == "after")
+                .unwrap();
+            let terminal =
+                NodeTerminalV1::decode_canonical(after.terminal_json.as_bytes()).unwrap();
+            assert_eq!(terminal.primary, NodePrimaryDispositionV1::Completed);
+            assert_eq!(terminal.degraded_ancestry, degraded);
+            assert_eq!(
+                deps.task_store
+                    .workflow_task_evidence(&record.id)
+                    .await
+                    .unwrap()
+                    .workflow_outcome,
+                Some(if degraded {
+                    WorkflowDurableOutcomeV1::CompletedDegraded
+                } else {
+                    WorkflowDurableOutcomeV1::Completed
+                })
+            );
+            assert_eq!(*h.f.spawns.lock().unwrap(), ["target"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_governed_and_authority_refusals() {
+    use bridge_core::governance::*;
+    for batch in [false, true] {
+        for drift in [false, true] {
+            let (h, admitted) = recovery_candidate_fixture("continuation").await;
+            let h = h.reopen_recovery();
+            let deps = completed_recovery_deps(&h, &admitted, batch).await;
+            let rows = h.f.rows();
+            let mut service = AccountingV1::new(h.f.store.clone());
+            if drift {
+                let mut snapshot = h.f.snapshot();
+                snapshot.entries[1].args.push("target-drift".into());
+                h.registry.apply(snapshot).await.unwrap();
+            } else {
+                service.budget_policy = Some(Arc::new(
+                    BudgetPolicyV1::new(
+                        vec![BudgetRuleV1 {
+                            id: "recovery-cap".into(),
+                            selector: BudgetSelectorV1::EachRequest,
+                            limits: BudgetLimitsV1 {
+                                turns: Some(10),
+                                terminal_tokens: None,
+                            },
+                        }],
+                        vec![],
+                    )
+                    .unwrap(),
+                ));
+            }
+            let record = consume_recovery_runtime(
+                &h,
+                &deps,
+                batch,
+                bridge_coordinator::batch::BatchRuntime::new(
+                    1,
+                    1,
+                    Arc::new(bridge_observ::NoopObserver),
+                ),
+                Some(service),
+            )
+            .await;
+            assert!(
+                matches!(
+                    record.status,
+                    TaskRecordStatus::Interrupted | TaskRecordStatus::Failed
+                ),
+                "{:?}",
+                record.error
+            );
+            if !drift {
+                assert!(record
+                    .error
+                    .unwrap()
+                    .contains("governed restored fallback is unsupported"));
+            }
+            assert_eq!(h.f.rows(), rows);
+            assert!(h.f.spawns.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_durable_delivery_failures_block_dependents() {
+    for fault in ["diagnostic", "publication"] {
+        continuation_delivery_failure(fault).await;
+    }
+}
+
+#[tokio::test]
+async fn workflow_continuation_rich_flush_failure_blocks_dependents() {
+    continuation_delivery_failure("rich").await;
+}
+
+async fn continuation_delivery_failure(fault: &str) {
+    let mut missing_prompts = Vec::new();
+    for batch in [false, true] {
+        let (h, admitted) =
+            recovery_candidate_fixture_target("continuation-dependent", "parity-recovery").await;
+        let h = h.reopen_recovery();
+        let deps = completed_recovery_deps(&h, &admitted, batch).await;
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        db.execute_batch(if fault == "diagnostic" {
+            "CREATE TRIGGER fail_delivery BEFORE INSERT ON task_journal WHEN json_extract(NEW.event_json,'$.diagnostic.transition.code')='fixture.recovery' BEGIN SELECT RAISE(ABORT,'diagnostic fault'); END;"
+        } else if fault == "rich" {
+            "CREATE TRIGGER fail_delivery BEFORE INSERT ON task_journal WHEN json_extract(NEW.event_json,'$.text')='fixture observation' BEGIN SELECT RAISE(ABORT,'rich flush fault'); END;"
+        } else {
+            "CREATE TRIGGER fail_delivery BEFORE INSERT ON task_journal WHEN json_extract(NEW.event_json,'$.terminal_json') IS NOT NULL BEGIN SELECT RAISE(ABORT,'publication fault'); END;"
+        }).unwrap();
+        let record = consume_completed_recovery(&h, &deps, batch).await;
+        if h.f.providers[1].prompts.load(Ordering::SeqCst) != 1 {
+            missing_prompts.push(batch);
+            continue;
+        }
+        if fault == "rich" {
+            assert_eq!(h.calls[1].cleaned.lock().unwrap().len(), 1);
+            assert!(
+                h.f.rows()
+                    .iter()
+                    .find(|row| row.attribution.agent == "target")
+                    .unwrap()
+                    .finalized
+            );
+        }
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Failed,
+            "{fault}: {:?}",
+            record.error
+        );
+        assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(h.calls[3].setups.load(Ordering::SeqCst), 0);
+        let unpublished: bool = db.query_row("SELECT json_extract(progress_json,'$.terminal') IS NULL FROM task_candidate_progress_v1 WHERE node_id='node'", [], |r| r.get(0)).unwrap();
+        assert!(unpublished);
+        assert!(deps
+            .task_store
+            .node_checkpoints(&record.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, _, ok, _)| !ok));
+    }
+    assert!(
+        missing_prompts.is_empty(),
+        "B prompt not reached for batch={missing_prompts:?}"
+    );
+}
+
+mod recovery_history {
+    use super::*;
+    use bridge_core::workflow_history::*;
+    pub struct PromptFailure(pub Arc<bridge_store::sqlite::SqliteStore>);
+    #[async_trait::async_trait]
+    impl WorkflowHistoryStore for PromptFailure {
+        async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+            self.0.reserve(row).await
+        }
+        async fn reserve_v2(&self, row: &AttemptReservationV2) -> Result<(), LedgerError> {
+            self.0.reserve_v2(row).await
+        }
+        async fn commit_node_terminal_v2(
+            &self,
+            id: &AttemptId,
+            node: &NodeId,
+            terminal: &str,
+            trigger: Option<&str>,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.0
+                .commit_node_terminal_v2(id, node, terminal, trigger)
+                .await
+        }
+        async fn structured_evidence_v2(
+            &self,
+            id: &AttemptId,
+        ) -> Result<Option<AttemptStructuredEvidenceV1>, LedgerError> {
+            self.0.structured_evidence_v2(id).await
+        }
+        async fn mark_prompt_acceptance(&self, _: &AttemptId, _: &str) -> Result<(), LedgerError> {
+            Err(LedgerError::new(LedgerUnavailableReason::Io))
+        }
+        async fn terminalize(
+            &self,
+            id: &AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.0.terminalize(id, terminal).await
+        }
+        async fn set_pinned(&self, _: &AttemptId, _: bool) -> Result<bool, LedgerError> {
+            unreachable!()
+        }
+        async fn interrupt_active(&self, _: i64) -> Result<u64, LedgerError> {
+            unreachable!()
+        }
+        async fn latest_reservation_for_task(
+            &self,
+            _: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            unreachable!()
+        }
+        async fn completed_between(
+            &self,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            unreachable!()
+        }
+    }
+}
+
+// C2c2d4: direct executor composition controls.
 async fn restored_owner(
     h: &CandidateFixture,
     source: &AdmittedWorkflowRunV1,
