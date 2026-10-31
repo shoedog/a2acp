@@ -2169,8 +2169,19 @@ async fn consume_recovery_runtime(
     runtime: bridge_coordinator::batch::BatchRuntime,
     accounting: Option<AccountingV1>,
 ) -> TaskRecord {
-    use bridge_coordinator::{batch::*, detached::*};
     let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    consume_recovery_task(h, deps, batch, runtime, accounting, &task).await
+}
+
+async fn consume_recovery_task(
+    h: &CandidateFixture,
+    deps: &bridge_coordinator::detached::DetachedDeps,
+    batch: bool,
+    runtime: bridge_coordinator::batch::BatchRuntime,
+    accounting: Option<AccountingV1>,
+    task: &TaskId,
+) -> TaskRecord {
+    use bridge_coordinator::{batch::*, detached::*};
     if !batch {
         assert!(reconcile_terminal_checkpoints(deps).await);
     }
@@ -2196,14 +2207,14 @@ async fn consume_recovery_runtime(
         )
         .await;
     } else {
-        let record = deps.task_store.get(&task).await.unwrap().unwrap();
+        let record = deps.task_store.get(task).await.unwrap().unwrap();
         if record.status == TaskRecordStatus::Working {
             resume_one_working_task_with_accounting(deps, &record, 3, accounting).await;
         }
     }
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let record = deps.task_store.get(&task).await.unwrap().unwrap();
+            let record = deps.task_store.get(task).await.unwrap().unwrap();
             if record.status != TaskRecordStatus::Working
                 && deps.workflow_cancels.lock().await.is_empty()
                 && deps.progress_hubs.lock().await.is_empty()
@@ -9349,6 +9360,47 @@ impl CandidateFixture {
     }
 }
 
+/// Every boundary handshake is bounded, and its failure names the boundary, so a
+/// regression fails instead of hanging CI.
+async fn boundary_wait<T>(
+    boundary: &str,
+    what: &str,
+    wait: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(15), wait)
+        .await
+        .unwrap_or_else(|_| panic!("{boundary}: timed out waiting for {what}"))
+}
+
+impl CandidateFixture {
+    /// Every session a provider holds is cleaned exactly once, and no other is.
+    fn assert_sessions_cleaned_once(&self, label: &str, held: impl Fn(usize) -> Vec<String>) {
+        for i in 0..self.f.providers.len() {
+            let mut cleaned: Vec<_> = self.calls[i]
+                .cleaned
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|session| session.as_str().to_owned())
+                .collect();
+            let mut held = held(i);
+            cleaned.sort();
+            held.sort();
+            assert_eq!(cleaned, held, "{label}: provider {i} session cleanup");
+        }
+    }
+
+    /// Cold contexts reserved for a provider's chain position by durable progress.
+    fn visit_sessions(&self, task: &TaskId, provider: usize) -> Vec<String> {
+        self.served_progress(task)
+            .iter()
+            .flat_map(|progress| &progress.visits)
+            .filter(|visit| visit.position == provider)
+            .map(|visit| visit.cold_context.as_str().to_owned())
+            .collect()
+    }
+}
+
 #[tokio::test]
 async fn served_chain_cancellation_boundaries() {
     for boundary in [
@@ -9392,18 +9444,26 @@ async fn served_chain_cancellation_boundaries() {
             "source-cleanup" => Some(&h.f.providers[0].cleanup),
             "target-first-poll" => Some(&first_poll_gate),
             "source-parked" => {
-                while h.f.providers[0].prompts.load(Ordering::SeqCst) == 0 {
-                    tokio::task::yield_now().await;
-                }
+                boundary_wait(boundary, "the parked source prompt", async {
+                    while h.f.providers[0].prompts.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
                 None
             }
             _ => None,
         };
         let configure = matches!(boundary, "target-resolve" | "target-setup");
         if configure {
-            h.f.providers[1].configure.0.notified().await;
+            boundary_wait(
+                boundary,
+                "the target configuration gate",
+                h.f.providers[1].configure.0.notified(),
+            )
+            .await;
         } else if let Some(gate) = gate {
-            gate.0.notified().await;
+            boundary_wait(boundary, "the boundary gate", gate.0.notified()).await;
         }
         assert!(coordinator.cancel_task(task.clone()).await.unwrap() || boundary == "latched");
         if configure {
@@ -9414,6 +9474,7 @@ async fn served_chain_cancellation_boundaries() {
         h.served_settled(&coordinator, &task).await;
         let record = h.served_terminal(&task).await;
         assert_eq!(record.status, TaskRecordStatus::Canceled, "{boundary}");
+        h.assert_sessions_cleaned_once(boundary, |i| h.visit_sessions(&task, i));
         // No cancellation boundary authorizes a later successor.
         for later in [2, 3] {
             assert_eq!(h.f.providers[later].setup.load(Ordering::SeqCst), 0);
@@ -9476,6 +9537,84 @@ async fn served_chain_cancellation_boundaries() {
                 "{boundary}: B was never polled"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn served_chain_cancel_and_cleanup_errors_keep_ordinary_precedence() {
+    use bridge_core::workflow_history::WorkflowHistoryStore;
+    for behavior in [
+        "parity-cancel-error",
+        "parity-cancel-cleanup-error",
+        "parity-open-cancel-error",
+        "parity-open-cancel-cleanup-error",
+    ] {
+        let mut shapes = vec![];
+        for chains in [false, true] {
+            let h = CandidateFixture::new(behavior, "final-only").await;
+            let coordinator = h.served_coordinator(chains, true).await;
+            let identity = AttemptIdentity::initial().unwrap();
+            let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+            let submitted = if chains {
+                coordinator
+                    .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+                    .await
+            } else {
+                coordinator
+                    .run_workflow_with_identity(served_params(false), identity.clone())
+                    .await
+            };
+            assert_eq!(submitted.unwrap().task_id, task);
+            boundary_wait(
+                behavior,
+                "the source cancellation gate",
+                h.f.providers[0].configure.0.notified(),
+            )
+            .await;
+            assert!(
+                coordinator.cancel_task(task.clone()).await.unwrap(),
+                "{behavior}"
+            );
+            h.served_settled(&coordinator, &task).await;
+            let record = h.served_terminal(&task).await;
+            assert_eq!(record.status, TaskRecordStatus::Canceled, "{behavior}");
+            h.assert_sessions_cleaned_once(behavior, |i| {
+                h.f.providers[i]
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|session| session.as_str().to_owned())
+                    .collect()
+            });
+            for provider in &h.f.providers[1..] {
+                assert_eq!(provider.setup.load(Ordering::SeqCst), 0, "{behavior}");
+                assert_eq!(provider.prompts.load(Ordering::SeqCst), 0, "{behavior}");
+            }
+            let terminal =
+                h.f.store
+                    .attempt(&identity.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .terminal
+                    .map(|t| (t.outcome, t.cleanup_disposition));
+            shapes.push((
+                record.status,
+                record.result,
+                record.error,
+                terminal,
+                h.usage_rows()
+                    .iter()
+                    .map(|r| (r.attribution.agent.clone(), r.dispatched, r.finalized))
+                    .collect::<Vec<_>>(),
+                h.f.providers[0].cancels.load(Ordering::SeqCst),
+            ));
+        }
+        assert_eq!(
+            shapes[0], shapes[1],
+            "{behavior}: chain-bearing route differs"
+        );
     }
 }
 
@@ -9607,17 +9746,35 @@ async fn served_chain_accounting_and_retries_match_local() {
     }
 }
 
+impl CandidateFixture {
+    /// The accounting store creates its own schema in a scratch database; callers
+    /// add only a fault trigger to the copy the run will lazily open.
+    async fn install_usage_schema(&self) {
+        let scratch = tempfile::tempdir().unwrap();
+        let schema =
+            bridge_store::sqlite::SqliteStore::open(&scratch.path().join("tasks.sqlite")).unwrap();
+        schema.ensure_usage_coverage_v1().await.unwrap();
+        drop(schema);
+        std::fs::copy(
+            scratch.path().join("tasks.sqlite.usage-v1.sqlite"),
+            self.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"),
+        )
+        .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn served_chain_persistence_and_cleanup_failures_never_authorize_a_successor() {
     for fault in ["reservation", "publication", "cleanup"] {
         let h = CandidateFixture::new("reject", "success").await;
         match fault {
-            "reservation" => rusqlite::Connection::open(
-                h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"),
-            )
-            .unwrap()
-            .execute_batch("CREATE TABLE usage_coverage_v1 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), started_ms INTEGER NOT NULL); CREATE TABLE usage_attempts_v1 (id TEXT PRIMARY KEY, record_json TEXT NOT NULL); CREATE TRIGGER fail_successor BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' BEGIN SELECT RAISE(ABORT,'reservation fault'); END;")
-            .unwrap(),
+            "reservation" => {
+                h.install_usage_schema().await;
+                rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                    .unwrap()
+                    .execute_batch("CREATE TRIGGER fail_successor BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' BEGIN SELECT RAISE(ABORT,'reservation fault'); END;")
+                    .unwrap();
+            }
             "publication" => rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
                 .unwrap()
                 .execute_batch("CREATE TRIGGER fail_preparation BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_array_length(NEW.progress_json,'$.visits')=2 BEGIN SELECT RAISE(ABORT,'publication fault'); END;")
@@ -9766,4 +9923,759 @@ async fn served_chain_without_executor_refuses_before_persistence() {
         .workflow_spec_json
         .unwrap()
         .contains("fallback_chains"));
+}
+
+// C2c2e4: records written by the real served runner feed the existing checked
+// recovery consumers. Refused terminal publication models the crash, so storage
+// keeps exactly what the runner had durably published and nothing else.
+const REFUSE_TERMINAL: &str = "CREATE TRIGGER crash_terminal BEFORE UPDATE OF status ON tasks WHEN NEW.status IN ('completed','failed','canceled','interrupted') BEGIN SELECT RAISE(ABORT,'terminal fault'); END;";
+
+impl CandidateFixture {
+    /// The chain-bearing `node` feeds the chainless `after`, so downstream input is
+    /// observable.
+    async fn served_dependent_graph(&self) -> Arc<bridge_workflow::graph::WorkflowGraph> {
+        let cwd =
+            SessionCwd::parse(&self.f.dir.path().join("scope").display().to_string()).unwrap();
+        let nodes = serde_json::json!([
+            {"id":"node", "agent":"source", "prompt_template":"{{input}}", "inputs":[]},
+            {"id":"after", "agent":"other", "prompt_template":"got:{{node}}", "inputs":["node"]}
+        ]);
+        Arc::new(
+            self.admission_nodes(nodes, cwd)
+                .await
+                .run_spec
+                .graph
+                .clone(),
+        )
+    }
+
+    /// Run the served runner with the faults installed, drop them as a restart
+    /// would, and reopen the store. `usage_fault` targets the accounting database.
+    async fn served_crash(
+        self,
+        graph: Arc<bridge_workflow::graph::WorkflowGraph>,
+        fault: &str,
+        usage_fault: &str,
+    ) -> (Self, TaskId, AttemptIdentity) {
+        let coordinator = self.served_coordinator_for(graph, true, true);
+        let main = rusqlite::Connection::open(self.f.dir.path().join("tasks.sqlite")).unwrap();
+        main.execute_batch(&format!("{REFUSE_TERMINAL} {fault}"))
+            .unwrap();
+        if !usage_fault.is_empty() {
+            self.install_usage_schema().await;
+            rusqlite::Connection::open(self.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                .unwrap()
+                .execute_batch(usage_fault)
+                .unwrap();
+        }
+        let identity = AttemptIdentity::initial().unwrap();
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .await
+            .unwrap();
+        self.served_settled(&coordinator, &locator.task_id).await;
+        let record = self.f.store.get(&locator.task_id).await.unwrap().unwrap();
+        assert_eq!(record.status, TaskRecordStatus::Working, "{record:?}");
+        for path in ["tasks.sqlite", "tasks.sqlite.usage-v1.sqlite"] {
+            let path = self.f.dir.path().join(path);
+            if !path.exists() {
+                continue;
+            }
+            let db = rusqlite::Connection::open(path).unwrap();
+            let triggers: Vec<String> = db
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'crash_%'",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for name in triggers {
+                db.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+            }
+        }
+        drop((coordinator, main));
+        (self.reopen_recovery(), locator.task_id, identity)
+    }
+
+    /// Provider, registry and accounting effects observed so far.
+    fn effects(&self) -> (Vec<String>, Vec<(usize, usize)>, Vec<UsageAttemptV1>) {
+        (
+            self.f.spawns.lock().unwrap().clone(),
+            recovery_effect_counts(self),
+            self.usage_rows(),
+        )
+    }
+}
+
+async fn served_recovery_deps(
+    h: &CandidateFixture,
+    graph: &Arc<bridge_workflow::graph::WorkflowGraph>,
+    task: &TaskId,
+    batch: bool,
+) -> bridge_coordinator::detached::DetachedDeps {
+    use bridge_coordinator::detached::DetachedDeps;
+    if batch {
+        let bid = BatchId::parse("batch-fixture").unwrap();
+        h.f.store
+            .create_batch(&BatchRecord {
+                id: bid.clone(),
+                workflow: "workflow".into(),
+                concurrency: 1,
+                total: 1,
+                status: BatchStatus::Working,
+                items_json: "{\"v\":1,\"items\":[]}".into(),
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+            })
+            .await
+            .unwrap();
+        rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET batch_id=?1,item_id='one' WHERE id=?2",
+                rusqlite::params![bid.as_str(), task.as_str()],
+            )
+            .unwrap();
+    }
+    DetachedDeps {
+        task_store: h.f.store.clone(),
+        executor: Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+        workflows: Arc::new([(graph.id.clone(), graph.clone())].into()),
+        workflow_cancels: Default::default(),
+        progress_hubs: Default::default(),
+        clock: Arc::new(bridge_coordinator::clock::SystemClock),
+        observer: Arc::new(bridge_observ::NoopObserver),
+        workflow_history: Some(Ok(h.f.store.clone())),
+        workflow_admission: Some(h.builder()),
+    }
+}
+
+type RecoveryRegistries = (
+    Arc<tokio::sync::Mutex<std::collections::HashMap<TaskId, CancellationToken>>>,
+    Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<TaskId, Arc<bridge_coordinator::detached::TaskProgressHub>>,
+        >,
+    >,
+);
+
+/// Non-batch recovery is the coordinator's full boot sequence; batch recovery uses
+/// the batch consumer over the same checked seed loader.
+async fn recover_served(
+    h: &CandidateFixture,
+    graph: &Arc<bridge_workflow::graph::WorkflowGraph>,
+    task: &TaskId,
+    batch: bool,
+) -> (TaskRecord, RecoveryRegistries) {
+    if batch {
+        let deps = served_recovery_deps(h, graph, task, true).await;
+        let record = consume_recovery_task(
+            h,
+            &deps,
+            true,
+            bridge_coordinator::batch::BatchRuntime::new(
+                1,
+                1,
+                Arc::new(bridge_observ::NoopObserver),
+            ),
+            Some(AccountingV1::new(h.f.store.clone())),
+            task,
+        )
+        .await;
+        return (record, (deps.workflow_cancels, deps.progress_hubs));
+    }
+    let boot = h.served_coordinator_for(graph.clone(), false, true);
+    boot.resume_with_cap(3).await.unwrap();
+    let record = h.served_terminal(task).await;
+    h.served_settled(&boot, task).await;
+    (record, (boot.workflow_cancels(), boot.progress_hubs()))
+}
+
+const FAIL_SUCCESSOR_RESERVATION: &str = "CREATE TRIGGER crash_successor BEFORE INSERT ON usage_attempts_v1 WHEN json_extract(NEW.record_json,'$.attribution.agent')='target' BEGIN SELECT RAISE(ABORT,'reservation fault'); END;";
+
+#[tokio::test]
+async fn served_recovery_resumes_settled_rejection_once_under_a_linked_attempt() {
+    for batch in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let graph = h.served_dependent_graph().await;
+        let (h, task, identity) = h
+            .served_crash(graph.clone(), "", FAIL_SUCCESSOR_RESERVATION)
+            .await;
+        *h.calls[3].prompt_answer.lock().unwrap() = Some("downstream");
+        let node = NodeId::parse("node").unwrap();
+        let prior =
+            h.f.store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+        // The served runner settled A's rejection and never reached B.
+        assert_eq!(prior.visits.len(), 1, "batch={batch}");
+        assert!(prior.visits[0].rejection.is_some());
+        assert_eq!(recovery_effect_counts(&h), [(1, 1), (0, 0), (0, 0), (0, 0)]);
+
+        let (record, _) = recover_served(&h, &graph, &task, batch).await;
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Completed,
+            "batch={batch}: {:?}",
+            record.error
+        );
+        assert_eq!(record.result.as_deref(), Some("downstream"));
+        assert_eq!(record.resume_attempts, 1);
+        // A is never re-prompted; B runs once; downstream sees only B's text.
+        assert_eq!(recovery_effect_counts(&h), [(1, 1), (1, 1), (0, 0), (1, 1)]);
+        let inputs = h.f.providers[3].inputs.lock().unwrap().clone();
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|parts| parts[0].text.as_str())
+                .collect::<Vec<_>>(),
+            ["got:answer"]
+        );
+        let progress =
+            h.f.store
+                .candidate_progress_v1(&task, &node)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(progress.visits.len(), 2);
+        assert_eq!(progress.visits[0], prior.visits[0]);
+        assert_eq!(progress.terminal.as_ref().unwrap().output, "answer");
+        // B belongs to the new linked attempt; A keeps the original owner.
+        let owner =
+            h.f.store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .identity;
+        assert_eq!(owner.ordinal, 1);
+        assert_eq!(owner.parent_attempt_id.as_ref(), Some(&identity.attempt_id));
+        assert_eq!(progress.visits[0].owner, identity);
+        assert_eq!(progress.visits[1].owner, owner);
+        let rows = h.usage_rows();
+        assert!(rows.iter().all(|row| row.finalized));
+        let attempt_of = |agent: &str| {
+            rows.iter()
+                .filter(|row| row.attribution.agent == agent)
+                .map(|row| row.attribution.run_attempt.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(attempt_of("source"), [identity.attempt_id.as_str()]);
+        assert_eq!(attempt_of("target"), [owner.attempt_id.as_str()]);
+        assert_eq!(attempt_of("other"), [owner.attempt_id.as_str()]);
+        // One logical completion per checkpointed node.
+        let checkpoints = h.f.store.node_checkpoints(&task).await.unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        let completions: i64 = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_journal WHERE event_json LIKE '%node_finished%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(completions as usize, checkpoints.len());
+    }
+}
+
+#[tokio::test]
+async fn served_recovery_never_reprompts_completed_candidate() {
+    for batch in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let graph = h.served_dependent_graph().await;
+        // Downstream fails before reaching a provider and cannot publish, so only
+        // the candidate's completion is durable when the "crash" happens.
+        h.calls[3]
+            .resolution_errors
+            .lock()
+            .unwrap()
+            .push(BridgeError::StoreFailure);
+        let (h, task, _) = h
+            .served_crash(
+                graph.clone(),
+                "CREATE TRIGGER crash_after BEFORE INSERT ON task_node_checkpoints WHEN NEW.node_id='after' BEGIN SELECT RAISE(ABORT,'downstream publication fault'); END;",
+                "",
+            )
+            .await;
+        *h.calls[3].prompt_answer.lock().unwrap() = Some("downstream");
+        let receipt = joint_receipt(&h);
+        let before = h.effects();
+        assert_eq!(before.1, [(1, 1), (1, 1), (0, 0), (0, 0)]);
+        assert_eq!(h.f.store.node_checkpoints(&task).await.unwrap().len(), 1);
+
+        let (record, _) = recover_served(&h, &graph, &task, batch).await;
+        assert_eq!(
+            record.status,
+            TaskRecordStatus::Completed,
+            "batch={batch}: {:?}",
+            record.error
+        );
+        assert_eq!(record.result.as_deref(), Some("downstream"));
+        // Neither A nor completed B is prompted, configured or resolved again.
+        assert_eq!(recovery_effect_counts(&h), [(1, 1), (1, 1), (0, 0), (1, 1)]);
+        let spawns = h.f.spawns.lock().unwrap().clone();
+        assert_eq!(spawns[..before.0.len()], before.0[..]);
+        assert_eq!(spawns[before.0.len()..], ["other"]);
+        assert_eq!(
+            joint_receipt(&h),
+            receipt,
+            "seed completion is replayed verbatim"
+        );
+        let node_rows = |rows: Vec<UsageAttemptV1>| {
+            rows.into_iter()
+                .filter(|row| row.attribution.node.as_deref() == Some("node"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(node_rows(h.usage_rows()), node_rows(before.2));
+        let inputs = h.f.providers[3].inputs.lock().unwrap().clone();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0][0].text, "got:answer");
+        assert_eq!(h.f.store.node_checkpoints(&task).await.unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn served_recovery_refuses_unsafe_or_drifted_served_records_without_effects() {
+    let usage_fault = |phase: &str| {
+        format!("CREATE TRIGGER crash_phase BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_extract(NEW.progress_json,'$.visits[1].phase')='{phase}' BEGIN SELECT RAISE(ABORT,'phase fault'); END;")
+    };
+    let invalid = "candidate state or frozen scope invalid";
+    let unavailable = "candidate checked evidence unavailable";
+    // (case, fault applied while the served runner is live, mutation applied to
+    // the stored records afterwards, expected refusal)
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        ("polled-source", "CREATE TRIGGER crash_rejection BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_extract(NEW.progress_json,'$.visits[0].rejection') IS NOT NULL BEGIN SELECT RAISE(ABORT,'rejection fault'); END;".into(), "", invalid),
+        ("preparing", usage_fault("Prepared"), "", invalid),
+        ("prepared", usage_fault("PollFenced"), "", invalid),
+        // The checked reader refuses an undispatched fence before classification.
+        ("fenced", usage_fault("Polled"), "", unavailable),
+        ("polled-successor", "CREATE TRIGGER crash_complete BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_extract(NEW.progress_json,'$.terminal') IS NOT NULL BEGIN SELECT RAISE(ABORT,'completion fault'); END;".into(), "", invalid),
+        ("missing", String::new(), "DELETE FROM task_candidate_progress_v1", "candidate progress missing"),
+        ("corrupt", String::new(), "UPDATE task_candidate_progress_v1 SET progress_json='{}'", unavailable),
+        ("lineage-missing", String::new(), "DELETE FROM task_attempt_locators", "candidate lineage missing"),
+        ("owner-conflict", String::new(), "UPDATE task_candidate_progress_v1 SET progress_json=json_set(progress_json,'$.visits[0].owner.attempt_id','attempt-conflict')", unavailable),
+        ("chain-drift", String::new(), "UPDATE task_candidate_progress_v1 SET progress_json=json_set(progress_json,'$.chains[0].id','drifted')", invalid),
+    ];
+    let mut mismatches = vec![];
+    for (case, fault, mutation, expected) in &cases {
+        // Consumer parity on representative runner states; the rest use detached.
+        let consumers: &[bool] =
+            if matches!(*case, "preparing" | "polled-successor" | "lineage-missing") {
+                &[false, true]
+            } else {
+                &[false]
+            };
+        for &batch in consumers {
+            let h = CandidateFixture::new("reject", "success").await;
+            let graph = h.served_dependent_graph().await;
+            // The successor reservation fault leaves a settled rejection to corrupt;
+            // phase faults leave the runner's own interrupted states.
+            let usage = if fault.is_empty() {
+                FAIL_SUCCESSOR_RESERVATION
+            } else {
+                ""
+            };
+            let (h, task, _) = h.served_crash(graph.clone(), fault, usage).await;
+            if !mutation.is_empty() {
+                rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+                    .unwrap()
+                    .execute_batch(mutation)
+                    .unwrap();
+            }
+            let (spawns, counts, rows) = h.effects();
+            let locator = h.f.store.get_attempt_locator(&task).await.unwrap();
+            let checkpoints = h.f.store.node_checkpoints(&task).await.unwrap();
+            let (record, (cancels, hubs)) = recover_served(&h, &graph, &task, batch).await;
+            let label = format!("batch={batch}/{case}");
+            if record.status != TaskRecordStatus::Interrupted
+                || !record
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(expected))
+            {
+                mismatches.push(format!("{label}: {:?}, {:?}", record.status, record.error));
+            }
+            assert_eq!(record.resume_attempts, 0, "{label}");
+            assert!(record.result.is_none(), "{label}");
+            assert_eq!(
+                h.effects(),
+                (spawns, counts, rows),
+                "{label}: provider effects"
+            );
+            assert_eq!(
+                h.f.store.get_attempt_locator(&task).await.unwrap(),
+                locator,
+                "{label}"
+            );
+            assert_eq!(
+                h.f.store.node_checkpoints(&task).await.unwrap(),
+                checkpoints,
+                "{label}"
+            );
+            assert!(hubs.lock().await.is_empty(), "{label}");
+            assert!(cancels.lock().await.is_empty(), "{label}");
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[tokio::test]
+async fn served_recovery_failed_refusal_persistence_invents_no_terminal() {
+    use bridge_coordinator::{batch::*, detached::*};
+    for batch in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        let graph = h.served_dependent_graph().await;
+        let (h, task, _) = h
+            .served_crash(
+                graph.clone(),
+                "CREATE TRIGGER crash_rejection BEFORE UPDATE ON task_candidate_progress_v1 WHEN json_extract(NEW.progress_json,'$.visits[0].rejection') IS NOT NULL BEGIN SELECT RAISE(ABORT,'rejection fault'); END;",
+                "",
+            )
+            .await;
+        let db = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_interruption BEFORE UPDATE OF status ON tasks WHEN NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'interruption fault'); END;").unwrap();
+        let events = || {
+            db.query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                [task.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let (effects, seq) = (h.effects(), events());
+        let deps = served_recovery_deps(&h, &graph, &task, batch).await;
+        let record = h.f.store.get(&task).await.unwrap().unwrap();
+        if batch {
+            run_admission(
+                BatchDeps {
+                    detached: deps.clone(),
+                    runtime: BatchRuntime::new(1, 1, Arc::new(bridge_observ::NoopObserver)),
+                    allowed_cwd_root: None,
+                },
+                BatchId::parse("batch-fixture").unwrap(),
+                [record].into(),
+                Default::default(),
+                1,
+                CancellationToken::new(),
+                3,
+            )
+            .await;
+        } else {
+            assert!(reconcile_terminal_checkpoints(&deps).await);
+            resume_one_working_task(&deps, &record, 3).await;
+        }
+        // The refusal could not be made durable, so no terminal result exists.
+        let record = h.f.store.get(&task).await.unwrap().unwrap();
+        assert_eq!(record.status, TaskRecordStatus::Working, "batch={batch}");
+        assert!(record.error.is_none() && record.result.is_none());
+        assert_eq!(record.resume_attempts, 0);
+        let evidence = h.f.store.workflow_task_evidence(&task).await.unwrap();
+        assert!(evidence.workflow_outcome.is_none());
+        assert!(h
+            .f
+            .store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(events(), seq);
+        assert_eq!(h.effects(), effects);
+        assert!(deps.progress_hubs.lock().await.is_empty());
+        assert!(deps.workflow_cancels.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn served_late_refusal_preserves_an_existing_terminal_task() {
+    use bridge_coordinator::detached::*;
+    for failed in [false, true] {
+        let h = CandidateFixture::new("reject", "success").await;
+        if failed {
+            h.install_usage_schema().await;
+            rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+                .unwrap()
+                .execute_batch(FAIL_SUCCESSOR_RESERVATION)
+                .unwrap();
+        }
+        let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
+        let coordinator = h.served_coordinator_for(graph.clone(), true, true);
+        let locator = coordinator
+            .run_workflow_with_chains_for_test(
+                served_params(false),
+                AttemptIdentity::initial().unwrap(),
+            )
+            .await
+            .unwrap();
+        let terminal = h.served_terminal(&locator.task_id).await;
+        h.served_settled(&coordinator, &locator.task_id).await;
+        assert_eq!(
+            terminal.status,
+            if failed {
+                TaskRecordStatus::Failed
+            } else {
+                TaskRecordStatus::Completed
+            }
+        );
+        let task = locator.task_id;
+        let snapshot = h.f.store.progress_snapshot(&task).await.unwrap();
+        let effects = h.effects();
+        // A refusal computed from a Working observation lands after the terminal.
+        let mut stale = terminal.clone();
+        stale.status = TaskRecordStatus::Working;
+        let deps = served_recovery_deps(&h, &graph, &task, false).await;
+        resume_one_working_task(&deps, &stale, 3).await;
+        let store: Arc<dyn TaskStore> = h.f.store.clone();
+        let _ = finalize_detached(
+            &store,
+            &deps.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("late candidate refusal"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            h.f.store.get(&task).await.unwrap().unwrap(),
+            terminal,
+            "failed={failed}"
+        );
+        let after = h.f.store.progress_snapshot(&task).await.unwrap();
+        assert_eq!(after.terminal_seq, snapshot.terminal_seq);
+        assert_eq!(after.cut_seq, snapshot.cut_seq);
+        assert_eq!(h.effects(), effects);
+    }
+}
+
+#[tokio::test]
+async fn served_primary_publication_failure_prevents_downstream_execution() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let graph = h.served_dependent_graph().await;
+    rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+        .unwrap()
+        .execute_batch("CREATE TRIGGER refuse_candidate BEFORE INSERT ON task_node_checkpoints WHEN NEW.node_id='node' BEGIN SELECT RAISE(ABORT,'publication fault'); END;")
+        .unwrap();
+    let coordinator = h.served_coordinator_for(graph, true, true);
+    let locator = coordinator
+        .run_workflow_with_chains_for_test(
+            served_params(false),
+            AttemptIdentity::initial().unwrap(),
+        )
+        .await
+        .unwrap();
+    let record = h.served_terminal(&locator.task_id).await;
+    h.served_settled(&coordinator, &locator.task_id).await;
+    assert_eq!(record.status, TaskRecordStatus::Failed, "{record:?}");
+    assert!(record.result.is_none());
+    assert!(h
+        .f
+        .store
+        .node_checkpoints(&locator.task_id)
+        .await
+        .unwrap()
+        .is_empty());
+    // B was reached, but its completion never became visible to the dependent.
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 1);
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source", "target"]);
+    assert_eq!(h.f.providers[3].prompts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.calls[3].setups.load(Ordering::SeqCst), 0);
+}
+
+impl CandidateFixture {
+    /// Reservation and terminal prompt-acceptance evidence for one run attempt.
+    async fn reached_provider(&self, attempt: &AttemptId) -> (String, Option<String>) {
+        use bridge_core::workflow_history::WorkflowHistoryStore;
+        let history = self.f.store.attempt(attempt).await.unwrap().unwrap();
+        (
+            history.reservation.prompt_acceptance,
+            history.terminal.map(|terminal| terminal.prompt_acceptance),
+        )
+    }
+}
+
+#[tokio::test]
+async fn served_projection_live_and_reattach_show_one_node_completion() {
+    use bridge_coordinator::detached::{FrameKind, TerminalOutcome};
+    let h = CandidateFixture::new("reject", "success").await;
+    let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    let coordinator = h
+        .served_coordinator(true, true)
+        .await
+        .with_workflow_history(Ok(h.fault_history(0, Some(gate.clone()), false, false)));
+    let identity = AttemptIdentity::initial().unwrap();
+    let locator = coordinator
+        .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+        .await
+        .unwrap();
+    let task = locator.task_id.clone();
+    // Park the runner before its first prompt so the subscriber sees every frame.
+    boundary_wait(
+        "projection",
+        "the first dispatch barrier",
+        gate.0.notified(),
+    )
+    .await;
+    let hub = coordinator.progress_hubs().lock().await.get(&task).cloned();
+    let mut live = hub
+        .expect("served hub registered before the runner starts")
+        .subscribe();
+    gate.1.notify_one();
+    let frames = boundary_wait("projection", "the live terminal frame", async {
+        let mut frames = vec![];
+        while let Ok(frame) = live.recv().await {
+            let terminal = matches!(frame.kind, FrameKind::Terminal { .. });
+            frames.push(frame);
+            if terminal {
+                break;
+            }
+        }
+        frames
+    })
+    .await;
+    h.served_settled(&coordinator, &task).await;
+
+    let finished: Vec<_> = frames
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FrameKind::NodeFinished {
+                node,
+                ok,
+                output,
+                terminal_json,
+                ..
+            } => Some((
+                f.seq,
+                node.as_str(),
+                *ok,
+                output.as_str(),
+                terminal_json.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished.len(),
+        1,
+        "one logical completion despite two candidates: {frames:?}"
+    );
+    let (seq, node, ok, output, terminal_json) = finished[0].clone();
+    assert_eq!((node, ok, output), ("node", true, "answer"));
+    let terminal = NodeTerminalV1::decode_canonical(terminal_json.unwrap().as_bytes()).unwrap();
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Completed);
+    // Provider reach is recorded exactly as the ordinary route records it.
+    let (reservation, terminal_acceptance) = h.reached_provider(&identity.attempt_id).await;
+    assert_eq!(reservation, "dispatch_uncertain");
+    let control = CandidateFixture::new("final-only", "success").await;
+    let ordinary = control.served_coordinator(false, true).await;
+    let control_identity = AttemptIdentity::initial().unwrap();
+    let control_locator = ordinary
+        .run_workflow_with_identity(served_params(false), control_identity.clone())
+        .await
+        .unwrap();
+    control.served_terminal(&control_locator.task_id).await;
+    control
+        .served_settled(&ordinary, &control_locator.task_id)
+        .await;
+    assert_eq!(
+        control.reached_provider(&control_identity.attempt_id).await,
+        (reservation, terminal_acceptance)
+    );
+    let outputs: Vec<_> = frames
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FrameKind::Terminal { outcome, output } => {
+                Some((f.seq, outcome.clone(), output.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert!(matches!(outputs[0].1, TerminalOutcome::Completed));
+    assert_eq!(outputs[0].2, "answer");
+    assert!(outputs[0].0 > seq);
+
+    // Reattachment reads the same durable evidence, not a second completion.
+    let snapshot = h.f.store.progress_snapshot(&task).await.unwrap();
+    assert_eq!(snapshot.status, TaskRecordStatus::Completed);
+    assert_eq!(snapshot.terminal_seq, Some(outputs[0].0));
+    let checkpoints: Vec<_> = snapshot
+        .checkpoints
+        .iter()
+        .map(|(node, output, ok, seq)| (node.as_str(), output.as_str(), *ok, *seq))
+        .collect();
+    assert_eq!(checkpoints, [("node", "answer", true, seq)]);
+    let completions =
+        h.f.store
+            .journal_from(&task, -1)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    bridge_core::orch::OrchEventKind::NodeFinished { .. }
+                )
+            })
+            .count();
+    assert_eq!(completions, 1);
+    let evidence = h.f.store.node_terminal_evidence(&task).await.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        NodeTerminalV1::decode_canonical(evidence[0].terminal_json.as_bytes()).unwrap(),
+        terminal
+    );
+    // Locators are exact: the submission, the durable lineage and history agree.
+    assert_eq!(
+        (locator.task_id, locator.attempt_id),
+        (task.clone(), identity.attempt_id.clone())
+    );
+    let durable = h.f.store.get_attempt_locator(&task).await.unwrap().unwrap();
+    assert_eq!(durable.identity, identity);
+}
+
+#[tokio::test]
+async fn served_refusal_projects_interrupted_as_failed() {
+    use bridge_coordinator::detached::{
+        finalize_detached_with_barrier, FrameKind, TaskProgressHub, TerminalOutcome,
+    };
+    let h = CandidateFixture::new("reject", "success").await;
+    let graph = h.served_dependent_graph().await;
+    let (h, task, _) = h.served_crash(graph, "", FAIL_SUCCESSOR_RESERVATION).await;
+    let store: Arc<dyn TaskStore> = h.f.store.clone();
+    let hub = Arc::new(TaskProgressHub::new());
+    let hubs = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+        (task.clone(), hub.clone()),
+    ])));
+    let mut live = hub.subscribe();
+    finalize_detached_with_barrier(
+        &store,
+        &hubs,
+        &task,
+        TaskRecordStatus::Interrupted,
+        None,
+        Some("not resumable: candidate refusal"),
+        Some(&hub),
+        None,
+        "not_needed",
+    )
+    .await
+    .unwrap();
+    let frame = live.recv().await.unwrap();
+    let FrameKind::Terminal { outcome, output } = frame.kind else {
+        panic!("expected terminal: {frame:?}");
+    };
+    // The durable status stays Interrupted; transports project it as failed.
+    assert!(matches!(outcome, TerminalOutcome::Failed));
+    assert_eq!(output, "not resumable: candidate refusal");
+    let record = h.f.store.get(&task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Interrupted);
+    assert!(record.result.is_none());
+    let snapshot = h.f.store.progress_snapshot(&task).await.unwrap();
+    assert_eq!(snapshot.terminal_seq, Some(frame.seq));
+    assert!(hubs.lock().await.is_empty());
 }
