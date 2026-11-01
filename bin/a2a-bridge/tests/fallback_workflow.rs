@@ -10725,3 +10725,359 @@ async fn served_refusal_projects_interrupted_as_failed() {
     assert_eq!(snapshot.terminal_seq, Some(frame.seq));
     assert!(hubs.lock().await.is_empty());
 }
+
+// ---- retained-context exclusion (C2c2e E1) ----------------------------------------------------
+//
+// A real warm `SessionManager` context is the retained provider conversation. The dispatcher hands
+// every node the same child context, so one conversation is reused across nodes and invocations.
+
+struct RetainedCleanup(bridge_coordinator::dispatch::WarmCompletionGuard);
+#[async_trait::async_trait]
+impl NodeTurnCleanup for RetainedCleanup {
+    fn arm_exit(&mut self, exit: &NodeTurnExit) {
+        use bridge_coordinator::dispatch::WarmCompletionExit as Exit;
+        self.0.observe_exit(match exit {
+            NodeTurnExit::Normal => Exit::Normal,
+            NodeTurnExit::Canceled => Exit::Canceled,
+            NodeTurnExit::Error(error) => Exit::Error(error),
+        });
+    }
+    async fn on_exit(mut self: Box<Self>, exit: NodeTurnExit) {
+        self.arm_exit(&exit);
+        let _ = self.0.complete().await;
+    }
+}
+
+struct RetainedDispatcher {
+    sm: Arc<bridge_coordinator::session_manager::SessionManager>,
+    context: ContextId,
+    cwd: SessionCwd,
+    /// (backend session, generation) of every checkout, in order.
+    checkouts: Mutex<Vec<(SessionId, u64)>>,
+}
+impl RetainedDispatcher {
+    fn new(h: &CandidateFixture, context: &str) -> Arc<Self> {
+        Arc::new(Self {
+            sm: h.f.coordinator.session_manager.clone(),
+            context: ContextId::parse(context).unwrap(),
+            cwd: SessionCwd::parse(h.f.dir.path().join("scope").to_str().unwrap()).unwrap(),
+            checkouts: Mutex::new(vec![]),
+        })
+    }
+    fn sessions(&self) -> Vec<(SessionId, u64)> {
+        self.checkouts.lock().unwrap().clone()
+    }
+    async fn binding(&self) -> Option<(String, u64)> {
+        self.sm
+            .status(&self.context)
+            .await
+            .map(|status| (status.agent, status.generation))
+    }
+}
+#[async_trait::async_trait]
+impl WorkflowNodeDispatcher for RetainedDispatcher {
+    async fn checkout(
+        &self,
+        _: &str,
+        _: &bridge_workflow::graph::WorkflowNode,
+        _: &str,
+        _: &WorkflowRunContext,
+    ) -> Result<NodeTurn> {
+        unreachable!("the executor checks out through the observed entry")
+    }
+    async fn checkout_observed_with_overrides(
+        &self,
+        _: &str,
+        node: &bridge_workflow::graph::WorkflowNode,
+        _: &str,
+        _: &WorkflowRunContext,
+        overrides: Option<AgentOverride>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn> {
+        let turn = self
+            .sm
+            .checkout_child_turn_observed(
+                &ContextId::parse("retained-parent").unwrap(),
+                &self.context,
+                node.agent.clone(),
+                overrides,
+                Some(self.cwd.clone()),
+                observer.clone(),
+            )
+            .await?;
+        self.checkouts
+            .lock()
+            .unwrap()
+            .push((turn.session.clone(), turn.generation.get()));
+        Ok(NodeTurn {
+            selection: Some((
+                turn.agent,
+                EffectiveConfig {
+                    model: turn.model,
+                    effort: turn.effort.as_deref().map(str::parse).transpose().unwrap(),
+                    mode: turn.mode,
+                },
+            )),
+            backend: turn.backend,
+            session: turn.session,
+            seed: turn.seed,
+            cleanup: Box::new(RetainedCleanup(
+                bridge_coordinator::dispatch::WarmCompletionGuard::workflow_owner(
+                    self.sm.clone(),
+                    self.context.clone(),
+                    turn.generation,
+                    turn.op,
+                    turn.expiry_intent,
+                    observer,
+                ),
+            )),
+        })
+    }
+}
+
+impl CandidateFixture {
+    /// Two chain-bearing nodes that both address the retained conversation.
+    async fn retained_admission(&self) -> AdmittedWorkflowRunV1 {
+        let cwd =
+            SessionCwd::parse(&self.f.dir.path().join("scope").display().to_string()).unwrap();
+        let admitted = self
+            .admission_nodes(
+                serde_json::json!([
+                    {"id":"first", "agent":"source", "prompt_template":"{{input}}", "inputs":[]},
+                    {"id":"node", "agent":"source", "prompt_template":"{{first}}", "inputs":["first"]}
+                ]),
+                cwd,
+            )
+            .await;
+        self.builder()
+            .bind_local_chains(admitted, &self.run.progress.chains)
+            .unwrap()
+    }
+    /// Run `admitted` through the retained dispatcher, with or without its frozen authority.
+    async fn retained_run(
+        &self,
+        admitted: &AdmittedWorkflowRunV1,
+        dispatcher: &Arc<RetainedDispatcher>,
+        frozen: bool,
+    ) -> Vec<Result<WorkflowEvent>> {
+        use futures::StreamExt;
+        let graph = Arc::new(admitted.run_spec.graph.clone());
+        let request = WorkflowRunContext {
+            session_cwd: frozen
+                .then(|| admitted.run_spec.requested_session_cwd.clone())
+                .flatten(),
+            ..Default::default()
+        };
+        let context = WorkflowDiagnosticContext::in_memory(request);
+        let context = if frozen {
+            context
+                .with_admitted_workflow_run(admitted.clone())
+                .unwrap()
+        } else {
+            context
+        };
+        WorkflowExecutor::new(self.registry.clone())
+            .with_local_fallback(
+                self.builder(),
+                admitted.clone(),
+                self.f.store.clone(),
+                TaskId::parse(self.owner.execution_id.as_str()).unwrap(),
+            )
+            .run_with_diagnostic_context_and_dispatcher(
+                graph,
+                "input".into(),
+                "retained".into(),
+                CancellationToken::new(),
+                context,
+                dispatcher.clone(),
+            )
+            .collect()
+            .await
+    }
+    /// Nothing prepared, polled or accounted for any successor candidate.
+    async fn assert_no_successor(&self, task: &TaskId) {
+        for index in 1..3 {
+            assert_eq!(self.calls[index].setups.load(Ordering::SeqCst), 0);
+            assert_eq!(self.f.providers[index].setup.load(Ordering::SeqCst), 0);
+            assert_eq!(self.f.providers[index].prompts.load(Ordering::SeqCst), 0);
+        }
+        assert!(self
+            .f
+            .spawns
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|id| id == "source"));
+        for node in ["first", "node"] {
+            assert!(self
+                .f
+                .store
+                .candidate_progress_v1(task, &NodeId::parse(node).unwrap())
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+    /// Accounted attempts so far; the usage table exists only once something was accounted.
+    fn usage_attempts(&self) -> usize {
+        let db = rusqlite::Connection::open(self.f.dir.path().join("tasks.sqlite.usage-v1.sqlite"))
+            .unwrap();
+        match db.query_row("SELECT count(*) FROM usage_attempts_v1", [], |r| r.get(0)) {
+            Ok(count) => count,
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                0
+            }
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    /// Establish an idle retained conversation on `source` without any workflow.
+    async fn warm_retained(&self, dispatcher: &RetainedDispatcher) -> (SessionId, u64) {
+        let turn = self
+            .f
+            .coordinator
+            .session_manager
+            .checkout_turn(
+                &dispatcher.context,
+                AgentId::parse("source").unwrap(),
+                None,
+                Some(dispatcher.cwd.clone()),
+            )
+            .await
+            .unwrap();
+        let identity = (turn.session.clone(), turn.generation.get());
+        self.f
+            .coordinator
+            .session_manager
+            .finish_turn(&dispatcher.context, turn.generation, &turn.op)
+            .await;
+        identity
+    }
+}
+
+#[tokio::test]
+async fn workflow_retained_context_never_migrates() {
+    let h = CandidateFixture::new("success", "success").await;
+    let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+    let admitted = h.retained_admission().await;
+    let dispatcher = RetainedDispatcher::new(&h, "retained-conversation");
+
+    // Ordinary retained execution: one conversation across both nodes and a second invocation.
+    for _ in 0..2 {
+        let events = h.retained_run(&admitted, &dispatcher, false).await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+    }
+    let sessions = dispatcher.sessions();
+    assert_eq!(sessions.len(), 4);
+    assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        h.f.providers[0].sessions.lock().unwrap().as_slice(),
+        [sessions[0].0.clone()],
+        "the provider configured exactly one conversation"
+    );
+    let binding = dispatcher.binding().await;
+    assert_eq!(binding, Some(("source".into(), sessions[0].1)));
+    h.assert_no_successor(&task).await;
+
+    // Frozen candidate authority on the dispatcher refuses before any checkout.
+    let events = h.retained_run(&admitted, &dispatcher, true).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Err(BridgeError::BindUnsupported))),
+        "{events:?}"
+    );
+    assert_eq!(dispatcher.sessions().len(), 4);
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 4);
+    assert_eq!(dispatcher.binding().await, binding);
+    h.assert_no_successor(&task).await;
+    assert_eq!(h.usage_attempts(), 0);
+}
+
+#[tokio::test]
+async fn workflow_retained_rejection_never_prepares_successor() {
+    // Every declared cause. `billing-match` declares only the billing cause for its chain.
+    for cause in ["reject", "region", "rate", "billing-match"] {
+        let h = CandidateFixture::new(cause, "success").await;
+        let task = TaskId::parse(h.owner.execution_id.as_str()).unwrap();
+        let admitted = h.retained_admission().await;
+        let dispatcher = RetainedDispatcher::new(&h, "retained-conversation");
+        let retained = h.warm_retained(&dispatcher).await;
+        let binding = dispatcher.binding().await;
+        assert_eq!(binding, Some(("source".into(), retained.1)), "{cause}");
+
+        // Authority attached to the retained dispatcher refuses before the rejecting provider is reached.
+        let events = h.retained_run(&admitted, &dispatcher, true).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Err(BridgeError::BindUnsupported))),
+            "{cause}: {events:?}"
+        );
+        assert!(dispatcher.sessions().is_empty(), "{cause}");
+        assert_eq!(
+            h.f.providers[0].prompts.load(Ordering::SeqCst),
+            0,
+            "{cause}"
+        );
+        assert_eq!(dispatcher.binding().await, binding, "{cause}");
+        h.assert_no_successor(&task).await;
+
+        // Without authority the retained conversation is ordinary: it reuses the same session, the
+        // provider rejection stays the node's own failure, and no candidate state appears.
+        let events = h.retained_run(&admitted, &dispatcher, false).await;
+        assert!(events.iter().all(Result::is_ok), "{cause}: {events:?}");
+        assert_eq!(dispatcher.sessions()[0], retained, "{cause}");
+        assert_eq!(h.f.providers[0].sessions.lock().unwrap()[0], retained.0);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Ok(WorkflowEvent::NodeFinished { ok: false, .. }))));
+        // The owner expires its own rejected conversation; it is never rebound to another agent.
+        assert!(dispatcher
+            .binding()
+            .await
+            .is_none_or(|(agent, _)| agent == "source"));
+        h.assert_no_successor(&task).await;
+        assert_eq!(h.usage_attempts(), 0, "{cause}");
+    }
+}
+
+#[tokio::test]
+async fn workflow_envelope_context_alone_stays_cold_eligible() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let identity = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+    // The client names a context that is also a live retained conversation in the same manager.
+    let dispatcher = RetainedDispatcher::new(&h, "client-envelope");
+    let retained = h.warm_retained(&dispatcher).await;
+    let binding = dispatcher.binding().await;
+    let mut params = served_params(false);
+    params.context = Some(dispatcher.context.clone());
+    let coordinator = h.served_coordinator(true, true).await;
+    coordinator
+        .run_workflow_with_chains_for_test(params, identity)
+        .await
+        .unwrap();
+    let record = h.served_terminal(&task).await;
+    assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+    assert_eq!(record.result.as_deref(), Some("answer"));
+    // The cold chain moved source to target on its own fresh conversations (the first spawn
+    // established the retained conversation)...
+    assert_eq!(h.f.spawns.lock().unwrap()[1..], ["source", "target"]);
+    let progress =
+        h.f.store
+            .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(progress.visits.len(), 2);
+    assert!(progress
+        .visits
+        .iter()
+        .all(|visit| visit.cold_context != dispatcher.context));
+    assert!(!h.f.providers[0].sessions.lock().unwrap()[1..].contains(&retained.0));
+    // ...and left the named retained conversation untouched.
+    assert_eq!(dispatcher.binding().await, binding);
+}

@@ -1853,6 +1853,19 @@ pub struct WorkflowExecutor {
     preflight_metadata_fault: std::sync::atomic::AtomicBool,
 }
 
+/// Affirmative proof that a node turn owns a cold conversation: no dispatcher retains it. Automatic
+/// fallback never silently moves a retained provider conversation to a different agent, so every
+/// candidate activation consumes this proof instead of inferring coldness from an absent branch. It
+/// has one constructor, and an envelope context identifier is not an input to it.
+#[derive(Clone, Copy)]
+struct ColdOwnershipV1(());
+
+impl ColdOwnershipV1 {
+    fn affirm(dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>) -> Option<Self> {
+        dispatcher.is_none().then_some(Self(()))
+    }
+}
+
 struct LocalWorkflowFallbackV1 {
     admission: Arc<crate::admission::WorkflowAdmissionV1>,
     admitted: crate::admission::AdmittedWorkflowRunV1,
@@ -4091,6 +4104,7 @@ impl WorkflowExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn run_local_chain(
         &self,
+        _cold: ColdOwnershipV1,
         local: &LocalWorkflowFallbackV1,
         run: &mut WorkflowCandidateRunV1,
         rendered: &str,
@@ -5025,9 +5039,12 @@ impl WorkflowExecutor {
         let rendered = render(&node.prompt_template, vars);
         let mut initial_preflight = None;
         let mut initial_node_context = None;
-        if let (Some(local), Some(authority), Some(accounting)) =
-            (&self.local_fallback, frozen_authority, &self.accounting)
-        {
+        if let (Some(local), Some(authority), Some(accounting), Some(cold)) = (
+            &self.local_fallback,
+            frozen_authority,
+            &self.accounting,
+            ColdOwnershipV1::affirm(dispatcher),
+        ) {
             if let Some(restored) = &local.restored {
                 if !Arc::ptr_eq(&local.admitted.run_spec, &authority.run_spec) {
                     return Err(BridgeError::InvalidStateTransition.into());
@@ -5061,6 +5078,7 @@ impl WorkflowExecutor {
                     let node_obs_ctx = start_node_observation(wf_id, node, run_id, ctx)?;
                     let result = self
                         .run_local_chain(
+                            cold,
                             local,
                             &mut run,
                             &rendered,
@@ -5151,6 +5169,7 @@ impl WorkflowExecutor {
                             let node_obs_ctx = initial_node_context.take().unwrap();
                             let result = self
                                 .run_local_chain(
+                                    cold,
                                     local,
                                     &mut run,
                                     &rendered,
