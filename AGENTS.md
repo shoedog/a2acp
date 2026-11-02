@@ -44,6 +44,10 @@ spec delivered to a managed agent receives the reserved `A2A_BRIDGE_MCP_CALL_DEP
 bridge MCP invocation refuses before config, store, or coordinator work. Do not set that reserved variable
 in agent MCP configuration. This is a safety guard against accidental recursion, not a security boundary
 against a deliberately hostile wrapper that removes inherited environment variables.
+On stdin EOF `a2a-bridge mcp` drains in-flight workflows for up to `[server] mcp_eof_grace_secs` (default 900,
+`0` = cancel immediately) before cancelling the rest; SIGTERM/SIGINT during the grace shuts down at once. A run
+blocked on permission/elicitation cannot be answered after EOF and consumes the grace unless
+`permission_timeout_ms` bounds it.
 
 ## 1. Build / install
 
