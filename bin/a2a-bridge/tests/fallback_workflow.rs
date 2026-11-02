@@ -2745,18 +2745,21 @@ async fn workflow_recovery_consumers_refuse_before_executor_effects() {
     }
 }
 
-// E2's admission switch is deliberately absent from OpParams and both transports.
+// Forged selection metadata is inert: chain selection never reads OpParams or the request.
 fn served_params(a2a: bool) -> bridge_coordinator::params::OpParams {
     use bridge_coordinator::params::OpParams;
     let input = "---\ntask-type: freeform\n---\nforged fallback_chain=other";
     let mut params = if a2a {
         OpParams::from_a2a_metadata(
-            serde_json::json!({"a2a-bridge.fallback_chain":"other", "a2a-bridge.test_admit_chains":true})
-                .as_object().unwrap(), input.into(),
-        ).unwrap()
+            serde_json::json!({"a2a-bridge.fallback_chain":"other"})
+                .as_object()
+                .unwrap(),
+            input.into(),
+        )
+        .unwrap()
     } else {
         OpParams::from_mcp_args(&serde_json::json!({
-            "input":input, "fallback_chain":"other", "test_admit_chains":true
+            "input":input, "fallback_chain":"other"
         }))
         .unwrap()
     };
@@ -2889,7 +2892,7 @@ async fn served_cold_chain_persists_authority_before_candidate_effects() {
     }
     let coordinator = h.served_coordinator(true, true).await;
     let locator = coordinator
-        .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+        .run_workflow_with_identity(served_params(false), identity.clone())
         .await
         .unwrap();
     assert_eq!(locator.task_id, task);
@@ -2966,7 +2969,7 @@ async fn served_chain_optional_history_retains_primary_authority() {
         .with_workflow_history(Err(LedgerUnavailableReason::Open));
     let identity = AttemptIdentity::initial().unwrap();
     let locator = coordinator
-        .run_workflow_with_chains_for_test(served_params(true), identity.clone())
+        .run_workflow_with_identity(served_params(true), identity.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -3001,72 +3004,35 @@ async fn served_chain_optional_history_retains_primary_authority() {
 
 #[tokio::test]
 async fn served_chain_no_declaration_keeps_snapshot_and_ordinary_path() {
-    for test_admission in [false, true] {
-        let h = CandidateFixture::new("reject", "success").await;
-        let coordinator = h.served_coordinator(false, true).await;
-        let identity = AttemptIdentity::initial().unwrap();
-        let locator = if test_admission {
-            coordinator
-                .run_workflow_with_chains_for_test(served_params(false), identity.clone())
-                .await
-        } else {
-            coordinator
-                .run_workflow_with_identity(served_params(false), identity.clone())
-                .await
-        }
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = h.served_coordinator(false, true).await;
+    let identity = AttemptIdentity::initial().unwrap();
+    let locator = coordinator
+        .run_workflow_with_identity(served_params(false), identity.clone())
+        .await
         .unwrap();
-        let record = h.served_terminal(&locator.task_id).await;
-        assert_eq!(record.status, TaskRecordStatus::Failed);
-        let json = record.workflow_spec_json.unwrap();
-        assert!(!json.contains("fallback_chains"));
-        let mut expected = h.admission("source").await;
-        Arc::make_mut(&mut expected.run_spec).attempt_id = identity.attempt_id;
-        Arc::make_mut(&mut expected.run_spec).requested_session_cwd = None;
-        Arc::make_mut(&mut expected.run_spec).ledger_admission =
-            LedgerAdmissionV1::DurablePrimaryTaskStore;
-        assert_eq!(
-            json.as_bytes(),
-            expected.run_spec.encode_snapshot_v2().unwrap()
-        );
-        assert!(h
-            .f
-            .store
-            .candidate_progress_v1(&locator.task_id, &NodeId::parse("node").unwrap())
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(*h.f.spawns.lock().unwrap(), ["source"]);
-        assert_eq!(h.f.rows().len(), 1);
-    }
-}
-
-#[tokio::test]
-async fn served_chain_production_transports_ignore_forged_selection() {
-    for a2a in [false, true] {
-        let h = CandidateFixture::new("reject", "success").await;
-        let coordinator = h.served_coordinator(true, true).await;
-        let locator = coordinator
-            .run_workflow_with_identity(served_params(a2a), AttemptIdentity::initial().unwrap())
-            .await
-            .unwrap();
-        let record = h.served_terminal(&locator.task_id).await;
-        assert_eq!(record.status, TaskRecordStatus::Failed);
-        assert!(!record
-            .workflow_spec_json
-            .unwrap()
-            .contains("fallback_chains"));
-        assert!(h
-            .f
-            .store
-            .candidate_progress_v1(&locator.task_id, &NodeId::parse("node").unwrap())
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 1);
-        assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0);
-        assert_eq!(h.f.providers[3].setup.load(Ordering::SeqCst), 0);
-        assert_eq!(h.f.rows().len(), 1);
-    }
+    let record = h.served_terminal(&locator.task_id).await;
+    assert_eq!(record.status, TaskRecordStatus::Failed);
+    let json = record.workflow_spec_json.unwrap();
+    assert!(!json.contains("fallback_chains"));
+    let mut expected = h.admission("source").await;
+    Arc::make_mut(&mut expected.run_spec).attempt_id = identity.attempt_id;
+    Arc::make_mut(&mut expected.run_spec).requested_session_cwd = None;
+    Arc::make_mut(&mut expected.run_spec).ledger_admission =
+        LedgerAdmissionV1::DurablePrimaryTaskStore;
+    assert_eq!(
+        json.as_bytes(),
+        expected.run_spec.encode_snapshot_v2().unwrap()
+    );
+    assert!(h
+        .f
+        .store
+        .candidate_progress_v1(&locator.task_id, &NodeId::parse("node").unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source"]);
+    assert_eq!(h.f.rows().len(), 1);
 }
 
 #[tokio::test]
@@ -3074,10 +3040,7 @@ async fn served_chain_missing_accounting_refuses_before_preparation() {
     let h = CandidateFixture::new("reject", "success").await;
     let coordinator = h.served_coordinator(true, false).await;
     let locator = coordinator
-        .run_workflow_with_chains_for_test(
-            served_params(false),
-            AttemptIdentity::initial().unwrap(),
-        )
+        .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
         .await
         .unwrap();
     let record = h.served_terminal(&locator.task_id).await;
@@ -3247,7 +3210,7 @@ async fn served_chain_admission_preserves_validation_and_collision_refusal() {
         }
         assert!(
             coordinator
-                .run_workflow_with_chains_for_test(params, identity)
+                .run_workflow_with_identity(params, identity)
                 .await
                 .is_err(),
             "{invalid}"
@@ -3276,7 +3239,7 @@ async fn served_chain_admission_preserves_validation_and_collision_refusal() {
     let coordinator = coordinator.with_workflow_history(Ok(history));
     assert!(matches!(
         coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .run_workflow_with_identity(served_params(false), identity.clone())
             .await,
         Err(BridgeError::DurableEvidenceUnavailable {
             reason: "collision"
@@ -3324,18 +3287,12 @@ async fn served_chain_governed_submission_stays_refused() {
         .served_coordinator(true, true)
         .await
         .with_accounting(service);
-    for test_admission in [false, true] {
+    for a2a in [false, true] {
         let identity = AttemptIdentity::initial().unwrap();
         let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
-        let result = if test_admission {
-            coordinator
-                .run_workflow_with_chains_for_test(served_params(false), identity)
-                .await
-        } else {
-            coordinator
-                .run_workflow_with_identity(served_params(true), identity)
-                .await
-        };
+        let result = coordinator
+            .run_workflow_with_identity(served_params(a2a), identity)
+            .await;
         assert!(matches!(result, Err(BridgeError::BudgetRefused { .. })));
         assert!(h.f.store.get(&task).await.unwrap().is_none());
     }
@@ -3343,54 +3300,34 @@ async fn served_chain_governed_submission_stays_refused() {
 }
 
 #[tokio::test]
-async fn workflow_served_composition_does_not_consume_chains() {
+async fn workflow_compat_submit_with_envelope_context_activates_declared_chains() {
     let h = CandidateFixture::new("reject", "success").await;
-    let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
-    let coordinator = bridge_coordinator::Coordinator::new(
-        h.f.coordinator.session_manager.clone(),
-        Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
-        Arc::new(std::collections::HashMap::from([(graph.id.clone(), graph)])),
-        h.f.store.clone(),
-        h.f.store.clone(),
-        h.f.coordinator.policy(),
-        h.registry.clone(),
-        Arc::new(bridge_coordinator::clock::SystemClock),
-        None,
-        None,
-        Arc::new(bridge_observ::NoopObserver),
-        3,
-    )
-    .with_workflow_admission(h.builder())
-    .with_workflow_history(Ok(h.f.store.clone()))
-    .with_accounting(AccountingV1::new(h.f.store.clone()))
-    .with_mcp_fallback(h.run.progress.chains.clone());
-    let params = bridge_coordinator::params::OpParams::from_mcp_args(&serde_json::json!({
-        "workflow":"workflow", "context":"envelope-only", "input":"---\ntask-type: freeform\n---\nforged fallback_chain=other"
-    })).unwrap();
-    let task = coordinator.run_workflow(params).await.unwrap();
-    let record = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            let record = h.f.store.get(&task).await.unwrap().unwrap();
-            if record.status.is_terminal() {
-                break record;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(record.status, TaskRecordStatus::Failed);
-    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 1);
-    assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0);
-    assert_eq!(h.f.rows().len(), 1);
-    assert!(
-        bridge_workflow::run_spec::WorkflowRunSpecV1::decode_snapshot_v2(
-            record.workflow_spec_json.unwrap().as_bytes()
-        )
-        .unwrap()
-        .fallback_chains
-        .is_none()
-    );
+    let coordinator = h.served_coordinator(true, true).await;
+    let context = ContextId::parse("envelope-only").unwrap();
+    // The same client envelope context is reused after each run completes: it only
+    // guards the detached owner's lifetime and never names a retained conversation.
+    for round in 1..=2 {
+        let mut params = served_params(false);
+        params.context = Some(context.clone());
+        let task = coordinator.run_workflow(params).await.unwrap();
+        let record = h.served_terminal(&task).await;
+        assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+        assert_eq!(record.result.as_deref(), Some("answer"));
+        h.served_settled(&coordinator, &task).await;
+        assert!(coordinator.session_manager.status(&context).await.is_none());
+        assert!(!coordinator.session_manager.has_live_contexts().await);
+        assert!(
+            bridge_workflow::run_spec::WorkflowRunSpecV1::decode_snapshot_v2(
+                record.workflow_spec_json.unwrap().as_bytes()
+            )
+            .unwrap()
+            .fallback_chains
+            .is_some()
+        );
+        assert_eq!(h.f.rows().len(), 2 * round);
+    }
+    assert_eq!(h.f.providers[1].prompts.load(Ordering::SeqCst), 2);
+    assert_eq!(h.f.providers[2].setup.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -9435,7 +9372,7 @@ async fn served_chain_cancellation_boundaries() {
             h.f.store.request_cancel(&task).await.unwrap();
         }
         let locator = coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .run_workflow_with_identity(served_params(false), identity.clone())
             .await
             .unwrap();
         assert_eq!(locator.task_id, task);
@@ -9555,15 +9492,9 @@ async fn served_chain_cancel_and_cleanup_errors_keep_ordinary_precedence() {
             let coordinator = h.served_coordinator(chains, true).await;
             let identity = AttemptIdentity::initial().unwrap();
             let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
-            let submitted = if chains {
-                coordinator
-                    .run_workflow_with_chains_for_test(served_params(false), identity.clone())
-                    .await
-            } else {
-                coordinator
-                    .run_workflow_with_identity(served_params(false), identity.clone())
-                    .await
-            };
+            let submitted = coordinator
+                .run_workflow_with_identity(served_params(false), identity.clone())
+                .await;
             assert_eq!(submitted.unwrap().task_id, task);
             boundary_wait(
                 behavior,
@@ -9711,7 +9642,7 @@ async fn served_chain_accounting_and_retries_match_local() {
         let coordinator = h.served_coordinator_for(h.retry_graph(attempts).await, true, true);
         let identity = AttemptIdentity::initial().unwrap();
         let locator = coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .run_workflow_with_identity(served_params(false), identity.clone())
             .await
             .unwrap();
         let record = h.served_terminal(&locator.task_id).await;
@@ -9798,10 +9729,7 @@ async fn served_chain_persistence_and_cleanup_failures_never_authorize_a_success
         }
         let coordinator = h.served_coordinator(true, true).await;
         let locator = coordinator
-            .run_workflow_with_chains_for_test(
-                served_params(false),
-                AttemptIdentity::initial().unwrap(),
-            )
+            .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
             .await
             .unwrap();
         let record = h.served_terminal(&locator.task_id).await;
@@ -9854,7 +9782,7 @@ async fn served_chain_optional_summary_failure_keeps_accounting_and_acceptance()
             .with_workflow_history(Ok(h.fault_history(0, None, fail_prompt, fail_terminal)));
         let identity = AttemptIdentity::initial().unwrap();
         let locator = coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .run_workflow_with_identity(served_params(false), identity.clone())
             .await
             .unwrap();
         let record = h.served_terminal(&locator.task_id).await;
@@ -9901,28 +9829,11 @@ async fn served_chain_optional_summary_failure_keeps_accounting_and_acceptance()
 }
 
 #[tokio::test]
-async fn served_chain_without_executor_refuses_before_persistence() {
+async fn served_chain_without_executor_stays_ordinary() {
     let h = CandidateFixture::new("reject", "success").await;
     let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
     let coordinator = h.served_coordinator_with(graph, true, true, false);
-    let identity = AttemptIdentity::initial().unwrap();
-    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
-    assert!(matches!(
-        coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
-            .await,
-        Err(BridgeError::InvalidStateTransition)
-    ));
-    assert!(h.f.store.get(&task).await.unwrap().is_none());
-    assert!(h
-        .f
-        .store
-        .get_attempt_locator(&task)
-        .await
-        .unwrap()
-        .is_none());
-    h.assert_no_candidate_effects("no executor");
-    // Without bound chains the ordinary route keeps its existing behaviour.
+    // No candidate executor means no affirmative admission: no authority is bound.
     let locator = coordinator
         .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
         .await
@@ -9934,6 +9845,7 @@ async fn served_chain_without_executor_refuses_before_persistence() {
         .workflow_spec_json
         .unwrap()
         .contains("fallback_chains"));
+    h.assert_no_candidate_effects("no executor");
 }
 
 // C2c2e4: records written by the real served runner feed the existing checked
@@ -9981,7 +9893,7 @@ impl CandidateFixture {
         }
         let identity = AttemptIdentity::initial().unwrap();
         let locator = coordinator
-            .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+            .run_workflow_with_identity(served_params(false), identity.clone())
             .await
             .unwrap();
         self.served_settled(&coordinator, &locator.task_id).await;
@@ -10445,10 +10357,7 @@ async fn served_late_refusal_preserves_an_existing_terminal_task() {
         let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
         let coordinator = h.served_coordinator_for(graph.clone(), true, true);
         let locator = coordinator
-            .run_workflow_with_chains_for_test(
-                served_params(false),
-                AttemptIdentity::initial().unwrap(),
-            )
+            .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
             .await
             .unwrap();
         let terminal = h.served_terminal(&locator.task_id).await;
@@ -10502,10 +10411,7 @@ async fn served_primary_publication_failure_prevents_downstream_execution() {
         .unwrap();
     let coordinator = h.served_coordinator_for(graph, true, true);
     let locator = coordinator
-        .run_workflow_with_chains_for_test(
-            served_params(false),
-            AttemptIdentity::initial().unwrap(),
-        )
+        .run_workflow_with_identity(served_params(false), AttemptIdentity::initial().unwrap())
         .await
         .unwrap();
     let record = h.served_terminal(&locator.task_id).await;
@@ -10549,7 +10455,7 @@ async fn served_projection_live_and_reattach_show_one_node_completion() {
         .with_workflow_history(Ok(h.fault_history(0, Some(gate.clone()), false, false)));
     let identity = AttemptIdentity::initial().unwrap();
     let locator = coordinator
-        .run_workflow_with_chains_for_test(served_params(false), identity.clone())
+        .run_workflow_with_identity(served_params(false), identity.clone())
         .await
         .unwrap();
     let task = locator.task_id.clone();
@@ -10680,50 +10586,532 @@ async fn served_projection_live_and_reattach_show_one_node_completion() {
 
 #[tokio::test]
 async fn served_refusal_projects_interrupted_as_failed() {
-    use bridge_coordinator::detached::{
-        finalize_detached_with_barrier, FrameKind, TaskProgressHub, TerminalOutcome,
-    };
+    use bridge_coordinator::detached::{FrameKind, TerminalOutcome};
     let h = CandidateFixture::new("reject", "success").await;
     let graph = h.served_dependent_graph().await;
-    let (h, task, _) = h.served_crash(graph, "", FAIL_SUCCESSOR_RESERVATION).await;
-    let store: Arc<dyn TaskStore> = h.f.store.clone();
-    let hub = Arc::new(TaskProgressHub::new());
-    let hubs = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
-        (task.clone(), hub.clone()),
-    ])));
-    let mut live = hub.subscribe();
-    finalize_detached_with_barrier(
-        &store,
-        &hubs,
-        &task,
-        TaskRecordStatus::Interrupted,
-        None,
-        Some("not resumable: candidate refusal"),
-        Some(&hub),
-        None,
-        "not_needed",
-    )
-    .await
-    .unwrap();
-    let frame = boundary_wait(
-        "served refusal projection",
-        "the projected terminal frame",
-        live.recv(),
-    )
-    .await
-    .unwrap();
+    let (h, task, _) = h
+        .served_crash(graph.clone(), "", FAIL_SUCCESSOR_RESERVATION)
+        .await;
+    // Recovery without an accounting owner is a real restored-composition refusal.
+    // Resume registers the hub and spawns the runner on this single-threaded
+    // runtime, so the subscription below precedes every published frame.
+    let boot = h.served_coordinator_for(graph, false, false);
+    boot.resume_with_cap(3).await.unwrap();
+    let hub = boot.progress_hubs().lock().await.get(&task).cloned();
+    let mut live = hub.expect("resume registers the served hub").subscribe();
+    let frame = boundary_wait("served refusal projection", "the terminal frame", async {
+        loop {
+            let frame = live.recv().await.unwrap();
+            if matches!(frame.kind, FrameKind::Terminal { .. }) {
+                break frame;
+            }
+        }
+    })
+    .await;
     let FrameKind::Terminal { outcome, output } = frame.kind else {
         panic!("expected terminal: {frame:?}");
     };
     // The durable status stays Interrupted; transports project it as failed.
     assert!(matches!(outcome, TerminalOutcome::Failed));
-    assert_eq!(output, "not resumable: candidate refusal");
+    assert!(
+        output.contains("restored candidate composition refused"),
+        "{output}"
+    );
+    h.served_settled(&boot, &task).await;
     let record = h.f.store.get(&task).await.unwrap().unwrap();
     assert_eq!(record.status, TaskRecordStatus::Interrupted);
+    assert_eq!(record.error.as_deref(), Some(output.as_str()));
     assert!(record.result.is_none());
     let snapshot = h.f.store.progress_snapshot(&task).await.unwrap();
     assert_eq!(snapshot.terminal_seq, Some(frame.seq));
-    assert!(hubs.lock().await.is_empty());
+    assert!(boot.progress_hubs().lock().await.is_empty());
+}
+
+// ---- C2c2e5: fresh served activation through the A2A and MCP transports ---------------------
+
+struct WorkflowRoute;
+impl RouteDecision for WorkflowRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>> {
+        self.route(meta).map(Some)
+    }
+    fn route(&self, _: &TaskMeta) -> Result<RouteTarget> {
+        Ok(RouteTarget::Workflow(WorkflowId::parse("workflow")?))
+    }
+}
+
+const SERVED_INPUT: &str = "---\ntask-type: freeform\n---\nidentical input";
+
+impl CandidateFixture {
+    fn a2a_router(&self, coordinator: &Arc<bridge_coordinator::Coordinator>) -> axum::Router {
+        Arc::new(bridge_a2a_inbound::server::InboundServer::from_coordinator(
+            coordinator.clone(),
+            Arc::new(WorkflowRoute),
+            Arc::new(bridge_policy::auth::AlwaysGrant),
+            "http://localhost",
+            Arc::new(bridge_a2a_outbound::StubDelegation),
+            "agent",
+        ))
+        .router()
+    }
+
+    async fn a2a_response(
+        router: axum::Router,
+        method: &str,
+        params: serde_json::Value,
+        cursor: Option<i64>,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .header("A2A-Version", "1.0");
+        if let Some(cursor) = cursor {
+            request = request.header("Last-Event-ID", cursor.to_string());
+        }
+        let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
+        router
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn a2a_send(owner: &AttemptIdentity, context: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"message":{"text":SERVED_INPUT, "taskId":owner.execution_id.as_str(),
+            "contextId":context, "metadata":{"fallback_chain":"forged",
+                "a2a-bridge.execution_id":owner.execution_id.as_str(),
+                "a2a-bridge.attempt_id":owner.attempt_id.as_str()}}})
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// `run_workflow` over the real MCP server loop; returns the tool reply.
+    async fn mcp_run_workflow(
+        coordinator: &Arc<bridge_coordinator::Coordinator>,
+        owner: &AttemptIdentity,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(server);
+        let serve = bridge_mcp::serve(read, write, coordinator.clone());
+        let caller = async {
+            let (r, mut w) = tokio::io::split(client);
+            for request in [
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_workflow","arguments":{
+                    "workflow":"workflow", "input":SERVED_INPUT, "fallback_chain":"forged",
+                    "execution_id":owner.execution_id.as_str(), "attempt_id":owner.attempt_id.as_str()
+                }}}),
+            ] {
+                w.write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let mut lines = tokio::io::BufReader::new(r).lines();
+            lines.next_line().await.unwrap().unwrap();
+            let reply = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            w.shutdown().await.unwrap();
+            reply
+        };
+        let (served, reply) = boundary_wait("mcp run_workflow", "the tool reply", async {
+            tokio::join!(serve, caller)
+        })
+        .await;
+        served.unwrap();
+        reply
+    }
+}
+
+fn sse_progress(body: &str) -> Vec<(Option<i64>, serde_json::Value)> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            let id = block
+                .lines()
+                .find_map(|line| line.strip_prefix("id:"))
+                .and_then(|id| id.trim().parse().ok());
+            let data = block.lines().find_map(|line| line.strip_prefix("data:"))?;
+            Some((id, serde_json::from_str(data.trim()).ok()?))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn served_four_causes_activate_on_a2a_and_mcp() {
+    for transport in ["a2a_stream", "a2a_unary", "mcp"] {
+        for source in ["reject", "region", "billing-match", "rate"] {
+            let label = format!("{transport}/{source}");
+            let h = CandidateFixture::new(source, "success").await;
+            *h.calls[3].prompt_answer.lock().unwrap() = Some("downstream");
+            let graph = h.served_dependent_graph().await;
+            let coordinator = Arc::new(h.served_coordinator_for(graph, true, true));
+            let owner = AttemptIdentity::initial().unwrap();
+            let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+            match transport {
+                "mcp" => {
+                    let reply = CandidateFixture::mcp_run_workflow(&coordinator, &owner).await;
+                    assert_ne!(reply["result"]["isError"], true, "{label}: {reply}");
+                }
+                method => {
+                    let method = if method == "a2a_stream" {
+                        "SendStreamingMessage"
+                    } else {
+                        "SendMessage"
+                    };
+                    let response = CandidateFixture::a2a_response(
+                        h.a2a_router(&coordinator),
+                        method,
+                        CandidateFixture::a2a_send(&owner, None),
+                        None,
+                    )
+                    .await;
+                    let body = CandidateFixture::body_text(response).await;
+                    assert!(!body.contains("error"), "{label}: {body}");
+                    assert_eq!(
+                        body.contains("downstream"),
+                        method == "SendStreamingMessage",
+                        "{label}: {body}"
+                    );
+                }
+            }
+            let record = h.served_terminal(&task).await;
+            h.served_settled(&coordinator, &task).await;
+            assert_eq!(
+                record.status,
+                TaskRecordStatus::Completed,
+                "{label}: {record:?}"
+            );
+            assert_eq!(record.result.as_deref(), Some("downstream"), "{label}");
+            // A rejects, B (only) answers, and the chainless downstream sees only B's text.
+            assert_eq!(
+                *h.f.spawns.lock().unwrap(),
+                ["source", "target", "other"],
+                "{label}"
+            );
+            let (a, b) = (
+                h.f.providers[0].inputs.lock().unwrap().clone(),
+                h.f.providers[1].inputs.lock().unwrap().clone(),
+            );
+            assert_eq!(a.len(), 1, "{label}");
+            assert_eq!(a, b, "{label}: identical rendered input");
+            assert_eq!(a[0][0].text, "identical input", "{label}");
+            let downstream = h.f.providers[3].inputs.lock().unwrap().clone();
+            assert_eq!(downstream.len(), 1, "{label}");
+            assert_eq!(downstream[0][0].text, "got:answer", "{label}");
+            // The declared C step is never prepared, polled or accounted.
+            assert_eq!(h.f.providers[2].setup.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(
+                h.f.providers[2].prompts.load(Ordering::SeqCst),
+                0,
+                "{label}"
+            );
+            assert_eq!(h.calls[2].setups.load(Ordering::SeqCst), 0, "{label}");
+            let mut rows = h.f.rows();
+            rows.sort_by_key(|row| row.started_ms);
+            assert_eq!(
+                rows.iter()
+                    .map(|r| r.attribution.agent.as_str())
+                    .collect::<Vec<_>>(),
+                ["source", "target", "other"],
+                "{label}"
+            );
+            assert!(
+                rows.iter().all(|r| r.finalized
+                    && r.attribution.run_attempt.as_deref() == Some(owner.attempt_id.as_str())),
+                "{label}"
+            );
+            let progress =
+                h.f.store
+                    .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(progress.visits.len(), 2, "{label}");
+            assert!(progress.visits.iter().all(|v| v.owner == owner), "{label}");
+            let locator = h.f.store.get_attempt_locator(&task).await.unwrap().unwrap();
+            assert_eq!(locator.identity, owner, "{label}");
+        }
+    }
+}
+
+/// `run-workflow --serve` against a real listener over the declared chain. `run` is the CLI entry
+/// point; the same client-supplied envelope context is reused after the first run completes.
+#[allow(dead_code)] // Also compiled as a standalone integration fixture.
+pub(crate) async fn served_cli_activation<F, Fut>(run: F)
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), String>>,
+{
+    for source in ["reject", "region", "billing-match", "rate"] {
+        let h = CandidateFixture::new(source, "success").await;
+        let coordinator = Arc::new(h.served_coordinator(true, true).await);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = h.a2a_router(&coordinator);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = h.f.dir.path();
+        std::fs::write(root.join("input"), SERVED_INPUT).unwrap();
+        for round in 0..2 {
+            let out = root.join(format!("output-{round}"));
+            let args = [
+                "--serve",
+                "--url",
+                &url,
+                "--context",
+                "envelope",
+                "workflow",
+                "--input",
+                root.join("input").to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--no-heartbeat",
+            ]
+            .map(String::from)
+            .to_vec();
+            run(args)
+                .await
+                .unwrap_or_else(|e| panic!("{source}/{round}: {e}"));
+            // The terminal result is written exactly once.
+            assert_eq!(std::fs::read_to_string(out).unwrap(), "answer", "{source}");
+        }
+        server.abort();
+        let db = rusqlite::Connection::open(root.join("tasks.sqlite")).unwrap();
+        let tasks: Vec<String> = db
+            .prepare("SELECT id FROM tasks ORDER BY created_ms, id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            // The fixture's own pre-created owner task is not a served submission.
+            .filter(|id| id != h.owner.execution_id.as_str())
+            .collect();
+        assert_eq!(tasks.len(), 2, "{source}");
+        let rows = h.f.rows();
+        for task in tasks {
+            let task = TaskId::parse(task).unwrap();
+            let record = h.f.store.get(&task).await.unwrap().unwrap();
+            assert_eq!(record.status, TaskRecordStatus::Completed, "{source}");
+            assert_eq!(record.result.as_deref(), Some("answer"), "{source}");
+            let owner =
+                h.f.store
+                    .get_attempt_locator(&task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .identity;
+            assert_eq!(owner.execution_id.as_str(), task.as_str(), "{source}");
+            let progress =
+                h.f.store
+                    .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(progress.visits.len(), 2, "{source}");
+            assert!(progress.visits.iter().all(|v| v.owner == owner), "{source}");
+            let attempts: Vec<_> = rows
+                .iter()
+                .filter(|r| r.attribution.run_attempt.as_deref() == Some(owner.attempt_id.as_str()))
+                .map(|r| r.attribution.agent.as_str())
+                .collect();
+            assert_eq!(attempts.len(), 2, "{source}");
+        }
+        // Reusing the envelope context claims no retained provider conversation.
+        assert!(
+            !coordinator.session_manager.has_live_contexts().await,
+            "{source}"
+        );
+        assert!(coordinator
+            .session_manager
+            .status(&ContextId::parse("envelope").unwrap())
+            .await
+            .is_none());
+        assert_eq!(rows.len(), 4, "{source}");
+        for i in [0, 1] {
+            assert_eq!(
+                h.f.providers[i].prompts.load(Ordering::SeqCst),
+                2,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            *h.f.providers[0].inputs.lock().unwrap(),
+            *h.f.providers[1].inputs.lock().unwrap()
+        );
+        assert_eq!(h.f.providers[2].setup.load(Ordering::SeqCst), 0, "{source}");
+    }
+}
+
+#[tokio::test]
+async fn served_a2a_resubscribe_replays_cursors_locator_and_single_terminal() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = Arc::new(h.served_coordinator(true, true).await);
+    let owner = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+    let live = CandidateFixture::body_text(
+        CandidateFixture::a2a_response(
+            h.a2a_router(&coordinator),
+            "SendStreamingMessage",
+            CandidateFixture::a2a_send(&owner, None),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(live.matches("TASK_STATE_COMPLETED").count(), 1, "{live}");
+    h.served_settled(&coordinator, &task).await;
+    let subscribe = |cursor| {
+        let router = h.a2a_router(&coordinator);
+        let params = serde_json::json!({"id":task.as_str()});
+        async move {
+            let response =
+                CandidateFixture::a2a_response(router, "SubscribeToTask", params, cursor).await;
+            sse_progress(&CandidateFixture::body_text(response).await)
+        }
+    };
+    let kind = |frames: &[(Option<i64>, serde_json::Value)], kind: &str| {
+        frames
+            .iter()
+            .filter(|(_, f)| f["kind"] == kind)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let full = subscribe(None).await;
+    // The exact durable locator, one completion for the chain-bearing node, one terminal.
+    let locators = kind(&full, "attempt_locator");
+    assert_eq!(locators.len(), 1, "{full:?}");
+    assert_eq!(locators[0].1["execution_id"], owner.execution_id.as_str());
+    assert_eq!(locators[0].1["attempt_id"], owner.attempt_id.as_str());
+    let finished = kind(&full, "node_finished");
+    assert_eq!(finished.len(), 1, "{full:?}");
+    assert_eq!(finished[0].1["node"], "node");
+    assert_eq!(finished[0].1["output"], "answer");
+    let terminal = kind(&full, "terminal");
+    assert_eq!(terminal.len(), 1, "{full:?}");
+    assert_eq!(terminal[0].1["outcome"], "completed");
+    assert_eq!(terminal[0].1["output"], "answer");
+    let (finished_seq, terminal_seq) = (finished[0].0.unwrap(), terminal[0].0.unwrap());
+    assert!(finished_seq < terminal_seq);
+    // A cursor at the node completion replays only the terminal; at the terminal, nothing.
+    let after_node = subscribe(Some(finished_seq)).await;
+    assert!(
+        kind(&after_node, "node_finished").is_empty(),
+        "{after_node:?}"
+    );
+    assert_eq!(kind(&after_node, "terminal").len(), 1, "{after_node:?}");
+    assert_eq!(
+        kind(&after_node, "attempt_locator")[0].1["attempt_id"],
+        owner.attempt_id.as_str()
+    );
+    let after_terminal = subscribe(Some(terminal_seq)).await;
+    assert!(
+        kind(&after_terminal, "node_finished").is_empty(),
+        "{after_terminal:?}"
+    );
+    assert!(
+        kind(&after_terminal, "terminal").is_empty(),
+        "{after_terminal:?}"
+    );
+    // Reattach is read-only: no provider or accounting effect beyond the one run.
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source", "target"]);
+    assert_eq!(h.f.rows().len(), 2);
+}
+
+#[tokio::test]
+async fn served_client_disconnect_does_not_cancel_detached_owner() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let coordinator = Arc::new(h.served_coordinator(true, true).await);
+    let owner = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+    // The response stream is dropped unread: the client is gone before any frame is sent.
+    drop(
+        CandidateFixture::a2a_response(
+            h.a2a_router(&coordinator),
+            "SendStreamingMessage",
+            CandidateFixture::a2a_send(&owner, None),
+            None,
+        )
+        .await,
+    );
+    let record = h.served_terminal(&task).await;
+    assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+    assert_eq!(record.result.as_deref(), Some("answer"));
+    for provider in &h.f.providers {
+        assert_eq!(provider.cancels.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(h.f.rows().len(), 2);
+}
+
+#[tokio::test]
+async fn served_unapproved_batch_surface_acquires_no_candidate_authority() {
+    use bridge_coordinator::batch::{BatchParams, BatchRuntime};
+    let h = CandidateFixture::new("reject", "success").await;
+    let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
+    let coordinator = bridge_coordinator::Coordinator::new(
+        h.f.coordinator.session_manager.clone(),
+        Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+        Arc::new(std::collections::HashMap::from([(graph.id.clone(), graph)])),
+        h.f.store.clone(),
+        h.f.store.clone(),
+        h.f.coordinator.policy(),
+        h.registry.clone(),
+        Arc::new(bridge_coordinator::clock::SystemClock),
+        None,
+        Some(BatchRuntime::new(
+            1,
+            1,
+            Arc::new(bridge_observ::NoopObserver),
+        )),
+        Arc::new(bridge_observ::NoopObserver),
+        3,
+    )
+    .with_workflow_admission(h.builder())
+    .with_workflow_history(Ok(h.f.store.clone()))
+    .with_accounting(AccountingV1::new(h.f.store.clone()))
+    .with_mcp_fallback(h.run.progress.chains.clone());
+    let batch = coordinator
+        .run_batch(BatchParams {
+            workflow: "workflow".into(),
+            concurrency: Some(1),
+            items: vec![BatchItem {
+                item_id: "one".into(),
+                input: SERVED_INPUT.into(),
+                session_cwd: None,
+            }],
+        })
+        .await
+        .unwrap();
+    boundary_wait("batch", "the item to fail", async {
+        loop {
+            let summary = coordinator.batch_status(&batch).await.unwrap();
+            if summary.status != BatchStatus::Working {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 1);
+    assert_eq!(h.f.providers[1].setup.load(Ordering::SeqCst), 0);
+    assert_eq!(h.f.rows().len(), 1);
+    let candidates: i64 = rusqlite::Connection::open(h.f.dir.path().join("tasks.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_candidate_progress_v1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(candidates, 0);
 }
 
 // ---- retained-context exclusion (C2c2e E1) ----------------------------------------------------
@@ -11110,7 +11498,7 @@ async fn workflow_envelope_context_alone_stays_cold_eligible() {
     params.context = Some(dispatcher.context.clone());
     let coordinator = h.served_coordinator(true, true).await;
     coordinator
-        .run_workflow_with_chains_for_test(params, identity)
+        .run_workflow_with_identity(params, identity)
         .await
         .unwrap();
     let record = h.served_terminal(&task).await;
