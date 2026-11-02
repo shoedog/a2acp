@@ -6367,9 +6367,6 @@ async fn fallback_fanout(
                     events.push(event);
                 }
             }
-            if srv.store.cancel_requested(&task).await.unwrap_or(false) {
-                outcome = TaskOutcome::Canceled;
-            }
             (events, outcome)
         };
         let work = async { tokio::join!(driver, merge, collect) };
@@ -6379,12 +6376,22 @@ async fn fallback_fanout(
             _ = async { stream_tx.as_ref().unwrap().closed().await }, if stream_tx.is_some() => {
                 // Disconnect and CancelTask share active-candidate ownership and peer
                 // deduplication, including pending delegation and late ID discovery.
-                let _ = cancel_admitted_task(srv.clone(), Value::Null, task.clone()).await;
-                work.await
+                // Keep polling the driver: it may own the FIFO bindings-mutex
+                // reservation ahead of cancellation's acquisition.
+                let (_, result) = tokio::join!(
+                    cancel_admitted_task(srv.clone(), Value::Null, task.clone()),
+                    &mut work,
+                );
+                result
             }
             result = &mut work => result,
         }
     };
+    // The collector can finish while disconnect cancellation waits for bindings.
+    // Resolve the latch after both futures finish, before publishing the terminal.
+    if srv.store.cancel_requested(&task).await.unwrap_or(false) {
+        outcome = TaskOutcome::Canceled;
+    }
     if let Some(tx) = stream_tx {
         if let Some(history) = history.as_mut() {
             let (state, reason) = match outcome {
@@ -7800,6 +7807,240 @@ mod tests {
                 assert_eq!(retained, failure);
             }
         }
+    }
+
+    enum FanoutDisconnectCase {
+        QueuedDriver,
+        AfterExposure,
+        PeerCompletesDuringCancel,
+        Connected,
+    }
+
+    struct CompletingFanoutPeer(Mutex<Option<oneshot::Receiver<()>>>, Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl DelegationPort for CompletingFanoutPeer {
+        async fn delegate(
+            &self,
+            _: &AuthContext,
+            _: &TaskId,
+            _: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            let finish = self.0.lock().unwrap().take().unwrap();
+            let ended = self.1.clone();
+            let (hold, peer_task) = tokio::sync::watch::channel(Some(PeerTaskId("peer".into())));
+            Ok(Delegation {
+                peer_task,
+                events: Box::pin(async_stream::stream! {
+                    let _hold = hold;
+                    yield Ok(Event::status("peer ready"));
+                    finish.await.unwrap();
+                    ended.store(true, Ordering::SeqCst);
+                }),
+            })
+        }
+        async fn cancel(&self, _: &PeerTaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// Drive the real fallback producer explicitly so the lock/disconnect ordering
+    /// is fixed by polls, rather than scheduler timing or sleeps.
+    async fn check_fallback_fanout_disconnect(case: FanoutDisconnectCase) {
+        use bridge_core::{fallback_runtime::FrozenFallbackInvocationV1, routing::*};
+        let contended = matches!(case, FanoutDisconnectCase::QueuedDriver);
+        let late = matches!(case, FanoutDisconnectCase::PeerCompletesDuringCancel);
+        let connected = matches!(case, FanoutDisconnectCase::Connected);
+        let backend = FakeBackend::new();
+        let mut entry = bare_entry("source");
+        entry.model = Some("model".into());
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        entry.cwd = Some(cwd.display().to_string());
+        let source = FallbackCandidateV1 {
+            agent: entry.id.clone(),
+            model: "model".into(),
+            posture: CandidatePostureV1 {
+                kind: "acp".into(),
+                cmd: entry.cmd.clone(),
+                cwd: cwd.display().to_string(),
+                session_cwd: cwd.display().to_string(),
+                mcp_delivery: "acp".into(),
+                ..Default::default()
+            },
+        };
+        let chain = FrozenFallbackChainV1 {
+            id: "capacity".into(),
+            source: source.clone(),
+            causes: [FallbackCauseV1::QuotaExhausted].into(),
+            steps: vec![FallbackCandidateV1 {
+                agent: AgentId::parse("target").unwrap(),
+                ..source.clone()
+            }],
+        };
+        let spawn_backend = backend.clone();
+        let registry = Arc::new(
+            bridge_registry::registry::Registry::new(
+                RegistrySnapshot {
+                    default: entry.id.clone(),
+                    entries: vec![entry],
+                    allowed_cmds: vec!["fake".into()],
+                    billing_identities: vec![],
+                },
+                Arc::new(move |_| {
+                    let backend = spawn_backend.clone();
+                    Box::pin(async move { Ok(backend as Arc<dyn AgentBackend>) })
+                }),
+            )
+            .unwrap(),
+        );
+        let ledger = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = Arc::new(
+            Arc::try_unwrap(test_coordinator(
+                registry,
+                Arc::new(FakeStore::default()),
+                Arc::new(AutoApprove),
+            ))
+            .unwrap_or_else(|_| panic!("fresh coordinator"))
+            .with_workflow_history(Ok(ledger.clone()))
+            .with_mcp_fallback(vec![chain.clone()]),
+        );
+        let peer = FakeDelegation::idle(vec![Ok(Event::status("peer ready"))], Some("peer"));
+        let (finish, wait) = oneshot::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let delegation: Arc<dyn DelegationPort> = if late || connected {
+            Arc::new(CompletingFanoutPeer(Mutex::new(Some(wait)), ended.clone()))
+        } else {
+            peer.clone()
+        };
+        let srv = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(FanoutSkillRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+            "source",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let history = srv
+            .coordinator()
+            .admit_direct_attempt(
+                identity.clone(),
+                bridge_core::workflow_history::ExecutionSurface::Other,
+                "a2a_stream",
+                "test".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(SVC_PARAM_VERSION, HeaderValue::from_static("1.0"));
+        let routed = srv
+            .gate(
+                &headers,
+                &json!({
+                    "taskId": task.as_str(),
+                    "message": { "text": "go", "metadata": { "a2a-bridge.skill": "fan-out" } }
+                }),
+            )
+            .unwrap();
+        let routing = FrozenFallbackInvocationV1::freeze(vec![chain], source).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut producer = Box::pin(fallback_fanout(
+            srv.clone(),
+            Value::Null,
+            routed,
+            identity.clone(),
+            Some(history),
+            routing,
+            Some(tx),
+        ));
+        let mut held = if contended {
+            Some(srv.bindings().lock().await)
+        } else {
+            None
+        };
+        // This poll queues the driver behind held bindings, or completes it
+        // and parks on the peer; all setup doubles complete synchronously.
+        assert!(futures::poll!(&mut producer).is_pending());
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), !contended);
+        let mut exposed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            exposed.push(event.unwrap());
+        }
+        assert!(exposed.iter().any(|event| event.text() == "peer ready"));
+        assert!(exposed.iter().all(|event| event.outcome().is_none()));
+        if !contended {
+            assert!(exposed.iter().any(|event| event.text() == "PONG"));
+        }
+        if late {
+            held = Some(srv.bindings().lock().await);
+        }
+        if !connected {
+            rx.close();
+        }
+        if contended || late {
+            // Queue disconnect cancellation before releasing the contested lock.
+            assert!(futures::poll!(&mut producer).is_pending());
+        }
+        if late || connected {
+            finish.send(()).unwrap();
+            if late {
+                // Drain peer completion and the collector while cancellation is
+                // still blocked. All events are ready; explicit polls fix the order.
+                assert!(futures::poll!(&mut producer).is_pending());
+                assert!(ended.load(Ordering::SeqCst));
+                assert!(futures::poll!(&mut producer).is_pending());
+                assert!(!srv.store.cancel_requested(&task).await.unwrap());
+            }
+        }
+        drop(held);
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(producer, async {
+                let _unrelated = srv.bindings().lock().await;
+            })
+        })
+        .await
+        .expect("disconnect must finish the producer and unblock unrelated bindings users");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(srv.store.cancel_requested(&task).await.unwrap(), !connected);
+        assert_eq!(
+            peer.cancels().lock().unwrap().len(),
+            usize::from(!late && !connected)
+        );
+        if connected {
+            let mut terminals = Vec::new();
+            while let Some(event) = rx.recv().await {
+                terminals.extend(event.unwrap().outcome());
+            }
+            assert_eq!(terminals, vec![TaskOutcome::Completed]);
+        }
+        assert!(srv.fallback_cancels.lock().unwrap().is_empty());
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), !contended);
+        let rows = ledger.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1, "one aggregate terminal");
+        assert_eq!(rows[0].reservation.identity, identity);
+        let expected = if connected { "completed" } else { "canceled" };
+        assert_eq!(rows[0].terminal.outcome, expected);
+        assert_eq!(rows[0].terminal.terminal_reason, expected);
+        let (_, status) = attempt_status_response(srv, identity.attempt_id.as_str()).await;
+        assert_eq!(status["result"]["attempt"]["terminal"]["outcome"], expected);
+    }
+
+    #[tokio::test]
+    async fn fallback_fanout_disconnect_with_queued_bindings_driver() {
+        check_fallback_fanout_disconnect(FanoutDisconnectCase::QueuedDriver).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_fanout_disconnect_after_exposure_records_canceled_terminal() {
+        check_fallback_fanout_disconnect(FanoutDisconnectCase::AfterExposure).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_fanout_disconnect_beats_peer_completion_while_cancel_waits() {
+        check_fallback_fanout_disconnect(FanoutDisconnectCase::PeerCompletesDuringCancel).await;
+        check_fallback_fanout_disconnect(FanoutDisconnectCase::Connected).await;
     }
 
     // ---- inline fakes ----
