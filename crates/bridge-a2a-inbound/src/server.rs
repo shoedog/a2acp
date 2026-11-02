@@ -6379,8 +6379,13 @@ async fn fallback_fanout(
             _ = async { stream_tx.as_ref().unwrap().closed().await }, if stream_tx.is_some() => {
                 // Disconnect and CancelTask share active-candidate ownership and peer
                 // deduplication, including pending delegation and late ID discovery.
-                let _ = cancel_admitted_task(srv.clone(), Value::Null, task.clone()).await;
-                work.await
+                // Keep polling the driver: it may own the FIFO bindings-mutex
+                // reservation ahead of cancellation's acquisition.
+                let (_, result) = tokio::join!(
+                    cancel_admitted_task(srv.clone(), Value::Null, task.clone()),
+                    &mut work,
+                );
+                result
             }
             result = &mut work => result,
         }
@@ -7800,6 +7805,172 @@ mod tests {
                 assert_eq!(retained, failure);
             }
         }
+    }
+
+    /// Drive the real fallback producer explicitly so the lock/disconnect ordering
+    /// is fixed by polls, rather than scheduler timing or sleeps.
+    async fn check_fallback_fanout_disconnect(contended: bool, peer_idle: bool) {
+        use bridge_core::{fallback_runtime::FrozenFallbackInvocationV1, routing::*};
+        let backend = FakeBackend::new();
+        let mut entry = bare_entry("source");
+        entry.model = Some("model".into());
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        entry.cwd = Some(cwd.display().to_string());
+        let source = FallbackCandidateV1 {
+            agent: entry.id.clone(),
+            model: "model".into(),
+            posture: CandidatePostureV1 {
+                kind: "acp".into(),
+                cmd: entry.cmd.clone(),
+                cwd: cwd.display().to_string(),
+                session_cwd: cwd.display().to_string(),
+                mcp_delivery: "acp".into(),
+                ..Default::default()
+            },
+        };
+        let chain = FrozenFallbackChainV1 {
+            id: "capacity".into(),
+            source: source.clone(),
+            causes: [FallbackCauseV1::QuotaExhausted].into(),
+            steps: vec![FallbackCandidateV1 {
+                agent: AgentId::parse("target").unwrap(),
+                ..source.clone()
+            }],
+        };
+        let spawn_backend = backend.clone();
+        let registry = Arc::new(
+            bridge_registry::registry::Registry::new(
+                RegistrySnapshot {
+                    default: entry.id.clone(),
+                    entries: vec![entry],
+                    allowed_cmds: vec!["fake".into()],
+                    billing_identities: vec![],
+                },
+                Arc::new(move |_| {
+                    let backend = spawn_backend.clone();
+                    Box::pin(async move { Ok(backend as Arc<dyn AgentBackend>) })
+                }),
+            )
+            .unwrap(),
+        );
+        let ledger = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = Arc::new(
+            Arc::try_unwrap(test_coordinator(
+                registry,
+                Arc::new(FakeStore::default()),
+                Arc::new(AutoApprove),
+            ))
+            .unwrap_or_else(|_| panic!("fresh coordinator"))
+            .with_workflow_history(Ok(ledger.clone()))
+            .with_mcp_fallback(vec![chain.clone()]),
+        );
+        let peer_events = vec![Ok(Event::status("peer ready"))];
+        let peer = if peer_idle {
+            FakeDelegation::idle(peer_events, Some("peer"))
+        } else {
+            FakeDelegation::new(peer_events, Some("peer"))
+        };
+        let srv = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(FanoutSkillRoute),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            peer.clone(),
+            "source",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let history = srv
+            .coordinator()
+            .admit_direct_attempt(
+                identity.clone(),
+                bridge_core::workflow_history::ExecutionSurface::Other,
+                "a2a_stream",
+                "test".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let routed = RoutedCall {
+            task: task.clone(),
+            session: SessionId::parse(format!("session-{}", task.as_str())).unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Fanout,
+            default_route_deferred: false,
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: None,
+            session_cwd: None,
+            liveness: Default::default(),
+        };
+        let routing = FrozenFallbackInvocationV1::freeze(vec![chain], source).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut producer = Box::pin(fallback_fanout(
+            srv.clone(),
+            Value::Null,
+            routed,
+            identity.clone(),
+            Some(history),
+            routing,
+            Some(tx),
+        ));
+        let held = if contended {
+            Some(srv.bindings().lock().await)
+        } else {
+            None
+        };
+        // All setup doubles complete synchronously. With the mutex held, this
+        // poll queues the local driver's first bindings acquisition. Otherwise
+        // it completes the local leg and parks on the idle peer.
+        assert!(futures::poll!(&mut producer).is_pending());
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), !contended);
+        let mut exposed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            exposed.push(event.unwrap());
+        }
+        assert!(exposed.iter().any(|event| event.text() == "peer ready"));
+        assert!(exposed.iter().all(|event| event.outcome().is_none()));
+        if !contended {
+            assert!(exposed.iter().any(|event| event.text() == "PONG"));
+        }
+        drop(rx);
+        if contended {
+            // The biased disconnect arm now queues cancellation BEHIND the
+            // retained driver. Releasing the guard reserves its permit for that
+            // driver; awaiting cancellation alone can never make progress.
+            assert!(futures::poll!(&mut producer).is_pending());
+        }
+        drop(held);
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(producer, async {
+                let _unrelated = srv.bindings().lock().await;
+            })
+        })
+        .await
+        .expect("disconnect must finish the producer and unblock unrelated bindings users");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(srv.store.cancel_requested(&task).await.unwrap());
+        assert_eq!(peer.cancels().lock().unwrap().len(), usize::from(peer_idle));
+        assert!(srv.fallback_cancels.lock().unwrap().is_empty());
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), !contended);
+        let rows = ledger.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1, "one aggregate terminal after disconnect");
+        assert_eq!(rows[0].reservation.identity, identity);
+        assert_eq!(rows[0].terminal.outcome, "canceled");
+        assert_eq!(rows[0].terminal.terminal_reason, "canceled");
+    }
+
+    #[tokio::test]
+    async fn fallback_fanout_disconnect_with_queued_bindings_driver() {
+        check_fallback_fanout_disconnect(true, true).await;
+        check_fallback_fanout_disconnect(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_fanout_disconnect_after_exposure_records_canceled_terminal() {
+        check_fallback_fanout_disconnect(false, true).await;
     }
 
     // ---- inline fakes ----
