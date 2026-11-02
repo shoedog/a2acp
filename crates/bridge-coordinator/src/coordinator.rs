@@ -2455,14 +2455,23 @@ impl Coordinator {
         // input, request metadata nor the envelope context participates in chain
         // selection; a context only guards the detached owner's lifetime.
         let admitted = match (admitted, self.workflow_admission.as_ref()) {
-            (Some(admitted), Some(admission))
-                if !self.mcp_fallback.is_empty()
-                    && self.executor.is_some()
-                    && !self.has_budget_policy()
-                    && admitted.run_spec.ledger_admission
-                        == bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore =>
-            {
-                Some(admission.bind_local_chains(admitted, &self.mcp_fallback)?)
+            (Some(admitted), Some(admission)) if !self.mcp_fallback.is_empty() => {
+                // `refuse_governed_unsupported_route` already rejected a budget policy
+                // at entry, so the `has_budget_policy` term is redundant today. It
+                // stays so this gate remains correct if that entry check moves.
+                let durable = admitted.run_spec.ledger_admission
+                    == bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore;
+                if self.executor.is_some() && !self.has_budget_policy() && durable {
+                    Some(admission.bind_local_chains(admitted, &self.mcp_fallback)?)
+                } else {
+                    tracing::warn!(
+                        executor = self.executor.is_some(),
+                        budget_policy = self.has_budget_policy(),
+                        durable_primary_store = durable,
+                        "declared fallback chains have no effect: served workflow admission is not affirmative"
+                    );
+                    Some(admitted)
+                }
             }
             (admitted, _) => admitted,
         };
@@ -2915,6 +2924,21 @@ impl Coordinator {
         self.task_store
             .cancel_if_working(&id, self.clock.now_ms())
             .await
+    }
+
+    /// Wait up to `grace` for in-flight detached workflows to publish their terminal state and
+    /// leave `workflow_cancels`. Returns immediately for a zero `grace`. Cancel-safe: dropping
+    /// it (e.g. on a signal) leaves the runs untouched for [`Self::shutdown`].
+    pub async fn drain_workflows(&self, grace: std::time::Duration) {
+        if grace.is_zero() {
+            return;
+        }
+        let _ = tokio::time::timeout(grace, async {
+            while !self.workflow_cancels.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
     }
 
     /// Shutdown hook for stdin EOF: cancel live detached work and release all warm sessions.

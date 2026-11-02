@@ -555,6 +555,10 @@ suite and a review of the combined base-to-target diff. See
   config to `serve`, `mcp`, or another agent. Use `--examples-policy deny` with
   repeated `--project-marker <text>` flags as a cleanup gate to reject
   project-specific material under an `examples/` directory.
+- `a2a-bridge mcp` does not cancel in-flight workflows the moment stdin closes: it drains them for up to
+  `[server] mcp_eof_grace_secs` (default 900; `0` = cancel immediately), then cancels the rest. SIGTERM/SIGINT
+  during the grace shuts down at once. A run blocked on permission/elicitation cannot be answered after EOF and
+  uses the whole grace unless `permission_timeout_ms` bounds it.
 - Run `cargo run -p a2a-bridge -- validate --repo-hygiene` before committing
   changes in this repo to catch untracked or newly committed root workflow
   artifacts under `examples/` and `prompts/`.

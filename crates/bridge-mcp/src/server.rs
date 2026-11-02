@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge_coordinator::params::{InjectParams, OpParams, PermitParams};
 use bridge_coordinator::session_manager::ResetOutcome;
@@ -15,18 +16,56 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Drive the MCP protocol over a read/write pair.
 ///
 /// The only writes performed by this adapter are framed JSON replies written through `write`.
-/// Clean EOF triggers Coordinator shutdown; truncated/invalid frames stop the loop without
-/// treating them as EOF.
-pub async fn serve<R, W>(read: R, mut write: W, coord: Arc<Coordinator>) -> Result<(), BridgeError>
+/// Clean EOF triggers Coordinator shutdown with no drain; truncated/invalid frames stop the
+/// loop without treating them as EOF.
+pub async fn serve<R, W>(read: R, write: W, coord: Arc<Coordinator>) -> Result<(), BridgeError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+{
+    serve_with_eof_grace(read, write, coord, Duration::ZERO).await
+}
+
+/// [`serve`] with a bounded drain on clean EOF: no further request is read, in-flight detached
+/// workflows get up to `eof_grace` to finish and persist, and anything still running at the
+/// deadline is cancelled as in `serve`. A zero grace cancels immediately.
+pub async fn serve_with_eof_grace<R, W>(
+    read: R,
+    write: W,
+    coord: Arc<Coordinator>,
+    eof_grace: Duration,
+) -> Result<(), BridgeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_with_eof_grace_until(read, write, coord, eof_grace, std::future::pending()).await
+}
+
+/// [`serve_with_eof_grace`] where `stop` ends the drain early: if it resolves during the EOF
+/// grace the coordinator shuts down at once (live runs cancelled, warm sessions released).
+/// `stop` is polled only during the grace, never while requests are being served.
+pub async fn serve_with_eof_grace_until<R, W, S>(
+    read: R,
+    mut write: W,
+    coord: Arc<Coordinator>,
+    eof_grace: Duration,
+    stop: S,
+) -> Result<(), BridgeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: std::future::Future<Output = ()>,
 {
     let mut reader = crate::framing::FrameReader::new(read, MAX_FRAME);
     let mut lc = transport::Lifecycle::default();
     loop {
         match reader.next().await {
             None => {
+                tokio::select! {
+                    _ = coord.drain_workflows(eof_grace) => {}
+                    _ = stop => {}
+                }
                 coord.shutdown().await;
                 break;
             }

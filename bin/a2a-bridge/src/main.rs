@@ -9872,8 +9872,32 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     } else {
         coordinator.resume().await?;
     }
-    bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
+    bridge_mcp::serve_with_eof_grace_until(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        coordinator,
+        cfg.server.mcp_eof_grace(),
+        wait_for_stop_signal(),
+    )
+    .await?;
     Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT. Handlers are installed only when this future is first polled
+/// (the EOF grace), so signal behaviour while serving is unchanged.
+async fn wait_for_stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        // No handlers: the default disposition still ends the process on a signal.
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
 }
 
 /// Read a task input from a file path, or stdin when `path` is "-". Returns the raw String.

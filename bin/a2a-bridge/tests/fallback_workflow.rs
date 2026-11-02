@@ -10593,8 +10593,10 @@ async fn served_refusal_projects_interrupted_as_failed() {
         .served_crash(graph.clone(), "", FAIL_SUCCESSOR_RESERVATION)
         .await;
     // Recovery without an accounting owner is a real restored-composition refusal.
-    // Resume registers the hub and spawns the runner on this single-threaded
-    // runtime, so the subscription below precedes every published frame.
+    // Resume registers the hub and spawns the runner. This depends on the
+    // current-thread `#[tokio::test]` runtime: the spawned runner cannot run until
+    // this task first yields, so the subscription below precedes every published
+    // frame. A multi-thread runtime would race and could miss the terminal frame.
     let boot = h.served_coordinator_for(graph, false, false);
     boot.resume_with_cap(3).await.unwrap();
     let hub = boot.progress_hubs().lock().await.get(&task).cloned();
@@ -10705,7 +10707,12 @@ impl CandidateFixture {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let (client, server) = tokio::io::duplex(65536);
         let (read, write) = tokio::io::split(server);
-        let serve = bridge_mcp::serve(read, write, coordinator.clone());
+        let serve = bridge_mcp::serve_with_eof_grace(
+            read,
+            write,
+            coordinator.clone(),
+            std::time::Duration::from_secs(15),
+        );
         let caller = async {
             let (r, mut w) = tokio::io::split(client);
             for request in [
@@ -11031,26 +11038,406 @@ async fn served_a2a_resubscribe_replays_cursors_locator_and_single_terminal() {
 #[tokio::test]
 async fn served_client_disconnect_does_not_cancel_detached_owner() {
     let h = CandidateFixture::new("reject", "success").await;
-    let coordinator = Arc::new(h.served_coordinator(true, true).await);
+    let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    let coordinator = Arc::new(
+        h.served_coordinator(true, true)
+            .await
+            .with_workflow_history(Ok(h.fault_history(1, Some(gate.clone()), false, false))),
+    );
     let owner = AttemptIdentity::initial().unwrap();
     let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
-    // The response stream is dropped unread: the client is gone before any frame is sent.
-    drop(
-        CandidateFixture::a2a_response(
-            h.a2a_router(&coordinator),
-            "SendStreamingMessage",
-            CandidateFixture::a2a_send(&owner, None),
-            None,
-        )
-        .await,
+    let response = CandidateFixture::a2a_response(
+        h.a2a_router(&coordinator),
+        "SendStreamingMessage",
+        CandidateFixture::a2a_send(&owner, None),
+        None,
+    )
+    .await;
+    // B's prompt dispatch is held: the run is genuinely in flight when the client goes away.
+    boundary_wait("disconnect", "candidate B's dispatch", gate.0.notified()).await;
+    assert_eq!(
+        h.f.store.get(&task).await.unwrap().unwrap().status,
+        TaskRecordStatus::Working
     );
+    drop(response);
+    gate.1.notify_one();
     let record = h.served_terminal(&task).await;
+    h.served_settled(&coordinator, &task).await;
     assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
     assert_eq!(record.result.as_deref(), Some("answer"));
     for provider in &h.f.providers {
         assert_eq!(provider.cancels.load(Ordering::SeqCst), 0);
     }
     assert_eq!(h.f.rows().len(), 2);
+}
+
+#[tokio::test]
+async fn served_a2a_resubscribe_with_prior_cursor_while_candidate_is_gated() {
+    let h = CandidateFixture::new("reject", "success").await;
+    let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    let coordinator = Arc::new(
+        h.served_coordinator(true, true)
+            .await
+            .with_workflow_history(Ok(h.fault_history(1, Some(gate.clone()), false, false))),
+    );
+    let owner = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+    coordinator
+        .run_workflow_with_identity(served_params(false), owner.clone())
+        .await
+        .unwrap();
+    boundary_wait("resubscribe", "candidate B's dispatch", gate.0.notified()).await;
+    // A cursor from the durable journal while B is held, before any completion exists.
+    let journal = h.f.store.journal_from(&task, -1).await.unwrap();
+    let cursor = journal.iter().map(|event| event.seq).max().unwrap();
+    let subscribe = |cursor: Option<i64>| {
+        let router = h.a2a_router(&coordinator);
+        let params = serde_json::json!({"id":task.as_str()});
+        tokio::spawn(async move {
+            let response =
+                CandidateFixture::a2a_response(router, "SubscribeToTask", params, cursor).await;
+            sse_progress(&CandidateFixture::body_text(response).await)
+        })
+    };
+    let (full, resumed) = (subscribe(None), subscribe(Some(cursor)));
+    // Both subscribers are attached (the stream stays open) before B is released.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!full.is_finished() && !resumed.is_finished());
+    gate.1.notify_one();
+    for (label, frames) in [
+        (
+            "full",
+            boundary_wait("resubscribe", "full stream", full).await,
+        ),
+        (
+            "resumed",
+            boundary_wait("resubscribe", "resumed stream", resumed).await,
+        ),
+    ] {
+        let frames = frames.unwrap();
+        let of = |kind: &str| frames.iter().filter(|(_, f)| f["kind"] == kind).count();
+        assert_eq!(of("node_finished"), 1, "{label}: {frames:?}");
+        assert_eq!(of("terminal"), 1, "{label}: {frames:?}");
+        if label == "resumed" {
+            assert!(
+                frames
+                    .iter()
+                    .filter(|(_, f)| f["phase"] != "snapshot")
+                    .all(|(id, _)| id.is_some_and(|id| id > cursor)),
+                "{frames:?}"
+            );
+        }
+    }
+    h.served_settled(&coordinator, &task).await;
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source", "target"]);
+    assert_eq!(h.f.rows().len(), 2);
+    let completions =
+        h.f.store
+            .journal_from(&task, -1)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    bridge_core::orch::OrchEventKind::NodeFinished { .. }
+                )
+            })
+            .count();
+    assert_eq!(completions, 1);
+}
+
+#[tokio::test]
+async fn served_declared_chain_with_non_durable_store_acquires_no_authority() {
+    // A matching declared chain, executor and accounting, but a primary store that cannot own the
+    // durable lane: binding must refuse silently and leave the ordinary path. Removing the
+    // durability check in `run_workflow_inner` binds the chain and fails these assertions.
+    let h = CandidateFixture::new("reject", "success").await;
+    let graph = Arc::new(h.admission("source").await.run_spec.graph.clone());
+    let memory = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+    let coordinator = bridge_coordinator::Coordinator::new(
+        h.f.coordinator.session_manager.clone(),
+        Some(Arc::new(WorkflowExecutor::new(h.registry.clone()))),
+        Arc::new(std::collections::HashMap::from([(graph.id.clone(), graph)])),
+        memory.clone(),
+        h.f.store.clone(),
+        h.f.coordinator.policy(),
+        h.registry.clone(),
+        Arc::new(bridge_coordinator::clock::SystemClock),
+        None,
+        None,
+        Arc::new(bridge_observ::NoopObserver),
+        3,
+    )
+    .with_workflow_admission(h.builder())
+    .with_accounting(AccountingV1::new(h.f.store.clone()))
+    .with_mcp_fallback(h.run.progress.chains.clone());
+    assert_eq!(
+        bridge_core::task_store::TaskStore::workflow_ledger_admission(&*memory),
+        bridge_core::execution_policy::LedgerAdmissionV1::HistoryLedgerUnavailable {
+            reason: bridge_core::execution_policy::BoundedLedgerReasonV1::Open
+        }
+    );
+    let identity = AttemptIdentity::initial().unwrap();
+    let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+    coordinator
+        .run_workflow_with_identity(served_params(false), identity)
+        .await
+        .unwrap();
+    let record = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let record = memory.get(&task).await.unwrap().unwrap();
+            if record.status.is_terminal() {
+                break record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    h.served_settled(&coordinator, &task).await;
+    assert_eq!(record.status, TaskRecordStatus::Failed, "{record:?}");
+    assert!(!record
+        .workflow_spec_json
+        .unwrap()
+        .contains("fallback_chains"));
+    // No candidate was resolved, configured, prompted or accounted beyond the declared source.
+    assert_eq!(*h.f.spawns.lock().unwrap(), ["source"]);
+    for later in 1..h.f.providers.len() {
+        assert_eq!(h.f.providers[later].setup.load(Ordering::SeqCst), 0);
+        assert_eq!(h.f.providers[later].prompts.load(Ordering::SeqCst), 0);
+    }
+    assert!(h
+        .f
+        .store
+        .candidate_progress_v1(&task, &NodeId::parse("node").unwrap())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// An MCP session whose `run_workflow` is in flight with candidate B's dispatch held at `gate`.
+struct GatedMcpRun {
+    coordinator: Arc<bridge_coordinator::Coordinator>,
+    gate: Arc<(tokio::sync::Notify, tokio::sync::Notify)>,
+    task: TaskId,
+    stdin: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    replies: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    serve: tokio::task::JoinHandle<std::result::Result<(), BridgeError>>,
+}
+
+impl CandidateFixture {
+    /// Submit `run_workflow` through the real MCP loop with `eof_grace`, then park B's prompt
+    /// dispatch. Stdin stays open so each test chooses when to send EOF.
+    async fn mcp_gated_run(&self, eof_grace: std::time::Duration) -> GatedMcpRun {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let coordinator = Arc::new(
+            self.served_coordinator(true, true)
+                .await
+                .with_workflow_history(Ok(self.fault_history(1, Some(gate.clone()), false, false))),
+        );
+        let owner = AttemptIdentity::initial().unwrap();
+        let (client, server) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(bridge_mcp::serve_with_eof_grace(
+            read,
+            write,
+            coordinator.clone(),
+            eof_grace,
+        ));
+        let (r, mut stdin) = tokio::io::split(client);
+        for request in [
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_workflow","arguments":{
+                "workflow":"workflow", "input":SERVED_INPUT,
+                "execution_id":owner.execution_id.as_str(), "attempt_id":owner.attempt_id.as_str()
+            }}}),
+        ] {
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let mut replies = tokio::io::BufReader::new(r).lines();
+        boundary_wait("mcp eof", "the initialize reply", replies.next_line())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(
+            &boundary_wait("mcp eof", "the locator reply", replies.next_line())
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        boundary_wait("mcp eof", "candidate B's dispatch", gate.0.notified()).await;
+        GatedMcpRun {
+            coordinator,
+            gate,
+            task: TaskId::parse(owner.execution_id.as_str()).unwrap(),
+            stdin,
+            replies,
+            serve,
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_eof_drains_in_flight_workflow_then_exits() {
+    use tokio::io::AsyncWriteExt;
+    let h = CandidateFixture::new("reject", "success").await;
+    let mut run = h.mcp_gated_run(std::time::Duration::from_secs(60)).await;
+    run.stdin.shutdown().await.unwrap();
+    // EOF alone neither exits nor cancels: the held run is still Working.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut run.serve)
+            .await
+            .is_err(),
+        "serve exited before the in-flight run finished"
+    );
+    let working = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(working.status, TaskRecordStatus::Working, "{working:?}");
+    run.gate.1.notify_one();
+    boundary_wait("mcp eof", "serve to exit after the drain", &mut run.serve)
+        .await
+        .unwrap()
+        .unwrap();
+    let record = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Completed, "{record:?}");
+    assert_eq!(record.result.as_deref(), Some("answer"));
+    assert!(run.coordinator.workflow_cancels().lock().await.is_empty());
+    let rows = h.f.rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.finalized), "{rows:?}");
+    for provider in &h.f.providers {
+        assert_eq!(provider.cancels.load(Ordering::SeqCst), 0);
+    }
+    // Nothing is read or answered after EOF: the reply stream just ends.
+    assert!(run.replies.next_line().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn mcp_eof_grace_zero_cancels_immediately() {
+    use tokio::io::AsyncWriteExt;
+    let h = CandidateFixture::new("reject", "success").await;
+    let mut run = h.mcp_gated_run(std::time::Duration::ZERO).await;
+    run.stdin.shutdown().await.unwrap();
+    boundary_wait("mcp eof", "serve to exit", &mut run.serve)
+        .await
+        .unwrap()
+        .unwrap();
+    let record = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
+    run.gate.1.notify_one();
+    h.served_settled(&run.coordinator, &run.task).await;
+    let record = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
+}
+
+#[tokio::test]
+async fn mcp_signal_during_eof_grace_shuts_down_cleanly() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let h = CandidateFixture::new("reject", "success").await;
+    let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    let coordinator = Arc::new(
+        h.served_coordinator(true, true)
+            .await
+            .with_workflow_history(Ok(h.fault_history(1, Some(gate.clone()), false, false))),
+    );
+    let owner = AttemptIdentity::initial().unwrap();
+    let (client, server) = tokio::io::duplex(65536);
+    let (read, write) = tokio::io::split(server);
+    let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+    let mut serve = tokio::spawn(bridge_mcp::serve_with_eof_grace_until(
+        read,
+        write,
+        coordinator.clone(),
+        std::time::Duration::from_secs(600),
+        async move {
+            let _ = signalled.await;
+        },
+    ));
+    let (r, mut stdin) = tokio::io::split(client);
+    for request in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_workflow","arguments":{
+            "workflow":"workflow", "input":SERVED_INPUT,
+            "execution_id":owner.execution_id.as_str(), "attempt_id":owner.attempt_id.as_str()
+        }}}),
+    ] {
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut replies = tokio::io::BufReader::new(r).lines();
+    for what in ["the initialize reply", "the locator reply"] {
+        boundary_wait("mcp signal", what, replies.next_line())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    boundary_wait("mcp signal", "candidate B's dispatch", gate.0.notified()).await;
+    let task = TaskId::parse(owner.execution_id.as_str()).unwrap();
+    stdin.shutdown().await.unwrap();
+    // In the grace: still draining, run untouched.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut serve)
+            .await
+            .is_err(),
+        "serve exited before the signal"
+    );
+    assert_eq!(
+        h.f.store.get(&task).await.unwrap().unwrap().status,
+        TaskRecordStatus::Working
+    );
+    signal.send(()).unwrap();
+    boundary_wait("mcp signal", "serve to exit on the signal", &mut serve)
+        .await
+        .unwrap()
+        .unwrap();
+    let record = h.f.store.get(&task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
+    gate.1.notify_one();
+    h.served_settled(&coordinator, &task).await;
+    let record = h.f.store.get(&task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
+}
+
+#[tokio::test]
+async fn mcp_eof_cancels_run_exceeding_the_grace_deadline() {
+    use tokio::io::AsyncWriteExt;
+    let h = CandidateFixture::new("reject", "success").await;
+    let grace = std::time::Duration::from_millis(400);
+    let mut run = h.mcp_gated_run(grace).await;
+    let eof = std::time::Instant::now();
+    run.stdin.shutdown().await.unwrap();
+    // Within the grace the run is untouched.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut run.serve)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.f.store.get(&run.task).await.unwrap().unwrap().status,
+        TaskRecordStatus::Working
+    );
+    // B stays held past the deadline, so serve exits only by cancelling it.
+    boundary_wait("mcp eof", "serve to exit at the deadline", &mut run.serve)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(eof.elapsed() >= grace, "{:?}", eof.elapsed());
+    let record = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
+    run.gate.1.notify_one();
+    h.served_settled(&run.coordinator, &run.task).await;
+    let record = h.f.store.get(&run.task).await.unwrap().unwrap();
+    assert_eq!(record.status, TaskRecordStatus::Canceled, "{record:?}");
 }
 
 #[tokio::test]
