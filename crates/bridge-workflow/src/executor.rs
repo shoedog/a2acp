@@ -1853,6 +1853,23 @@ pub struct WorkflowExecutor {
     preflight_metadata_fault: std::sync::atomic::AtomicBool,
 }
 
+/// Typed marker that `run_local_chain` requires: it is minted only when no dispatcher is present. It
+/// does not itself enforce exclusion. The dispatcher refusal in `run_node` (`BindUnsupported` when a
+/// dispatcher meets frozen authority) is what keeps a retained provider conversation from ever
+/// reaching a different agent; this marker makes that precondition explicit at the activation
+/// boundary. It has one constructor, and an envelope context identifier is not an input to it.
+/// `run_candidate_tracked` does not take the marker: it builds its own executor with no dispatcher
+/// and drives `run_cold_node` directly, so it is a cold-only seam that cannot address a retained
+/// conversation.
+#[derive(Clone, Copy)]
+struct ColdOwnershipV1(());
+
+impl ColdOwnershipV1 {
+    fn affirm(dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>) -> Option<Self> {
+        dispatcher.is_none().then_some(Self(()))
+    }
+}
+
 struct LocalWorkflowFallbackV1 {
     admission: Arc<crate::admission::WorkflowAdmissionV1>,
     admitted: crate::admission::AdmittedWorkflowRunV1,
@@ -4091,6 +4108,7 @@ impl WorkflowExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn run_local_chain(
         &self,
+        _cold: ColdOwnershipV1,
         local: &LocalWorkflowFallbackV1,
         run: &mut WorkflowCandidateRunV1,
         rendered: &str,
@@ -5025,9 +5043,12 @@ impl WorkflowExecutor {
         let rendered = render(&node.prompt_template, vars);
         let mut initial_preflight = None;
         let mut initial_node_context = None;
-        if let (Some(local), Some(authority), Some(accounting)) =
-            (&self.local_fallback, frozen_authority, &self.accounting)
-        {
+        if let (Some(local), Some(authority), Some(accounting), Some(cold)) = (
+            &self.local_fallback,
+            frozen_authority,
+            &self.accounting,
+            ColdOwnershipV1::affirm(dispatcher),
+        ) {
             if let Some(restored) = &local.restored {
                 if !Arc::ptr_eq(&local.admitted.run_spec, &authority.run_spec) {
                     return Err(BridgeError::InvalidStateTransition.into());
@@ -5061,6 +5082,7 @@ impl WorkflowExecutor {
                     let node_obs_ctx = start_node_observation(wf_id, node, run_id, ctx)?;
                     let result = self
                         .run_local_chain(
+                            cold,
                             local,
                             &mut run,
                             &rendered,
@@ -5151,6 +5173,7 @@ impl WorkflowExecutor {
                             let node_obs_ctx = initial_node_context.take().unwrap();
                             let result = self
                                 .run_local_chain(
+                                    cold,
                                     local,
                                     &mut run,
                                     &rendered,
