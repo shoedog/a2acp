@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bridge_coordinator::params::{InjectParams, OpParams, PermitParams};
 use bridge_coordinator::session_manager::ResetOutcome;
@@ -15,9 +16,25 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Drive the MCP protocol over a read/write pair.
 ///
 /// The only writes performed by this adapter are framed JSON replies written through `write`.
-/// Clean EOF triggers Coordinator shutdown; truncated/invalid frames stop the loop without
-/// treating them as EOF.
-pub async fn serve<R, W>(read: R, mut write: W, coord: Arc<Coordinator>) -> Result<(), BridgeError>
+/// Clean EOF triggers Coordinator shutdown with no drain; truncated/invalid frames stop the
+/// loop without treating them as EOF.
+pub async fn serve<R, W>(read: R, write: W, coord: Arc<Coordinator>) -> Result<(), BridgeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_with_eof_grace(read, write, coord, Duration::ZERO).await
+}
+
+/// [`serve`] with a bounded drain on clean EOF: no further request is read, in-flight detached
+/// workflows get up to `eof_grace` to finish and persist, and anything still running at the
+/// deadline is cancelled as in `serve`. A zero grace cancels immediately.
+pub async fn serve_with_eof_grace<R, W>(
+    read: R,
+    mut write: W,
+    coord: Arc<Coordinator>,
+    eof_grace: Duration,
+) -> Result<(), BridgeError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -27,7 +44,7 @@ where
     loop {
         match reader.next().await {
             None => {
-                coord.shutdown().await;
+                coord.shutdown_after_grace(eof_grace).await;
                 break;
             }
             Some(Err(_)) => break,

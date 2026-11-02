@@ -9872,7 +9872,14 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     } else {
         coordinator.resume().await?;
     }
-    bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
+    let eof_grace = Duration::from_secs(cfg.server.mcp_eof_grace_secs.unwrap_or(15 * 60));
+    bridge_mcp::serve_with_eof_grace(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        coordinator,
+        eof_grace,
+    )
+    .await?;
     Ok(())
 }
 

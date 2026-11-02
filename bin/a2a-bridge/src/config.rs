@@ -69,6 +69,10 @@ pub struct ServerConfig {
     pub permission_policy: Option<String>,
     #[serde(default)]
     pub permission_timeout_ms: Option<u64>,
+    /// `a2a-bridge mcp`: on stdin EOF, let in-flight detached workflows finish for up to this
+    /// many seconds before cancelling them. None = 900 (15 min); 0 = cancel immediately.
+    #[serde(default)]
+    pub mcp_eof_grace_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -6761,15 +6765,17 @@ addr = "127.0.0.1:8080"
         assert_eq!(cfg.server.adapter_idle_ttl_secs, 300);
         assert_eq!(cfg.server.warm_usage_warn_fraction, None);
         assert_eq!(cfg.server.compact_summarize_timeout_secs, None);
+        assert_eq!(cfg.server.mcp_eof_grace_secs, None);
 
         let cfg2: RegistryConfig = RegistryConfig::parse(&format!(
-            "{base}warm_idle_ttl_secs = 5\nadapter_idle_ttl_secs = 0\nwarm_usage_warn_fraction = 0.8\ncompact_summarize_timeout_secs = 7\n"
+            "{base}warm_idle_ttl_secs = 5\nadapter_idle_ttl_secs = 0\nwarm_usage_warn_fraction = 0.8\ncompact_summarize_timeout_secs = 7\nmcp_eof_grace_secs = 30\n"
         ))
         .unwrap();
         assert_eq!(cfg2.server.warm_idle_ttl_secs, 5);
         assert_eq!(cfg2.server.adapter_idle_ttl_secs, 0);
         assert_eq!(cfg2.server.warm_usage_warn_fraction, Some(0.8));
         assert_eq!(cfg2.server.compact_summarize_timeout_secs, Some(7));
+        assert_eq!(cfg2.server.mcp_eof_grace_secs, Some(30));
 
         let cfg3: RegistryConfig =
             RegistryConfig::parse(&format!("{base}adapter_idle_ttl_secs = 45\n")).unwrap();
