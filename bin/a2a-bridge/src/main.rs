@@ -21233,6 +21233,15 @@ async fn workflow_declared_fallback_local_and_retry_accounting() {
 
 #[cfg(test)]
 #[tokio::test]
+async fn workflow_declared_fallback_served_client_with_envelope_context() {
+    local_fallback_fixture::served_cli_activation(|args| async move {
+        run_workflow_cmd(&args).await.map_err(|e| e.to_string())
+    })
+    .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
 async fn round4_history_degradation_uses_final_fallback_authority() {
     local_fallback_fixture::round4_history_admission(|args, registry, store, reason| async move {
         run_workflow_with_registry(
