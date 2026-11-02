@@ -2376,7 +2376,7 @@ impl Coordinator {
     /// behavior: it mints identity internally, and the detached runner may
     /// begin before the awaiting caller observes the returned task id.
     pub async fn run_workflow(&self, p: OpParams) -> Result<TaskId, BridgeError> {
-        Ok(self.run_workflow_inner(p, None, false).await?.task_id)
+        Ok(self.run_workflow_inner(p, None).await?.task_id)
     }
 
     /// Submit a detached workflow under an identity already visible to the
@@ -2393,25 +2393,13 @@ impl Coordinator {
         p: OpParams,
         identity: bridge_core::ids::AttemptIdentity,
     ) -> Result<WorkflowLocator, BridgeError> {
-        self.run_workflow_inner(p, Some(identity), false).await
-    }
-
-    /// Inactive served-chain admission fixture. Only this explicit test entry
-    /// binds operator declarations; A2A and MCP submissions never select it.
-    #[doc(hidden)]
-    pub async fn run_workflow_with_chains_for_test(
-        &self,
-        p: OpParams,
-        identity: bridge_core::ids::AttemptIdentity,
-    ) -> Result<WorkflowLocator, BridgeError> {
-        self.run_workflow_inner(p, Some(identity), true).await
+        self.run_workflow_inner(p, Some(identity)).await
     }
 
     async fn run_workflow_inner(
         &self,
         p: OpParams,
         supplied_identity: Option<bridge_core::ids::AttemptIdentity>,
-        test_admit_chains: bool,
     ) -> Result<WorkflowLocator, BridgeError> {
         self.refuse_governed_unsupported_route()?;
         if p.agent.is_some() || p.model.is_some() || p.effort.is_some() || p.mode.is_some() {
@@ -2460,34 +2448,24 @@ impl Coordinator {
             ),
             None => None,
         };
+        // Fresh served submissions (A2A and MCP share this entry) bind operator
+        // declarations only on affirmative cold, durable, ungoverned admission.
         // Share the local binder and retain its final Arc through persistence,
         // detached composition and the executor's exact-authority check. Neither
-        // input nor request metadata participates in chain selection.
-        let admitted = if test_admit_chains && !self.mcp_fallback.is_empty() {
-            let admission = self
-                .workflow_admission
-                .as_ref()
-                .ok_or(BridgeError::InvalidStateTransition)?;
-            Some(admission.bind_local_chains(
-                admitted.ok_or(BridgeError::InvalidStateTransition)?,
-                &self.mcp_fallback,
-            )?)
-        } else {
-            admitted
+        // input, request metadata nor the envelope context participates in chain
+        // selection; a context only guards the detached owner's lifetime.
+        let admitted = match (admitted, self.workflow_admission.as_ref()) {
+            (Some(admitted), Some(admission))
+                if !self.mcp_fallback.is_empty()
+                    && self.executor.is_some()
+                    && !self.has_budget_policy()
+                    && admitted.run_spec.ledger_admission
+                        == bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore =>
+            {
+                Some(admission.bind_local_chains(admitted, &self.mcp_fallback)?)
+            }
+            (admitted, _) => admitted,
         };
-        // Bound chains need the candidate executor. Refuse before any durable
-        // effect instead of persisting authority for a run that cannot use it.
-        if self.executor.is_none()
-            && admitted.as_ref().is_some_and(|authority| {
-                authority
-                    .run_spec
-                    .fallback_chains
-                    .as_ref()
-                    .is_some_and(|chains| !chains.is_empty())
-            })
-        {
-            return Err(BridgeError::InvalidStateTransition);
-        }
         let workflow_spec_json = match admitted.as_ref() {
             Some(authority) => Some(crate::detached::encode_workflow_run_spec(
                 &authority.run_spec,
