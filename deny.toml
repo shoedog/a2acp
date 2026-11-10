@@ -18,6 +18,7 @@ allow = [
     "ISC",                  # inotify/inotify-sys (notify file-watcher), ring/untrusted (rustls TLS)
     "CC0-1.0",              # notify (file-watcher) — public-domain dedication
     "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA bundle, via rustls)
+    "Zlib",                 # foldhash (hashbrown hasher, via rusqlite)
 ]
 confidence-threshold = 0.9
 

@@ -1060,7 +1060,7 @@ impl SqliteStore {
         if slot.is_none() {
             let primary = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
             let read_only = primary
-                .is_readonly(rusqlite::DatabaseName::Main)
+                .is_readonly(rusqlite::MAIN_DB)
                 .map_err(|_| BridgeError::StoreFailure)?;
             let path = primary
                 .path()
@@ -1291,7 +1291,7 @@ impl SqliteStore {
         // EACCES into CANTOPEN. A file that existed before this open owns its
         // permissions; failure to create a missing file belongs to its parent.
         let _database_file = history_parent.open_file("", true, R::Open, R::ReadOnlyDatabase)?;
-        let conn = rusqlite::Connection::open_with_flags(
+        let mut conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
@@ -1309,7 +1309,8 @@ impl SqliteStore {
                     }
                     _ => rusqlite::hooks::Authorization::Allow,
                 },
-            ));
+            ))
+            .map_err(|error| history_error(&error))?;
         }
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|error| history_error(&error))?;
@@ -1680,7 +1681,7 @@ impl SqliteStore {
         })?;
         let history_parent = HistoryParent::prove(path)?;
         let _database_file = history_parent.open_file("", false, R::Open, R::ReadOnlyDatabase)?;
-        let conn = rusqlite::Connection::open_with_flags(
+        let mut conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -1697,7 +1698,8 @@ impl SqliteStore {
                     }
                     _ => rusqlite::hooks::Authorization::Allow,
                 },
-            ));
+            ))
+            .map_err(|error| history_error(&error))?;
         }
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
             .map_err(|error| history_error(&error))?;

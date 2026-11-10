@@ -1124,7 +1124,7 @@ async fn source_terminalization_failure_projection() {
             let db = rusqlite::Connection::open(f.dir.path().join("tasks.sqlite")).unwrap();
             let terminal_count: u64 = db.query_row(
                 "SELECT count(*) FROM workflow_attempt_summaries WHERE terminal_json IS NOT NULL",
-                [], |r| r.get(0),
+                [], |r| r.get::<_, i64>(0).map(|v| u64::try_from(v).unwrap()),
             ).unwrap();
             assert_eq!(terminal_count, u64::from(!terminalization_fails));
         }

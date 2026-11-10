@@ -3,6 +3,11 @@
 use bridge_core::{accounting::*, ids::*, orch::*, task_store::TaskStore};
 use bridge_store::sqlite::SqliteStore;
 use std::sync::Arc;
+/// Reads an INTEGER column as `u64`, rejecting negative values instead of wrapping.
+fn u64_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
 fn path(dir: &tempfile::TempDir) -> std::path::PathBuf {
     dir.path().join("tasks.sqlite")
 }
@@ -706,7 +711,7 @@ async fn governance_atomic_scopes_identity_and_policy() {
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
                 [],
-                |r| r.get(0),
+                |r| u64_col(r, 0),
             )
             .unwrap();
         assert_eq!(count, 0);
@@ -931,7 +936,7 @@ async fn governance_coverage_history_day_and_disabled() {
         db.query_row(
             "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
             [],
-            |r| r.get::<_, u64>(0)
+            |r| u64_col(r, 0)
         )
         .unwrap(),
         0
@@ -1039,13 +1044,14 @@ async fn governance_independent_processes_compete_and_reopen() {
     let db = rusqlite::Connection::open(usage_path(&path)).unwrap();
     db.execute_batch("PRAGMA journal_mode=PERSIST").unwrap();
     assert_eq!(
-        db.query_row("SELECT count(*) FROM governance_reservations_v1", [], |r| r
-            .get::<_, u64>(0))
-            .unwrap(),
+        db.query_row("SELECT count(*) FROM governance_reservations_v1", [], |r| {
+            u64_col(r, 0)
+        })
+        .unwrap(),
         1
     );
-    assert_eq!(db.query_row("SELECT count(*) FROM usage_attempts_v1 WHERE json_extract(record_json, '$.dispatched')=1", [], |r| r.get::<_, u64>(0)).unwrap(), 1);
-    assert_eq!(db.query_row("SELECT json_extract(record_json, '$.liability.Pending') FROM governance_reservations_v1", [], |r| r.get::<_, u64>(0)).unwrap(), 10);
+    assert_eq!(db.query_row("SELECT count(*) FROM usage_attempts_v1 WHERE json_extract(record_json, '$.dispatched')=1", [], |r| u64_col(r, 0)).unwrap(), 1);
+    assert_eq!(db.query_row("SELECT json_extract(record_json, '$.liability.Pending') FROM governance_reservations_v1", [], |r| u64_col(r, 0)).unwrap(), 10);
 }
 
 // A thread-local subscriber keeps the completion assertion independent of other tests' logs.
@@ -1278,7 +1284,7 @@ async fn governance_amendment_omitted_policy_across_executions() {
         db.query_row(
             "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
             [],
-            |r| r.get::<_, u64>(0)
+            |r| u64_col(r, 0)
         )
         .unwrap(),
         0
@@ -1296,7 +1302,7 @@ async fn governance_amendment_omitted_policy_across_executions() {
         db.query_row(
             "SELECT count(*) FROM governance_reservations_v1 WHERE id=?1",
             [b.0.as_str()],
-            |r| r.get::<_, u64>(0)
+            |r| u64_col(r, 0)
         )
         .unwrap(),
         0
