@@ -5,7 +5,7 @@ use crate::clock::{Clock, SystemClock};
 use bridge_core::domain::{
     effective_config, AgentOverride, InjectRequest, QueuedInject, SessionSpec,
 };
-use bridge_core::error::BridgeError;
+use bridge_core::error::{BridgeError, ForkRefusal};
 use bridge_core::ids::{
     AgentId, ContextId, OperationId, SessionGeneration, SessionHandleId, SessionId,
 };
@@ -473,6 +473,9 @@ pub struct GovernedTurnClaim {
     before: SessionSpecFingerprint,
     intended: SessionSpecFingerprint,
     fresh: bool,
+    /// Set for a fresh claim that forks this backend session into its own: applied right after the
+    /// claim's session is configured.
+    fork_source: Option<ForkSourceRef>,
     applying: bool,
     attempt: Option<String>,
     entry: Option<Arc<bridge_core::domain::AgentEntry>>,
@@ -683,6 +686,20 @@ impl GovernedTurnClaim {
         drop(tab);
         if self.fresh {
             self.backend.configure_session(&session, &spec).await?;
+            if let Some(source) = &self.fork_source {
+                // See `SessionManager::checkout_fork_turn_observed`: the source must be the admitted
+                // handle before and after the copy.
+                let expired = BridgeError::ForkRefused {
+                    reason: ForkRefusal::SourceExpired,
+                };
+                if !self.sm.fork_source_unchanged(source).await {
+                    return Err(expired.into());
+                }
+                self.backend.fork_session(&source.session, &session).await?;
+                if !self.sm.fork_source_unchanged(source).await {
+                    return Err(expired.into());
+                }
+            }
         } else if self.before != self.intended {
             match self.backend.reconcile_config(&session, &spec).await? {
                 ReconcileOutcome::Applied => {}
@@ -824,6 +841,7 @@ impl Drop for GovernedTurnClaim {
                 before: self.before.clone(),
                 intended: self.intended.clone(),
                 fresh: self.fresh,
+                fork_source: self.fork_source.take(),
                 applying: self.applying,
                 attempt: self.attempt.take(),
                 entry: self.entry.take(),
@@ -836,6 +854,132 @@ impl Drop for GovernedTurnClaim {
                 let _ = owner.settle().await;
             });
         }
+    }
+}
+
+/// A validated fork of one idle context into a new one: the backend session being forked and
+/// everything the new context's handle records, derived from the source's. Built under the table
+/// lock, so it is only as fresh as that hold.
+struct ForkPlan {
+    source: ForkSourceRef,
+    backend: Arc<dyn AgentBackend>,
+    fingerprint: SessionSpecFingerprint,
+}
+
+/// Which source a fork copies: its backend session AND the exact handle that owns it. A backend
+/// session id (`ctx-<id>-g0`) is reused when a context is released and recreated, so the id alone
+/// cannot tell a replacement conversation from the one the fork was admitted against; the handle
+/// id, minted per handle, can.
+#[derive(Clone)]
+struct ForkSourceRef {
+    session: SessionId,
+    ctx: ContextId,
+    handle: SessionHandleId,
+    generation: SessionGeneration,
+}
+
+impl ForkSourceRef {
+    fn same_handle(&self, other: &ForkSourceRef) -> bool {
+        self.handle == other.handle && self.generation == other.generation
+    }
+}
+
+/// The owner of a fork target's `Configuring` handle while its setup is in flight. It is bound to
+/// the exact claim (handle id and claim op), and settles through the same checked cleanup whether
+/// setup fails, or the caller's future is dropped before setup settles: that cleanup removes the
+/// target if it is still ours, releases the backend session when the fork was sent, and frees the
+/// context id with its registry lease. A dropped guard that is still armed runs it on a detached
+/// task; settle paths run it inline and then disarm.
+struct ForkTargetGuard {
+    by_context: Arc<Mutex<SessionTable>>,
+    backend: Arc<dyn AgentBackend>,
+    target: ContextId,
+    handle: SessionHandleId,
+    claim: OperationId,
+    session: SessionId,
+    /// `session/fork` may have been sent, so the backend session may exist and must be released
+    /// rather than merely forgotten.
+    forked: bool,
+    armed: bool,
+}
+
+impl ForkTargetGuard {
+    async fn cleanup(
+        by_context: &Mutex<SessionTable>,
+        backend: &dyn AgentBackend,
+        target: &ContextId,
+        handle: &SessionHandleId,
+        claim: &OperationId,
+        session: &SessionId,
+        forked: bool,
+    ) {
+        let mut tab = by_context.lock().await;
+        let ours = matches!(
+            tab.get(target),
+            Some(h) if h.id == *handle
+                && h.op.as_ref() == Some(claim)
+                && matches!(h.state, SessionState::Configuring | SessionState::Expiring)
+        );
+        if !ours {
+            return;
+        }
+        // `Expiring` holds the id against a re-claim until the backend session is gone.
+        tab.get_mut(target).expect("ours").state = SessionState::Expiring;
+        drop(tab);
+        if forked {
+            backend.release_session(session).await;
+        } else {
+            backend.forget_session(session).await;
+        }
+        let mut tab = by_context.lock().await;
+        if tab.get(target).is_some_and(|h| h.id == *handle) {
+            if let Some(h) = tab.remove(target) {
+                drop(h.lease);
+            }
+        }
+    }
+
+    async fn abandon(&self) {
+        Self::cleanup(
+            &self.by_context,
+            self.backend.as_ref(),
+            &self.target,
+            &self.handle,
+            &self.claim,
+            &self.session,
+            self.forked,
+        )
+        .await;
+    }
+}
+
+impl Drop for ForkTargetGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let by_context = self.by_context.clone();
+        let backend = self.backend.clone();
+        let target = self.target.clone();
+        let handle = self.handle.clone();
+        let claim = self.claim.clone();
+        let session = self.session.clone();
+        let forked = self.forked;
+        runtime.spawn(async move {
+            Self::cleanup(
+                &by_context,
+                backend.as_ref(),
+                &target,
+                &handle,
+                &claim,
+                &session,
+                forked,
+            )
+            .await;
+        });
     }
 }
 
@@ -1385,6 +1529,7 @@ impl SessionManager {
             before: h.fingerprint.clone(),
             intended,
             fresh,
+            fork_source: None,
             applying: false,
             attempt: None,
             entry: self.registry.entry_snapshot(&h.agent),
@@ -1482,6 +1627,376 @@ impl SessionManager {
             injects,
             ..Self::warm_turn_from_handle(h, usage_warning, op, expiry_intent, abort)
         })
+    }
+
+    /// Every refusal of a fork, in one place and before anything is created or touched: the source
+    /// must be a live, idle, non-expiring context on a backend that can fork, the target id must be
+    /// unused, and the agent must be the source's. The new context records the source's agent,
+    /// effective config and cwd, with the request's per-message overrides layered on top.
+    fn fork_plan_locked(
+        tab: &SessionTable,
+        source: &ContextId,
+        target: &ContextId,
+        agent: &AgentId,
+        overrides: Option<&AgentOverride>,
+        cwd: Option<&SessionCwd>,
+    ) -> Result<ForkPlan, BridgeError> {
+        let refuse = |reason| BridgeError::ForkRefused { reason };
+        if tab.tombstone(source).is_some() {
+            return Err(refuse(ForkRefusal::SourceExpired));
+        }
+        let h = tab.get(source).ok_or(refuse(ForkRefusal::SourceNotFound))?;
+        if h.lease.is_retired()
+            || h.expire_after_reconcile
+            || h.turn_aborts.iter().any(|t| t.expiry_intent.is_armed())
+        {
+            return Err(refuse(ForkRefusal::SourceExpired));
+        }
+        if h.state != SessionState::Idle || h.governed.is_some() {
+            return Err(refuse(ForkRefusal::SourceBusy));
+        }
+        if source == target || tab.contains_key(target) || tab.cleanup_retries.contains_key(target)
+        {
+            return Err(refuse(ForkRefusal::TargetInUse));
+        }
+        h.backend.fork_support().map_err(refuse)?;
+        if *agent != h.agent {
+            return Err(refuse(ForkRefusal::AgentMismatch));
+        }
+        let mut fingerprint = h.fingerprint.clone();
+        if let Some(ov) = overrides {
+            if ov.model.is_some() {
+                fingerprint.config.model = ov.model.clone();
+            }
+            if ov.effort.is_some() {
+                fingerprint.config.effort = ov.effort;
+            }
+            if ov.mode.is_some() {
+                fingerprint.config.mode = ov.mode.clone();
+            }
+        }
+        if let Some(cwd) = cwd {
+            fingerprint.cwd = Some(cwd.as_str().to_owned());
+        }
+        Ok(ForkPlan {
+            source: ForkSourceRef {
+                session: h.backend_session.clone(),
+                ctx: source.clone(),
+                handle: h.id.clone(),
+                generation: h.generation,
+            },
+            backend: h.backend.clone(),
+            fingerprint,
+        })
+    }
+
+    /// Whether `source` is still owned by the handle a fork was admitted against.
+    fn fork_source_unchanged_locked(tab: &SessionTable, source: &ForkSourceRef) -> bool {
+        tab.get(&source.ctx)
+            .is_some_and(|h| h.id == source.handle && h.generation == source.generation)
+    }
+
+    /// [`Self::fork_source_unchanged_locked`] for a fork's re-plan under a new hold of the table.
+    /// A source replaced since admission is refused as expired before the plan is made: planning
+    /// against the replacement could name a different refusal (a replacement on another agent is
+    /// a config mismatch), which would carry no stable reason.
+    fn fork_source_admitted_locked(
+        tab: &SessionTable,
+        source: &ForkSourceRef,
+    ) -> Result<(), BridgeError> {
+        if Self::fork_source_unchanged_locked(tab, source) {
+            Ok(())
+        } else {
+            Err(BridgeError::ForkRefused {
+                reason: ForkRefusal::SourceExpired,
+            })
+        }
+    }
+
+    async fn fork_source_unchanged(&self, source: &ForkSourceRef) -> bool {
+        let tab = self.by_context.lock().await;
+        Self::fork_source_unchanged_locked(&tab, source)
+    }
+
+    /// The fork's refusals, then the target's agent resolved exactly once. The resolved backend must
+    /// be the one the source's session lives in: a registry reload since the source's first turn
+    /// replaced it, and a session cannot be forked across backends.
+    async fn resolve_fork(
+        &self,
+        source: &ContextId,
+        target: &ContextId,
+        agent: &AgentId,
+        overrides: Option<&AgentOverride>,
+        cwd: Option<&SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(ForkPlan, bridge_core::ports::Resolved), BridgeError> {
+        // The source this fork was admitted against: resolving the agent takes time, and a source
+        // released and recreated under the same id meanwhile is a different conversation.
+        let admitted = {
+            let tab = self.by_context.lock().await;
+            Self::fork_plan_locked(&tab, source, target, agent, overrides, cwd)?.source
+        };
+        let resolved = self.registry.resolve_observed(agent, observer).await?;
+        let tab = self.by_context.lock().await;
+        Self::fork_source_admitted_locked(&tab, &admitted)?;
+        let plan = Self::fork_plan_locked(&tab, source, target, agent, overrides, cwd)?;
+        if !plan.source.same_handle(&admitted) || !Arc::ptr_eq(&plan.backend, &resolved.backend) {
+            return Err(BridgeError::ForkRefused {
+                reason: ForkRefusal::SourceExpired,
+            });
+        }
+        Ok((plan, resolved))
+    }
+
+    /// Start the first turn of a NEW context that is a fork of the idle context `source`.
+    ///
+    /// The target's handle is claimed `Configuring` before anything is sent, its backend session is
+    /// configured with the source's config (plus `overrides`), and the backend forks the source's
+    /// session into it; the handle then goes `Running` exactly as a fresh checkout's does. The
+    /// source is only read: its handle, lease, generation and idle clock are untouched, so it stays
+    /// usable and expires, releases and cancels on its own. Any refusal returns before a provider
+    /// request and leaves no target behind.
+    pub async fn checkout_fork_turn_observed(
+        &self,
+        source: &ContextId,
+        target: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<WarmTurn, BridgeError> {
+        let (plan, resolved) = self
+            .resolve_fork(
+                source,
+                target,
+                &agent,
+                overrides.as_ref(),
+                cwd.as_ref(),
+                observer,
+            )
+            .await?;
+        let backend_session = SessionId::parse(format!("ctx-{}-g0", target.as_str()))
+            .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle_id = SessionHandleId::parse(format!("h-{n}")).expect("minted handle id parses");
+        let claim = self.mint_turn_op();
+        let config = plan.fingerprint.config.clone();
+        let spec_cwd = plan
+            .fingerprint
+            .cwd
+            .as_deref()
+            .map(SessionCwd::parse)
+            .transpose()?;
+        {
+            // The plan was built from a hold that has ended: refuse again if the table moved.
+            let mut tab = self.by_context.lock().await;
+            Self::fork_source_admitted_locked(&tab, &plan.source)?;
+            let again = Self::fork_plan_locked(
+                &tab,
+                source,
+                target,
+                &agent,
+                overrides.as_ref(),
+                cwd.as_ref(),
+            )?;
+            if !again.source.same_handle(&plan.source) {
+                return Err(BridgeError::ForkRefused {
+                    reason: ForkRefusal::SourceExpired,
+                });
+            }
+            tab.insert(
+                target.clone(),
+                WarmHandle {
+                    id: handle_id.clone(),
+                    agent,
+                    caps: resolved.backend.capabilities(),
+                    backend: resolved.backend,
+                    backend_session: backend_session.clone(),
+                    generation: SessionGeneration::new(0),
+                    fingerprint: plan.fingerprint,
+                    lease: resolved.lease,
+                    state: SessionState::Configuring,
+                    usage: UsageSnapshot::default(),
+                    expire_after_reconcile: false,
+                    op: Some(claim.clone()),
+                    turn_aborts: Vec::new(),
+                    governed: None,
+                    pending_seed: None,
+                    pending_injects: Vec::new(),
+                    last_used: self.clock.now_instant(),
+                },
+            );
+        }
+        let backend = plan.backend;
+        // From here the target's `Configuring` handle has an owner that outlives this future: a
+        // caller dropped mid-setup (a client that disconnected) still gets the target removed, its
+        // backend session released and its id freed.
+        let mut guard = ForkTargetGuard {
+            by_context: self.by_context.clone(),
+            backend: backend.clone(),
+            target: target.clone(),
+            handle: handle_id.clone(),
+            claim: claim.clone(),
+            session: backend_session.clone(),
+            forked: false,
+            armed: true,
+        };
+        let setup = match backend
+            .configure_session(
+                &backend_session,
+                &SessionSpec {
+                    config,
+                    cwd: spec_cwd,
+                },
+            )
+            .await
+        {
+            // The source must still be the very handle the fork was admitted against before the
+            // copy starts, and again once it is done: a source released and recreated under the same
+            // id in between would otherwise hand the fork the replacement's history.
+            Ok(()) if !self.fork_source_unchanged(&plan.source).await => {
+                Err(BridgeError::ForkRefused {
+                    reason: ForkRefusal::SourceExpired,
+                })
+            }
+            Ok(()) => {
+                guard.forked = true;
+                match backend
+                    .fork_session(&plan.source.session, &backend_session)
+                    .await
+                {
+                    Ok(()) if !self.fork_source_unchanged(&plan.source).await => {
+                        Err(BridgeError::ForkRefused {
+                            reason: ForkRefusal::SourceExpired,
+                        })
+                    }
+                    result => result,
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let mut tab = self.by_context.lock().await;
+        let still_ours = matches!(
+            tab.get(target),
+            Some(h) if h.id == handle_id
+                && h.state == SessionState::Configuring
+                && h.op.as_ref() == Some(&claim)
+        );
+        if !still_ours {
+            drop(tab);
+            if guard.forked {
+                backend.release_session(&backend_session).await;
+            }
+            guard.armed = false;
+            return Err(setup.err().unwrap_or(BridgeError::SessionExpired));
+        }
+        let expired = tab
+            .get(target)
+            .map(|h| h.expire_after_reconcile)
+            .unwrap_or(true);
+        if setup.is_err() || expired {
+            drop(tab);
+            guard.abandon().await;
+            guard.armed = false;
+            return Err(setup.err().unwrap_or(BridgeError::SessionExpired));
+        }
+        let h = tab.get_mut(target).expect("still_ours");
+        let op = self.mint_turn_op();
+        let abort = CancellationToken::new();
+        let expiry_intent = WarmExpiryIntent::new();
+        h.state = SessionState::Running;
+        h.op = Some(op.clone());
+        h.turn_aborts.push(TurnAbort {
+            op: op.clone(),
+            token: abort.clone(),
+            expiry_intent: expiry_intent.clone(),
+        });
+        h.last_used = self.clock.now_instant();
+        // Settled: the handle is a running turn like any checkout's, owned by its caller.
+        guard.armed = false;
+        Ok(Self::warm_turn_from_handle(
+            h,
+            None,
+            op,
+            expiry_intent,
+            abort,
+        ))
+    }
+
+    /// Installed-policy counterpart of [`Self::checkout_fork_turn_observed`]: the new context's
+    /// handle is claimed for governed admission, and the claim's apply step configures the target
+    /// and forks the source's session into it (see [`GovernedTurnClaim`]). Nothing reaches the
+    /// provider before admission, and a rolled-back claim removes the target.
+    pub async fn claim_fork_turn_observed(
+        self: &Arc<Self>,
+        source: &ContextId,
+        target: &ContextId,
+        agent: AgentId,
+        overrides: Option<AgentOverride>,
+        cwd: Option<SessionCwd>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<GovernedTurnClaim, BridgeError> {
+        let (plan, resolved) = self
+            .resolve_fork(
+                source,
+                target,
+                &agent,
+                overrides.as_ref(),
+                cwd.as_ref(),
+                observer.clone(),
+            )
+            .await?;
+        let session = SessionId::parse(format!("ctx-{}-g0", target.as_str()))
+            .map_err(|_| BridgeError::InvalidRequest { field: "contextId" })?;
+        let mut tab = self.by_context.lock().await;
+        Self::fork_source_admitted_locked(&tab, &plan.source)?;
+        let again = Self::fork_plan_locked(
+            &tab,
+            source,
+            target,
+            &agent,
+            overrides.as_ref(),
+            cwd.as_ref(),
+        )?;
+        if !again.source.same_handle(&plan.source) {
+            return Err(BridgeError::ForkRefused {
+                reason: ForkRefusal::SourceExpired,
+            });
+        }
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tab.insert(
+            target.clone(),
+            WarmHandle {
+                id: SessionHandleId::parse(format!("h-{n}"))?,
+                agent,
+                caps: resolved.backend.capabilities(),
+                backend: resolved.backend,
+                backend_session: session,
+                generation: SessionGeneration::new(0),
+                fingerprint: plan.fingerprint,
+                lease: resolved.lease,
+                state: SessionState::Idle,
+                usage: UsageSnapshot::default(),
+                expire_after_reconcile: false,
+                op: None,
+                turn_aborts: Vec::new(),
+                governed: None,
+                pending_seed: None,
+                pending_injects: Vec::new(),
+                last_used: self.clock.now_instant(),
+            },
+        );
+        let result = self.claim_governed_locked(&mut tab, target, None, None, None, true, observer);
+        match result {
+            Ok(mut claim) => {
+                claim.fork_source = Some(plan.source);
+                Ok(claim)
+            }
+            Err(error) => {
+                tab.remove(target);
+                Err(error)
+            }
+        }
     }
 
     async fn checkout_turn_inner(
@@ -3074,6 +3589,11 @@ mod tests {
         reconcile_started: Notify,
         reconcile_started_count: AtomicUsize,
         capabilities: AgentSessionCaps,
+        fork_support: StdMutex<Result<(), ForkRefusal>>,
+        fork_result: StdMutex<Result<(), BridgeError>>,
+        fork_gate: StdMutex<Option<oneshot::Receiver<()>>>,
+        /// `(source, target)` backend sessions, one per `fork_session`.
+        forks: StdMutex<Vec<(String, String)>>,
     }
 
     impl FakeBackend {
@@ -3107,7 +3627,29 @@ mod tests {
                 reconcile_started: Notify::new(),
                 reconcile_started_count: AtomicUsize::new(0),
                 capabilities: AgentSessionCaps::default(),
+                fork_support: StdMutex::new(Ok(())),
+                fork_result: StdMutex::new(Ok(())),
+                fork_gate: StdMutex::new(None),
+                forks: StdMutex::new(Vec::new()),
             }
+        }
+
+        fn forks(&self) -> Vec<(String, String)> {
+            self.forks.lock().unwrap().clone()
+        }
+
+        fn set_fork_support(&self, support: Result<(), ForkRefusal>) {
+            *self.fork_support.lock().unwrap() = support;
+        }
+
+        fn block_next_fork(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.fork_gate.lock().unwrap() = Some(rx);
+            tx
+        }
+
+        fn set_fork_result(&self, result: Result<(), BridgeError>) {
+            *self.fork_result.lock().unwrap() = result;
         }
 
         fn with_capabilities(reply: impl Into<String>, capabilities: AgentSessionCaps) -> Self {
@@ -3340,6 +3882,26 @@ mod tests {
         fn capabilities(&self) -> AgentSessionCaps {
             self.capabilities.clone()
         }
+
+        fn fork_support(&self) -> Result<(), ForkRefusal> {
+            *self.fork_support.lock().unwrap()
+        }
+
+        async fn fork_session(
+            &self,
+            source: &SessionId,
+            target: &SessionId,
+        ) -> Result<(), BridgeError> {
+            self.forks
+                .lock()
+                .unwrap()
+                .push((source.as_str().to_owned(), target.as_str().to_owned()));
+            let gate = self.fork_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            self.fork_result.lock().unwrap().clone()
+        }
     }
 
     /// Registry resolving a fixed agent entry and a shared recording backend.
@@ -3349,6 +3911,8 @@ mod tests {
         retired: StdMutex<Arc<AtomicBool>>,
         panic_next_lease_drop: AtomicBool,
         observed: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        /// Parks the next observed `resolve` until the sender fires.
+        resolve_gate: StdMutex<Option<oneshot::Receiver<()>>>,
     }
 
     impl FakeRegistry {
@@ -3359,6 +3923,7 @@ mod tests {
                 retired: StdMutex::new(Arc::new(AtomicBool::new(false))),
                 panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
+                resolve_gate: StdMutex::new(None),
             }
         }
 
@@ -3369,11 +3934,22 @@ mod tests {
                 retired: StdMutex::new(Arc::new(AtomicBool::new(false))),
                 panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
+                resolve_gate: StdMutex::new(None),
             }
         }
 
         fn retire(&self) {
             self.retired.lock().unwrap().store(true, Ordering::SeqCst);
+        }
+
+        fn resolves(&self) -> usize {
+            self.observed.lock().unwrap().len()
+        }
+
+        fn block_next_resolve(&self) -> oneshot::Sender<()> {
+            let (tx, rx) = oneshot::channel();
+            *self.resolve_gate.lock().unwrap() = Some(rx);
+            tx
         }
 
         fn panic_next_lease_drop(&self) {
@@ -3410,6 +3986,10 @@ mod tests {
             observer: Arc<dyn DiagnosticObserver>,
         ) -> Result<Resolved, BridgeError> {
             self.observed.lock().unwrap().push(observer);
+            let gate = self.resolve_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             self.resolve(id).await
         }
 
@@ -9088,5 +9668,471 @@ mod tests {
         assert_eq!(manager.status(&c).await.unwrap().state, "running");
         manager.finish_turn(&c, turn.generation, &turn.op).await;
         assert_eq!(manager.status(&c).await.unwrap().state, "idle");
+    }
+
+    // ---- context fork ----
+
+    fn noop_observer() -> Arc<dyn DiagnosticObserver> {
+        Arc::new(NoopDiagnosticObserver::default())
+    }
+
+    /// An idle source context `src`, whose one turn used `model`.
+    async fn idle_source(manager: &SessionManager, model: Option<&str>) -> (ContextId, WarmTurn) {
+        let source = ctx("src");
+        let overrides = model.map(|model| AgentOverride {
+            model: Some(model.into()),
+            ..Default::default()
+        });
+        let turn = manager
+            .checkout_turn(&source, agent(), overrides, None)
+            .await
+            .unwrap();
+        manager
+            .finish_turn(&source, turn.generation, &turn.op)
+            .await;
+        (source, turn)
+    }
+
+    async fn fork(
+        manager: &SessionManager,
+        source: &ContextId,
+        target: &str,
+        overrides: Option<AgentOverride>,
+    ) -> Result<WarmTurn, BridgeError> {
+        manager
+            .checkout_fork_turn_observed(
+                source,
+                &ctx(target),
+                agent(),
+                overrides,
+                None,
+                noop_observer(),
+            )
+            .await
+    }
+
+    fn refused(result: Result<WarmTurn, BridgeError>, reason: ForkRefusal) {
+        match result {
+            Err(BridgeError::ForkRefused { reason: actual }) => assert_eq!(actual, reason),
+            Err(other) => panic!("expected {reason:?}, got {other:?}"),
+            Ok(_) => panic!("expected {reason:?}, but the fork was admitted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_starts_a_new_context_on_its_own_session_with_the_sources_config() {
+        let (manager, backend, _registry) = manager();
+        let (source, source_turn) = idle_source(&manager, Some("m1")).await;
+
+        let turn = fork(&manager, &source, "child", None).await.unwrap();
+
+        assert_eq!(turn.agent, agent());
+        assert_eq!(
+            turn.model.as_deref(),
+            Some("m1"),
+            "the fork inherits the source's config"
+        );
+        assert_eq!(turn.generation, SessionGeneration::new(0));
+        assert_ne!(turn.session, source_turn.session);
+        assert_eq!(
+            backend.forks(),
+            [(
+                source_turn.session.as_str().to_owned(),
+                turn.session.as_str().to_owned()
+            )]
+        );
+        assert_eq!(
+            backend.configured().last().map(String::as_str),
+            Some(turn.session.as_str()),
+            "the target is configured before the fork"
+        );
+        assert_eq!(
+            manager.status(&ctx("child")).await.unwrap().state,
+            "running"
+        );
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+        assert_eq!(backend.releases(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn fork_layers_per_message_overrides_on_the_sources_config() {
+        let (manager, _backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, Some("m1")).await;
+        let turn = fork(
+            &manager,
+            &source,
+            "child",
+            Some(AgentOverride {
+                model: Some("m2".into()),
+                effort: Some(Effort::High),
+                mode: Some("plan".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.model.as_deref(), Some("m2"));
+        assert_eq!(turn.effort.as_deref(), Some("high"));
+        assert_eq!(turn.mode.as_deref(), Some("plan"));
+        // Overrides belong to the fork alone.
+        let sibling = fork(&manager, &source, "sibling", None).await.unwrap();
+        assert_eq!(sibling.model.as_deref(), Some("m1"));
+        assert_eq!(sibling.mode, None);
+    }
+
+    #[tokio::test]
+    async fn fork_refusals_name_their_reason_touch_nothing_and_send_no_fork() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+
+        // Unknown source.
+        refused(
+            fork(&manager, &ctx("nobody"), "t", None).await,
+            ForkRefusal::SourceNotFound,
+        );
+        // Target already in use, including the source itself.
+        manager
+            .checkout_turn(&ctx("taken"), agent(), None, None)
+            .await
+            .unwrap();
+        let configured = backend.configured();
+        refused(
+            fork(&manager, &source, "taken", None).await,
+            ForkRefusal::TargetInUse,
+        );
+        refused(
+            fork(&manager, &source, "src", None).await,
+            ForkRefusal::TargetInUse,
+        );
+        // A source with a turn in flight.
+        refused(
+            fork(&manager, &ctx("taken"), "t", None).await,
+            ForkRefusal::SourceBusy,
+        );
+        // Adapter and backend kinds that cannot fork.
+        for reason in [
+            ForkRefusal::AdapterUnsupported,
+            ForkRefusal::BackendUnsupported,
+        ] {
+            backend.set_fork_support(Err(reason));
+            refused(fork(&manager, &source, "t", None).await, reason);
+        }
+        // An expired source.
+        backend.set_fork_support(Ok(()));
+        manager.release(&source).await;
+        refused(
+            fork(&manager, &source, "t", None).await,
+            ForkRefusal::SourceNotFound,
+        );
+
+        assert!(backend.forks().is_empty());
+        assert_eq!(
+            backend.configured(),
+            configured,
+            "no refusal configured a session"
+        );
+        assert!(
+            manager.status(&ctx("t")).await.is_none(),
+            "no refusal left a target behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_fork_leaves_the_source_idle_and_usable() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        backend.set_fork_support(Err(ForkRefusal::AdapterUnsupported));
+        refused(
+            fork(&manager, &source, "t", None).await,
+            ForkRefusal::AdapterUnsupported,
+        );
+        let status = manager.status(&source).await.unwrap();
+        assert_eq!(status.state, "idle");
+        assert_eq!(status.generation, 0);
+        manager.checkout_existing_turn(&source).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_fork_leaves_no_target_and_releases_its_session() {
+        let (manager, backend, registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        backend.set_fork_result(Err(BridgeError::ForkRefused {
+            reason: ForkRefusal::SourceBusy,
+        }));
+        let result = fork(&manager, &source, "child", None).await;
+        refused(result, ForkRefusal::SourceBusy);
+        assert!(manager.status(&ctx("child")).await.is_none());
+        assert_eq!(
+            backend.releases(),
+            ["ctx-child-g0"],
+            "only the target's session is released"
+        );
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+        // The id is free again, and the registry lease the failed fork held was dropped.
+        backend.set_fork_result(Ok(()));
+        fork(&manager, &source, "child", None).await.unwrap();
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn a_fork_refuses_a_source_whose_backend_was_replaced() {
+        let (manager, _backend, registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        registry.retire();
+        refused(
+            fork(&manager, &source, "t", None).await,
+            ForkRefusal::SourceExpired,
+        );
+    }
+
+    #[tokio::test]
+    async fn many_forks_of_one_source_run_concurrently() {
+        let (manager, backend, _registry) = manager();
+        let (source, source_turn) = idle_source(&manager, None).await;
+        let (a, b, c) = tokio::join!(
+            fork(&manager, &source, "a", None),
+            fork(&manager, &source, "b", None),
+            fork(&manager, &source, "c", None),
+        );
+        let sessions: Vec<_> = [a, b, c].into_iter().map(|t| t.unwrap().session).collect();
+        let mut distinct = sessions.clone();
+        distinct.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3);
+        assert_eq!(backend.forks().len(), 3);
+        assert!(backend
+            .forks()
+            .iter()
+            .all(|(from, _)| from == source_turn.session.as_str()));
+        // The source was not consumed.
+        manager.checkout_existing_turn(&source).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forks_and_their_source_expire_and_release_independently() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let clock = Arc::new(ManualClock::new(0));
+        let manager =
+            SessionManager::new_with_clock(registry, Duration::from_secs(5), clock.clone());
+        let (source, _) = idle_source(&manager, None).await;
+        clock.advance(Duration::from_secs(4));
+        let turn = fork(&manager, &source, "child", None).await.unwrap();
+        manager
+            .finish_turn(&ctx("child"), turn.generation, &turn.op)
+            .await;
+        clock.advance(Duration::from_secs(2));
+
+        // The source idled out; the fork, younger, did not.
+        manager.reap_idle().await;
+        assert!(manager.status(&source).await.is_none());
+        assert_eq!(manager.status(&ctx("child")).await.unwrap().state, "idle");
+        manager.checkout_existing_turn(&ctx("child")).await.unwrap();
+
+        // Releasing a fork leaves its source and its siblings.
+        let (manager, backend, _registry) = self::manager();
+        let (source, _) = idle_source(&manager, None).await;
+        for name in ["a", "b"] {
+            let turn = fork(&manager, &source, name, None).await.unwrap();
+            manager
+                .finish_turn(&ctx(name), turn.generation, &turn.op)
+                .await;
+        }
+        manager.release(&ctx("a")).await;
+        assert!(manager.status(&ctx("a")).await.is_none());
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+        assert_eq!(manager.status(&ctx("b")).await.unwrap().state, "idle");
+        assert_eq!(backend.releases(), ["ctx-a-g0"]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_forks_turn_does_not_cancel_its_source() {
+        let (manager, backend, _registry) = manager();
+        let (source, source_turn) = idle_source(&manager, None).await;
+        let turn = fork(&manager, &source, "child", None).await.unwrap();
+        manager.cancel(&ctx("child")).await.unwrap();
+        assert_eq!(backend.cancels(), [turn.session.as_str().to_owned()]);
+        assert!(!backend
+            .cancels()
+            .contains(&source_turn.session.as_str().to_owned()));
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+    }
+
+    /// Release `source` and bring it back under the same id: the new handle's backend session id is
+    /// the old one's, which is exactly what a fork must not mistake for the same conversation.
+    async fn replace_source(manager: &SessionManager, source: &ContextId) {
+        manager.release(source).await;
+        let turn = manager
+            .checkout_turn(source, agent(), None, None)
+            .await
+            .unwrap();
+        manager.finish_turn(source, turn.generation, &turn.op).await;
+    }
+
+    #[tokio::test]
+    async fn a_source_replaced_before_the_copy_is_refused_and_never_forked() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        let configured = backend.configured().len();
+        let open = backend.block_next_configure();
+        let (result, ()) = tokio::join!(fork(&manager, &source, "child", None), async {
+            while backend.configured().len() == configured {
+                tokio::task::yield_now().await;
+            }
+            replace_source(&manager, &source).await;
+            open.send(()).unwrap();
+        });
+        refused(result, ForkRefusal::SourceExpired);
+        assert!(
+            backend.forks().is_empty(),
+            "no session/fork reached the backend"
+        );
+        assert!(manager.status(&ctx("child")).await.is_none());
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_source_replaced_during_the_copy_discards_the_fork() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        let open = backend.block_next_fork();
+        let (result, ()) = tokio::join!(fork(&manager, &source, "child", None), async {
+            while backend.forks().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            replace_source(&manager, &source).await;
+            open.send(()).unwrap();
+        });
+        refused(result, ForkRefusal::SourceExpired);
+        assert!(
+            manager.status(&ctx("child")).await.is_none(),
+            "the copy is not delivered"
+        );
+        assert!(
+            backend.releases().contains(&"ctx-child-g0".to_owned()),
+            "the discarded fork's session is released: {:?}",
+            backend.releases()
+        );
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_source_being_torn_down_is_refused_as_expired() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        let open = backend.block_next_release();
+        let (manager, source_ctx) = (Arc::new(manager), source.clone());
+        let releasing = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.release(&source_ctx).await }
+        });
+        backend.wait_for_release().await;
+        // The release is parked in the backend: the source's tombstone is all that is left of it.
+        refused(
+            fork(&manager, &source, "t", None).await,
+            ForkRefusal::SourceExpired,
+        );
+        assert!(backend.forks().is_empty());
+        open.send(()).unwrap();
+        releasing.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_source_replaced_while_the_agent_resolves_is_refused_and_never_forked() {
+        let (manager, backend, registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        let configured = backend.configured().len();
+        let resolves = registry.resolves();
+        let open = registry.block_next_resolve();
+        let (result, ()) = tokio::join!(fork(&manager, &source, "child", None), async {
+            while registry.resolves() == resolves {
+                tokio::task::yield_now().await;
+            }
+            replace_source(&manager, &source).await;
+            open.send(()).unwrap();
+        });
+        refused(result, ForkRefusal::SourceExpired);
+        let configured_for_child = backend.configured()[configured..]
+            .iter()
+            .any(|session| session == "ctx-child-g0");
+        assert!(!configured_for_child, "the target was never set up");
+        assert!(backend.forks().is_empty(), "no session/fork was sent");
+        assert!(manager.status(&ctx("child")).await.is_none());
+        assert_eq!(manager.status(&source).await.unwrap().state, "idle");
+    }
+
+    #[tokio::test]
+    async fn a_source_recreated_on_another_agent_is_refused_as_expired() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::with_entries(
+            vec![fake_entry("codex"), fake_entry("other")],
+            backend.clone(),
+        ));
+        let manager = SessionManager::new(registry.clone(), Duration::from_secs(30));
+        let (source, _) = idle_source(&manager, None).await;
+        let resolves = registry.resolves();
+        let open = registry.block_next_resolve();
+        let (result, ()) = tokio::join!(fork(&manager, &source, "child", None), async {
+            while registry.resolves() == resolves {
+                tokio::task::yield_now().await;
+            }
+            // The same id comes back on a different, equally fork-capable agent.
+            manager.release(&source).await;
+            let other = AgentId::parse("other").unwrap();
+            let turn = manager
+                .checkout_turn(&source, other, None, None)
+                .await
+                .unwrap();
+            manager
+                .finish_turn(&source, turn.generation, &turn.op)
+                .await;
+            open.send(()).unwrap();
+        });
+        refused(result, ForkRefusal::SourceExpired);
+        assert!(backend.forks().is_empty(), "no session/fork was sent");
+        assert!(manager.status(&ctx("child")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_caller_dropped_during_the_copy_leaves_no_target_and_frees_its_id() {
+        let (manager, backend, _registry) = manager();
+        let (source, _) = idle_source(&manager, None).await;
+        let manager = Arc::new(manager);
+        let open = backend.block_next_fork();
+        let requesting = tokio::spawn({
+            let (manager, source) = (manager.clone(), source.clone());
+            async move { fork(&manager, &source, "child", None).await.map(|_| ()) }
+        });
+        while backend.forks().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            manager.status(&ctx("child")).await.unwrap().state,
+            "configuring"
+        );
+        // The client disconnects with `session/fork` unanswered; the answer then arrives.
+        requesting.abort();
+        assert!(requesting.await.unwrap_err().is_cancelled());
+        let _ = open.send(());
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while manager.status(&ctx("child")).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the abandoned target is removed, not left configuring");
+        assert!(
+            backend.releases().contains(&"ctx-child-g0".to_owned()),
+            "the target's backend session is released: {:?}",
+            backend.releases()
+        );
+        assert!(
+            !backend.releases().contains(&"ctx-src-g0".to_owned()),
+            "the source's is not: {:?}",
+            backend.releases()
+        );
+        // The id is free again, and the source never stopped being usable.
+        fork(&manager, &source, "child", None).await.unwrap();
+        manager.checkout_existing_turn(&source).await.unwrap();
     }
 }

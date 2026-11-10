@@ -279,6 +279,16 @@ impl AgentBackend for AccountingBackendV1 {
     fn capabilities(&self) -> crate::orch::AgentSessionCaps {
         self.inner.capabilities()
     }
+    fn fork_support(&self) -> Result<(), crate::error::ForkRefusal> {
+        self.inner.fork_support()
+    }
+    async fn fork_session(
+        &self,
+        source: &SessionId,
+        target: &SessionId,
+    ) -> Result<(), BridgeError> {
+        self.inner.fork_session(source, target).await
+    }
     async fn set_host_custody(&self, held: bool) -> Result<(), BridgeError> {
         self.inner.set_host_custody(held).await
     }

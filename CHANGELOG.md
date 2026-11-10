@@ -63,6 +63,18 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Added
 
+- A served context can be forked. `message/send` (unary and streaming) accepts the bridge-private metadata key
+  `a2a-bridge.fork_from`, an idle warm context id, and `a2a-bridge submit` gains `--fork-from <id>`. The message
+  runs as the first turn of a NEW context (`message.contextId`, allocated and returned if omitted) on an agent
+  session forked from the source's with ACP `session/fork`, so many independent conversations can start from one
+  warm history and share its provider prompt cache. The new context takes the source's agent and effective
+  config plus the message's `a2a-bridge.{model,effort,mode,cwd}`; the source is untouched and the source and each
+  fork expire, release, cancel and are accounted independently. Refusals (unknown, expired or busy source,
+  target in use, adapter without `session/fork`, API, `container_rw`, containerized-reader, workflow, fan-out or
+  delegation backends, cwd outside `allowed_cwd_root`) precede any provider work and carry a stable
+  `error.data.reason`. `models --json` and the Agent Card report `"fork": true` per agent from the adapter's
+  `initialize` response. Enables `agent-client-protocol` feature `unstable_session_fork`. MCP-surface fork is a
+  follow-up.
 - `submit` and `run-workflow` (local and `--serve`) print a heartbeat while the run is in flight: one
   stderr line per beat, first after 60 s and then every 60 s, never anything on stdout, for example
   `[heartbeat] elapsed=14m00s turns=1 agent=codex last_activity=2m10s open_tool="cargo test"

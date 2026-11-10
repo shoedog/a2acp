@@ -327,6 +327,68 @@ dropping that request drops the local leg, which cancels its ACP prompt. A strea
 Served workflows ignore all three: their node turns follow the frozen workflow policy above and keep the
 workflow's 2-hour cutoff, whatever the client asked.
 
+### Forking a warm context: `a2a-bridge.fork_from`
+
+Build one warm conversation once, then branch it into many independent ones that each start with the same
+history. A served `message/send` (unary or streaming) may carry the bridge-private metadata key
+`a2a-bridge.fork_from`, set to the id of an existing, idle warm context:
+
+```sh
+a2a-bridge submit --input packet.md --context packet                       # build the shared prefix once
+a2a-bridge submit --input claim-1.md --fork-from packet --context claim-1  # branch it, once per claim
+a2a-bridge submit --input claim-2.md --fork-from packet                    # the server allocates the id
+```
+
+- `message.contextId` names the **new** context, which must be unused; omit it and the bridge allocates one and
+  returns it (`task.contextId` in the unary reply, the SSE frames' context on a streaming one, and a
+  `context_id=` line from `submit`). The message runs as the first turn of the new context, on a fresh agent
+  session the bridge forks from the source's with ACP `session/fork`.
+- The new context runs the source's agent: a fork that names neither `a2a-bridge.agent` nor a skill takes its
+  source's agent rather than the registry default, and one that names a different agent is refused as a
+  `ConfigMismatch` on `agent`, as for any warm context. It records the source's effective config, with the
+  message's own `a2a-bridge.model`,
+  `effort`, `mode` and `cwd` layered on top as for any first turn. A fork's `cwd` must pass the same
+  `allowed_cwd_root` check as any request.
+- The source is only read. It stays usable, keeps its history, and is not consumed; later turns on the source or
+  on any fork never change the other's history. A source may have many forks, taking turns concurrently within
+  the agent's usual limits. Each fork is a context of its own: it is accounted like any other turn (usage rows,
+  attribution, heartbeat and liveness), and it expires (idle TTL), is released and is cancelled independently of
+  the source and of its siblings.
+- Each refusal happens before any provider prompt work, leaves the source untouched, and is a JSON-RPC
+  `-32600` error whose `error.data.reason` is stable (on a streaming request that has already opened its SSE
+  response, the same code is the `reason` field of the `error` frame):
+
+  | `reason` | when |
+  |----------|------|
+  | `fork_source_not_found` | the source context is unknown or was released |
+  | `fork_source_expired` | the source expired, is being torn down, or its agent was reloaded since its first turn |
+  | `fork_source_busy` | the source has a turn or another operation in flight (fork only an idle context) |
+  | `fork_source_not_started` | the source has no agent session yet (it took no turn since it was created, compacted or reset) |
+  | `fork_target_in_use` | the new context id is already a live context |
+  | `fork_adapter_unsupported` | the agent's adapter did not advertise `session/fork` at `initialize` |
+  | `fork_backend_unsupported` | the backend kind cannot fork: API agents, `container_rw` implement sessions, containerized readers (refused for now), workflows, fan-out and delegation |
+  | `fork_cwd_outside_root` | the `a2a-bridge.cwd` override lies outside `allowed_cwd_root` |
+  | `fork_agent_mismatch` | the request names an `a2a-bridge.agent` other than the one the source runs on (omit the key to inherit the source's agent) |
+  | `fork_timeout` | once the fork's turn in the per-source fork queue came (forks of one source copy one at a time; waiting behind siblings does not count), the adapter's `session/fork` answer and the new context's mode/model/effort configuration did not finish within 60 s, so a stalled adapter holds the source and the queue for at most one deadline per fork; the new context is removed and its id is reusable; an agent session the adapter already returned is released with it (closed with `session/close` when the adapter advertises it, otherwise dropped) |
+
+- A fork copies the source's agent-side history only: input queued for the source's next turn (`inject`, a
+  compaction seed) is not carried. A fork does not refresh the source's idle clock, so a long batch of forks
+  from one source should keep it warm with its own turns or a larger `warm_idle_ttl_secs`; a source that
+  expires mid-batch refuses later forks with `fork_source_not_found`.
+- A source that is released and recreated under the same id while a fork is being admitted or copied is
+  detected, including in the window before the agent is resolved: the fork is discarded with
+  `fork_source_expired` rather than carrying the replacement's history.
+- Fork setup is owned by the bridge, not the request: a client that disconnects mid-setup leaves no half-made
+  context behind. The new context and its agent session are released, and its id is free to use again.
+- `[worktrees]` agents and containerized agents do not fork; their catalog entries carry no `fork` key.
+- **Discover support first.** `a2a-bridge models --json` (and the Agent Card's `agent-models` extension) carries
+  `"fork": true` for a host agent whose adapter advertised `session/fork`; the key is absent otherwise.
+  claude-agent-acp 0.97.0 and codex-acp 2.3.0 advertise it.
+- The key names a local session, so it is never forwarded: delegation sends no request metadata to a peer, and a
+  request that would route to a peer is refused (`fork_backend_unsupported`) before anything is sent.
+- Not covered: forking from the MCP surface (a follow-up), forking inside a workflow node, and lineage across a
+  bridge restart beyond what context persistence already keeps.
+
 ### Workflow node selections
 
 Each `[[workflows.nodes]]` may set optional `model`, `effort`, and `mode` fields.

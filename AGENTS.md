@@ -191,6 +191,23 @@ a2a-bridge serve --config ./a2a-bridge.toml
 `serve` advertises each agent's available models/effort/modes on the Agent Card
 (`agent-models` extension, probed at startup + refreshed on `SIGHUP`).
 
+**Fork a warm context.** A served `message/send` (unary or streaming) may carry the bridge-private metadata key
+`a2a-bridge.fork_from` set to an idle warm context id, and `a2a-bridge submit` sets it with `--fork-from <id>`.
+`message.contextId` names the **new** context (it must be unused; the bridge allocates and returns one if omitted,
+and `submit` prints `context_id=<id>`); the message then runs as that context's first turn on a fresh agent
+session forked from the source's with ACP `session/fork`. The new context takes the source's agent (when the message names no agent or skill) and effective
+config with the message's `a2a-bridge.{model,effort,mode,cwd}` layered on top; the source is only read, and the
+source and every fork expire, release, cancel and are accounted independently. Refusals come before any provider
+work, leave the source untouched, and carry a stable `error.data.reason`: `fork_source_not_found`,
+`fork_source_expired`, `fork_source_busy`, `fork_source_not_started`, `fork_target_in_use`,
+`fork_adapter_unsupported`, `fork_backend_unsupported` (API, `:rw` implement sessions, containerized readers,
+workflows, fan-out, delegation), `fork_cwd_outside_root`, `fork_agent_mismatch` (an explicit `a2a-bridge.agent`
+other than the source's) and `fork_timeout` (once its turn in the per-source fork queue
+comes, `session/fork` and the target's configuration did not finish within 60 s; the source, its siblings and the
+target are freed. Waiting behind sibling forks does not count). The key is never forwarded to a peer. Agents that can
+fork show `"fork": true` in `models --json` and the Agent Card. Details:
+[`docs/onboarding.md`](docs/onboarding.md#forking-a-warm-context-a2a-bridgefork_from).
+
 ## 4b. Discover model/effort/mode values
 
 ```bash
@@ -199,7 +216,7 @@ a2a-bridge models --config … --agent codex --json       # one agent, JSON (cap
 ```
 
 Probes live and degrades per-agent. Successful JSON values use the Agent Card `agent-models` capability
-shape. A failed probe is retained as `{available:false,failure:{agent,strategy,phase,...}}`; an explicitly
+shape; `"fork": true` appears for a host agent whose adapter advertised `session/fork` (see section 4). A failed probe is retained as `{available:false,failure:{agent,strategy,phase,...}}`; an explicitly
 requested failed agent exits nonzero after printing that machine-readable record, while an all-agent probe
 keeps partial-success exit behavior. Failure detail is returned in place: text includes the stable phase,
 category, and deepest bounded redacted error; JSON exposes those as `failure.phase`, `failure.category`, and

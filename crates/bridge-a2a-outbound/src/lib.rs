@@ -140,6 +140,34 @@ mod tests {
         assert!(d.peer_task.borrow().is_some(), "peer task id captured");
     }
 
+    /// Delegation forwards the message text and nothing of the inbound request's `a2a-bridge.*`
+    /// metadata, so the bridge-private fork key (and every sibling of it) never reaches a peer.
+    #[tokio::test]
+    async fn delegation_sends_no_bridge_private_metadata_to_the_peer() {
+        let (url, peer) =
+            crate::testpeer::MockPeer::start(crate::testpeer::script_status_then_final("R")).await;
+        let pd = PeerDelegation::new(&url, "bearer:T", std::time::Duration::from_secs(30));
+        let mut d = pd
+            .delegate(
+                &auth(),
+                &TaskId::parse("t").unwrap(),
+                vec![Part { text: "x".into() }],
+            )
+            .await
+            .unwrap();
+        while d.events.next().await.is_some() {}
+        let body = peer.last_request_body().to_string();
+        assert!(
+            body.contains("\"x\""),
+            "the message text is delegated: {body}"
+        );
+        assert!(
+            !body.contains("a2a-bridge"),
+            "no bridge-private key is forwarded: {body}"
+        );
+        assert!(!body.contains("fork_from"), "{body}");
+    }
+
     #[tokio::test]
     async fn cancel_posts_cancel_task_to_peer() {
         let (url, peer) =
