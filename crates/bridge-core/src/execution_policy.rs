@@ -688,6 +688,7 @@ impl NodeCauseV1 {
             }
             BridgeError::SessionExpired => (Class::Unknown, "bridge.session_expired"),
             BridgeError::HandleBusy => (Class::Unknown, "bridge.handle_busy"),
+            BridgeError::ForkRefused { .. } => (Class::Config, "bridge.fork_refused"),
             BridgeError::AuthRequired { .. } => (Class::Authentication, "bridge.auth_required"),
             BridgeError::PermissionRequired { .. } => (Class::Config, "bridge.permission_required"),
             BridgeError::PermissionDenied => (Class::Config, "bridge.permission_denied"),

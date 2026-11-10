@@ -134,7 +134,9 @@ pub fn agent_card(
             description: Some(
                 "Per-agent model/effort/mode catalog. To override a default, send message.metadata \
             `a2a-bridge.model` only for agents with `model_configurable: true`, and \
-            `a2a-bridge.effort` / `a2a-bridge.mode` only when those lists are present."
+            `a2a-bridge.effort` / `a2a-bridge.mode` only when those lists are present. An agent \
+            with `fork: true` can branch an idle context: send `a2a-bridge.fork_from` set to that \
+            context id (the message's contextId names the new, unused context)."
                     .to_string(),
             ),
             required: Some(false),
@@ -359,6 +361,7 @@ mod tests {
                 effort_levels: vec!["low".into(), "high".into()],
                 modes: vec![],
                 current_mode: None,
+                fork: false,
             },
         );
         let c = agent_card("http://x", &[], &[], &cat);

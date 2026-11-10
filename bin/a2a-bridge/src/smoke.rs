@@ -3191,6 +3191,7 @@ mod tests {
             effort_levels: vec!["low".into(), "high".into()],
             modes: vec!["default".into(), "plan".into()],
             current_mode: Some("plan".into()),
+            fork: false,
         }
     }
 

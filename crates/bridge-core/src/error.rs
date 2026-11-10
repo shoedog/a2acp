@@ -19,6 +19,44 @@ pub enum A2aDisposition {
     SetState(A2aState),
 }
 
+/// Why a context fork was refused. Every refusal happens before any provider prompt work and leaves
+/// the source context untouched; [`Self::code`] is the stable machine-readable reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRefusal {
+    /// The source context id is unknown (never created, or already released).
+    SourceNotFound,
+    /// The source context expired or is being torn down.
+    SourceExpired,
+    /// The source context has a turn (or another operation) in flight.
+    SourceBusy,
+    /// The source context has no provider session yet, so there is no history to fork.
+    SourceNotStarted,
+    /// The requested target context id is already in use.
+    TargetInUse,
+    /// The source agent's adapter did not advertise `session/fork` at initialize.
+    AdapterUnsupported,
+    /// The backend kind has no fork support (API, `:rw` implement sessions, containers, workflows,
+    /// fan-out and delegation).
+    BackendUnsupported,
+    /// A cwd override fell outside the allowed cwd root.
+    CwdOutsideRoot,
+}
+
+impl ForkRefusal {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SourceNotFound => "fork_source_not_found",
+            Self::SourceExpired => "fork_source_expired",
+            Self::SourceBusy => "fork_source_busy",
+            Self::SourceNotStarted => "fork_source_not_started",
+            Self::TargetInUse => "fork_target_in_use",
+            Self::AdapterUnsupported => "fork_adapter_unsupported",
+            Self::BackendUnsupported => "fork_backend_unsupported",
+            Self::CwdOutsideRoot => "fork_cwd_outside_root",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum BridgeError {
     #[error("a2a version mismatch")]
@@ -47,6 +85,8 @@ pub enum BridgeError {
     SessionExpired,
     #[error("session busy")]
     HandleBusy,
+    #[error("fork refused: {}", reason.code())]
+    ForkRefused { reason: ForkRefusal },
     #[error("auth required")]
     AuthRequired { request_id: String },
     #[error("permission required")]
@@ -199,7 +239,8 @@ impl BridgeError {
             | ConfigReseedRequired { .. }
             | ResourceFlightUnsupported
             | SessionExpired
-            | HandleBusy => RejectRequest,
+            | HandleBusy
+            | ForkRefused { .. } => RejectRequest,
             IdentityUnavailable | DurableEvidenceUnavailable { .. } => RejectRequest,
             AuthRequired { .. } | AgentNotAuthenticated => SetState(S::AuthRequired),
             PermissionRequired { .. } => SetState(S::InputRequired),
@@ -255,6 +296,32 @@ mod slice0_error_tests {
         assert!(BridgeError::ConfigMismatch { field: "effort" }
             .client_message()
             .contains("effort"));
+    }
+
+    #[test]
+    fn fork_refusals_reject_the_request_with_stable_distinct_codes() {
+        let all = [
+            ForkRefusal::SourceNotFound,
+            ForkRefusal::SourceExpired,
+            ForkRefusal::SourceBusy,
+            ForkRefusal::SourceNotStarted,
+            ForkRefusal::TargetInUse,
+            ForkRefusal::AdapterUnsupported,
+            ForkRefusal::BackendUnsupported,
+            ForkRefusal::CwdOutsideRoot,
+        ];
+        let codes: std::collections::BTreeSet<_> = all.iter().map(|r| r.code()).collect();
+        assert_eq!(codes.len(), all.len(), "every reason has its own code");
+        assert!(codes.iter().all(|code| code.starts_with("fork_")));
+        for reason in all {
+            let error = BridgeError::ForkRefused { reason };
+            assert_eq!(error.disposition(), A2aDisposition::RejectRequest);
+            assert_eq!(
+                error.client_message(),
+                format!("fork refused: {}", reason.code())
+            );
+        }
+        assert_eq!(ForkRefusal::SourceBusy.code(), "fork_source_busy");
     }
 
     #[test]

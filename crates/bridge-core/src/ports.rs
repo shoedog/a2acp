@@ -595,6 +595,28 @@ pub trait AgentBackend: Send + Sync {
     fn capabilities(&self) -> crate::orch::AgentSessionCaps {
         crate::orch::AgentSessionCaps::default()
     }
+    /// Whether this backend can fork a warm session into a new one. `Ok` only for a backend that
+    /// both implements [`Self::fork_session`] and whose adapter advertised `session/fork`. The
+    /// default refuses as an unsupported backend kind, so a wrapper that does not forward this
+    /// method can never fork. Checked before any session state is created.
+    fn fork_support(&self) -> Result<(), crate::error::ForkRefusal> {
+        Err(crate::error::ForkRefusal::BackendUnsupported)
+    }
+    /// Fork bridge session `source` into the new bridge session `target`: the target starts with a
+    /// copy of the source's history, in its own agent session with its own turn lock. `target` must
+    /// already be configured ([`Self::configure_session`]) and must not have taken a turn; the fork
+    /// applies the target's configured mode/model/effort exactly as a first mint would. Refuses
+    /// without sending a prompt when the source is unknown, busy or never started. The default
+    /// refuses.
+    async fn fork_session(
+        &self,
+        _source: &SessionId,
+        _target: &SessionId,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::ForkRefused {
+            reason: crate::error::ForkRefusal::BackendUnsupported,
+        })
+    }
     /// Freeze every write-capable process before host repository access; resume only before a turn.
     /// Unsupported backends refuse: stream completion alone does not stop background writers.
     async fn set_host_custody(&self, _held: bool) -> Result<(), BridgeError> {
@@ -1407,6 +1429,16 @@ mod tests {
             crate::orch::ReconcileOutcome::NotAdvertised,
         );
         assert_eq!(f.capabilities(), crate::orch::AgentSessionCaps::default());
+        // A backend that implements nothing about forking refuses it as an unsupported kind.
+        let unsupported = crate::error::ForkRefusal::BackendUnsupported;
+        assert_eq!(f.fork_support(), Err(unsupported));
+        assert_eq!(
+            f.fork_session(&session, &crate::ids::SessionId::parse("t").unwrap())
+                .await,
+            Err(BridgeError::ForkRefused {
+                reason: unsupported
+            })
+        );
         f.retire().await.unwrap();
         let _obj: std::sync::Arc<dyn AgentBackend> = std::sync::Arc::new(Fake); // object-safe
     }

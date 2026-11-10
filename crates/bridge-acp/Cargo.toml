@@ -6,12 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# ACP SDK 1.x made model/config and streaming UsageUpdate surfaces stable, but auth methods
-# and terminal PromptResponse.usage still ride feature gates. Keep both enabled: auth
-# methods drive login selection, and terminal usage carries per-turn token totals.
+# ACP SDK 1.x made model/config and streaming UsageUpdate surfaces stable, but auth methods,
+# session fork and terminal PromptResponse.usage still ride feature gates. Keep all enabled: auth
+# methods drive login selection, session fork branches a warm context, and terminal usage carries
+# per-turn token totals.
 agent-client-protocol = { workspace = true, features = [
     "unstable_auth_methods",
     "unstable_end_turn_token_usage",
+    "unstable_session_fork",
 ] }
 bridge-core = { path = "../bridge-core" }
 thiserror.workspace = true

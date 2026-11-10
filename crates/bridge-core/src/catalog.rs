@@ -14,6 +14,9 @@ pub struct AgentCaps {
     pub effort_levels: Vec<String>,
     pub modes: Vec<String>,
     pub current_mode: Option<String>,
+    /// True when the adapter advertised `session/fork` at initialize and the bridge can use it for
+    /// this agent (never for containerized agents). Rendered as `"fork": true` only when set.
+    pub fork: bool,
 }
 
 /// agent_id -> caps. An agent that failed to probe is ABSENT (not a stub).
@@ -126,6 +129,9 @@ pub fn caps_to_json(caps: &AgentCaps) -> serde_json::Value {
     if let Some(mode) = &caps.current_mode {
         object.insert("current_mode".into(), serde_json::json!(mode));
     }
+    if caps.fork {
+        object.insert("fork".into(), serde_json::json!(true));
+    }
     serde_json::Value::Object(object)
 }
 
@@ -222,6 +228,7 @@ mod tests {
             effort_levels: vec!["low".into(), "high".into()],
             modes: vec![],
             current_mode: None,
+            fork: false,
         };
         let value = caps_to_json(&caps);
         assert_eq!(value["current"], serde_json::json!("sonnet"));

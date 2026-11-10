@@ -213,7 +213,7 @@ SUBCOMMANDS:
                       operation lock, pinned root, live-consumer probe, git state + containment).
                       --build-targets | --clones [--dry-run] [--disposition-list <f>]
                       [--config <f>] [--json]
-  submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+  submit              Send a unary message.  [skill] --input <file> [--context <id>] [--fork-from <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
   doctor              Read-only preflight: config, agent commands/runtimes, egress, verify/review, store, MCP.  [--config <f>] [--json]
@@ -6970,6 +6970,8 @@ const MODELS_USAGE: &str = "\
 usage: a2a-bridge models [--config <path>] [--agent <id>] [--match <substring>]... [--json]
   List each configured agent's advertised models (+ effort levels + modes), probed live host-side.
   Pass models only when model_configurable=true; effort/mode only when those lists are present.
+  `fork` (JSON key `fork`, true) appears only for a host agent whose adapter advertised session/fork:
+  a served message may then branch an idle context of that agent with a2a-bridge.fork_from.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
   --match <text>   keep advertised model IDs containing text (repeatable OR, case-insensitive)
@@ -7135,6 +7137,9 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
                     }
                     if !caps.modes.is_empty() {
                         println!("    modes:  {}", caps.modes.join(", "));
+                    }
+                    if caps.fork {
+                        println!("    fork:   yes");
                     }
                 }
                 None => {
@@ -7502,8 +7507,8 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
 }
 
 const SUBMIT_USAGE: &str = "\
-usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--agent <id>]
-                         [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--fork-from <id>]
+                         [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
                          [--heartbeat-secs <n> | --no-heartbeat]
 
 Send one unary message to a running a2a-bridge serve and print the response text.
@@ -7511,6 +7516,12 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --input <file>  message body to send (required)
   --url <url>     serve URL (default: http://127.0.0.1:8080)
   --context <id>  reuse an existing contextId (continues that warm session)
+  --fork-from <id>  branch the idle warm context <id> into a NEW context that starts with a copy
+                  of its history (sets a2a-bridge.fork_from). --context names the new context
+                  (it must be unused); without it the server allocates one and submit prints
+                  `context_id=<id>`. The source is untouched. Refused, with a stable reason, when
+                  the source is unknown, busy or expired, the target is in use, or the agent's
+                  adapter or backend cannot fork (see `a2a-bridge models`: `fork`)
   --agent <id>    route to a specific agent id
   --model <m>     override the agent model for this message
   --effort <e>    override the reasoning effort for this message
@@ -7521,6 +7532,9 @@ Send one unary message to a running a2a-bridge serve and print the response text
                   turn is watched: it dies with this client and has no default 2 h work cutoff
   --no-heartbeat  no heartbeat; the turn keeps the 2 h work cutoff (for scripts)
   --usage-config <path> | --usage-store <absolute-path>  select a local reporting ledger";
+
+/// The bridge-private request key that forks the named warm context into the request's new one.
+const FORK_FROM_KEY: &str = "a2a-bridge.fork_from";
 
 fn submit_failure_message(error: &serde_json::Value) -> &str {
     error
@@ -7579,6 +7593,10 @@ async fn submit_cmd_inner(
     if let Some(err) = v.get("error") {
         return Err(format!("submit failed: {}", submit_failure_message(err)).into());
     }
+    // A forked turn runs in a NEW context, which the server may have allocated.
+    if let Some(context) = v["result"]["task"]["contextId"].as_str() {
+        println!("context_id={context}");
+    }
     let out = v["result"]["artifact"]["text"]
         .as_str()
         .or_else(|| {
@@ -7614,6 +7632,7 @@ fn submit_message(
         "--input",
         "--url",
         "--context",
+        "--fork-from",
         "--agent",
         "--model",
         "--effort",
@@ -7631,6 +7650,7 @@ fn submit_message(
         md.insert("a2a-bridge.skill".into(), s.clone().into());
     }
     for (f, key) in [
+        ("--fork-from", FORK_FROM_KEY),
         ("--agent", "a2a-bridge.agent"),
         ("--model", "a2a-bridge.model"),
         ("--effort", "a2a-bridge.effort"),
@@ -19542,6 +19562,41 @@ The command prints schemas, templates, and validates input.
         );
     }
 
+    /// `submit --fork-from` sets the bridge-private fork key, names the new context with
+    /// `--context`, and is documented in the help text; its value is never taken for the skill.
+    #[test]
+    fn submit_fork_from_sets_the_fork_key_and_is_documented() {
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let args: Vec<String> = [
+            "--input",
+            "brief.md",
+            "--fork-from",
+            "src",
+            "--context",
+            "child",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let message = super::submit_message(&args, &identity, "go".into(), false);
+        assert_eq!(message["metadata"]["a2a-bridge.fork_from"], "src");
+        assert_eq!(message["contextId"], "child");
+        assert!(
+            message["metadata"].get("a2a-bridge.skill").is_none(),
+            "{message:?}"
+        );
+
+        let plain: Vec<String> = ["--input", "brief.md"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let message = super::submit_message(&plain, &identity, "go".into(), false);
+        assert!(message["metadata"].get("a2a-bridge.fork_from").is_none());
+
+        assert!(super::SUBMIT_USAGE.contains("--fork-from <id>"));
+        assert!(super::SUBMIT_USAGE.contains("a2a-bridge.fork_from"));
+    }
+
     /// I3: `run-workflow` takes the heartbeat flags without its own parser refusing them.
     #[test]
     fn run_workflow_accepts_the_heartbeat_flags() {
@@ -20328,6 +20383,7 @@ The command prints schemas, templates, and validates input.
                 effort_levels: vec!["high".into()],
                 modes: vec!["code".into()],
                 current_mode: Some("code".into()),
+                fork: false,
             },
         );
         let entries = vec![("opencode".into(), acp_entry("opencode"))];
