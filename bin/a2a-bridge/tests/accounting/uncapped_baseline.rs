@@ -89,7 +89,7 @@ fn projection(cli: &Cli, file_output: bool) -> Value {
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|v| u64::try_from(v).unwrap()),
         )
         .unwrap();
     json!({"status":output.status.code(), "stdout":stdout, "stderr":stderr,

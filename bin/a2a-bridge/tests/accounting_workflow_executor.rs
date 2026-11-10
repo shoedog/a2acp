@@ -1014,7 +1014,7 @@ fn reservations(f: &Fixture) -> Vec<serde_json::Value> {
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|v| u64::try_from(v).unwrap()),
         )
         .unwrap();
     if count == 0 {
@@ -1367,7 +1367,7 @@ async fn ungoverned_capture_keeps_exact_rows_and_creates_no_governance_schema() 
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name LIKE 'governance_%'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|v| u64::try_from(v).unwrap()),
         )
         .unwrap();
     assert_eq!(tables, 0);

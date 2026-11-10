@@ -7913,7 +7913,7 @@ async fn restored_governed_refusal(execute: bool) {
             if exists {
                 let reservations: u64 = db
                     .query_row("SELECT COUNT(*) FROM governance_reservations_v1", [], |r| {
-                        r.get(0)
+                        r.get::<_, i64>(0).map(|v| u64::try_from(v).unwrap())
                     })
                     .unwrap();
                 assert_eq!(reservations, 0);
@@ -8373,7 +8373,8 @@ async fn restored_structured_seed_reuses_ordinary_checkpoint_and_refuses_candida
         assert_eq!(h.f.providers[0].prompts.load(Ordering::SeqCst), 0);
         assert_eq!(
             db.query_row("SELECT count(*) FROM harvest_raw_records_v1", [], |row| row
-                .get::<_, u64>(0))
+                .get::<_, i64>(0)
+                .map(|v| u64::try_from(v).unwrap()))
                 .unwrap(),
             0
         );
@@ -11729,8 +11730,10 @@ impl CandidateFixture {
         let db =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
-        db.query_row("SELECT count(*) FROM usage_attempts_v1", [], |r| r.get(0))
-            .unwrap()
+        db.query_row("SELECT count(*) FROM usage_attempts_v1", [], |r| {
+            r.get::<_, i64>(0).map(|v| usize::try_from(v).unwrap())
+        })
+        .unwrap()
     }
     /// Establish an idle retained conversation on `source` without any workflow.
     async fn warm_retained(&self, dispatcher: &RetainedDispatcher) -> (SessionId, u64) {

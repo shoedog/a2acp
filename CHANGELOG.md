@@ -9,6 +9,11 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- Bundled SQLite is now 3.54.1 (`rusqlite` 0.41, `libsqlite3-sys` 0.39), clearing RUSTSEC-2026-0459 (CVE-2026-119375,
+  uninitialized page-cache memory returned when a database is opened with a sibling `-wal` file of a different page
+  size). Store behaviour is unchanged. The history-database authorizer is now installed fallibly: a failed install
+  fails the open as a ledger error instead of leaving the connection unrestricted. `deny.toml` allows `Zlib` for
+  `foldhash`, which the new `rusqlite` pulls in.
 - Reader and toolchain images pin codex-acp 2.3.0 (Codex 0.164.0) and claude-agent-acp 0.97.0 (Agent SDK 0.3.310 /
   Claude Code 2.1.310); they were 2.2.2 / 0.162.1 and 0.93.0 / 0.3.300 / 2.1.300. The containerized example adds an
   `impl-terra` implementor pinned to `gpt-6.1-terra`. Host, reader and `container_rw` fixed-`PONG` lanes passed; see

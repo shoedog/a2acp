@@ -198,7 +198,7 @@ impl Direct {
             .unwrap();
         let count: usize = conn
             .query_row("SELECT count(*) FROM governance_reservations_v1", [], |r| {
-                r.get(0)
+                r.get::<_, i64>(0).map(|v| usize::try_from(v).unwrap())
             })
             .unwrap();
         assert_eq!(count, expected);
