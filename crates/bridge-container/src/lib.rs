@@ -931,6 +931,7 @@ impl ContainerRwBackend {
             pre_authenticated: self.cfg.pre_authenticated,
             rename_new_sessions: self.cfg.rename_new_sessions,
             rename_timeout: AcpConfig::default().rename_timeout,
+            fork_timeout: AcpConfig::default().fork_timeout,
             watchdog: self.cfg.watchdog.clone(),
             liveness: self.cfg.liveness,
             liveness_board: self.cfg.liveness_board.clone(),
@@ -3366,6 +3367,38 @@ mod tests {
             "identical-path canonical mount {canon}:{canon} not in {argv:?}"
         );
         while stream.next().await.is_some() {}
+    }
+
+    /// A `:rw` implement session never forks: neither backend shape advertises it, and a fork request
+    /// is refused as an unsupported backend kind before any container or session work.
+    #[tokio::test]
+    async fn rw_container_sessions_refuse_to_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        for be in [
+            backend(root, spawn.clone(), reap.clone()).await,
+            warm_backend(root, spawn.clone(), reap.clone()).await,
+        ] {
+            let unsupported = bridge_core::error::ForkRefusal::BackendUnsupported;
+            assert_eq!(be.fork_support(), Err(unsupported));
+            let (source, target) = (
+                SessionId::parse("s1").unwrap(),
+                SessionId::parse("s2").unwrap(),
+            );
+            assert_eq!(
+                be.fork_session(&source, &target).await,
+                Err(BridgeError::ForkRefused {
+                    reason: unsupported
+                })
+            );
+        }
+        assert_eq!(
+            spawn.last_argv.lock().await.len(),
+            0,
+            "no container was started"
+        );
     }
 
     #[tokio::test]

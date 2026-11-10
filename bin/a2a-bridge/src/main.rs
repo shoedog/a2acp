@@ -213,7 +213,7 @@ SUBCOMMANDS:
                       operation lock, pinned root, live-consumer probe, git state + containment).
                       --build-targets | --clones [--dry-run] [--disposition-list <f>]
                       [--config <f>] [--json]
-  submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+  submit              Send a unary message.  [skill] --input <file> [--context <id>] [--fork-from <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
   task                Durable task store.  get | list | cancel | watch
   session             Warm session control.  status | release | cancel | clear | compact <contextId>
   doctor              Read-only preflight: config, agent commands/runtimes, egress, verify/review, store, MCP.  [--config <f>] [--json]
@@ -6970,6 +6970,8 @@ const MODELS_USAGE: &str = "\
 usage: a2a-bridge models [--config <path>] [--agent <id>] [--match <substring>]... [--json]
   List each configured agent's advertised models (+ effort levels + modes), probed live host-side.
   Pass models only when model_configurable=true; effort/mode only when those lists are present.
+  `fork` (JSON key `fork`, true) appears only for a host agent whose adapter advertised session/fork:
+  a served message may then branch an idle context of that agent with a2a-bridge.fork_from.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
   --match <text>   keep advertised model IDs containing text (repeatable OR, case-insensitive)
@@ -7027,6 +7029,19 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
 
 /// Render every configured probe target. Successful values retain the exact Agent Card capability
 /// shape; a failed target gets an additive CLI-only record instead of disappearing.
+/// `[worktrees]` wraps every host agent in a decorator that does not fork, so none of them can: the
+/// catalog reports what the served agents can do, not what their adapters advertise.
+fn mask_fork_for_worktrees(
+    catalog: &mut bridge_core::catalog::ModelCatalog,
+    worktrees_enabled: bool,
+) {
+    if worktrees_enabled {
+        for caps in catalog.values_mut() {
+            caps.fork = false;
+        }
+    }
+}
+
 fn catalog_report_to_json(
     entries: &[(String, AgentEntry)],
     report: &catalog_probe::CatalogProbeReport,
@@ -7093,6 +7108,7 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         .map_err(|e| format!("models: cannot read config {:?}: {e}", config_path))?;
     let cfg = config::RegistryConfig::parse(&raw)
         .map_err(|e| format!("models: config parse error: {e}"))?;
+    let worktrees_enabled = cfg.worktrees.as_ref().is_some_and(|w| w.enabled);
     let snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("models: registry snapshot error: {e}"))?;
@@ -7112,6 +7128,7 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
     let mut report = catalog_probe::probe_all_report(&entries, &cwd).await;
+    mask_fork_for_worktrees(&mut report.catalog, worktrees_enabled);
     let json_report = catalog_report_to_json(&entries, &report, &parsed.matches);
     filter_catalog_models(&mut report.catalog, &parsed.matches);
     if parsed.json {
@@ -7135,6 +7152,9 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
                     }
                     if !caps.modes.is_empty() {
                         println!("    modes:  {}", caps.modes.join(", "));
+                    }
+                    if caps.fork {
+                        println!("    fork:   yes");
                     }
                 }
                 None => {
@@ -7502,8 +7522,8 @@ async fn batch_cmd(args: &[String]) -> Result<(), BoxError> {
 }
 
 const SUBMIT_USAGE: &str = "\
-usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--agent <id>]
-                         [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
+usage: a2a-bridge submit [skill] --input <file> [--url <url>] [--context <id>] [--fork-from <id>]
+                         [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
                          [--heartbeat-secs <n> | --no-heartbeat]
 
 Send one unary message to a running a2a-bridge serve and print the response text.
@@ -7511,6 +7531,12 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --input <file>  message body to send (required)
   --url <url>     serve URL (default: http://127.0.0.1:8080)
   --context <id>  reuse an existing contextId (continues that warm session)
+  --fork-from <id>  branch the idle warm context <id> into a NEW context that starts with a copy
+                  of its history (sets a2a-bridge.fork_from). --context names the new context
+                  (it must be unused); without it the server allocates one and submit prints
+                  `context_id=<id>`. The source is untouched. Refused, with a stable reason, when
+                  the source is unknown, busy or expired, the target is in use, or the agent's
+                  adapter or backend cannot fork (see `a2a-bridge models`: `fork`)
   --agent <id>    route to a specific agent id
   --model <m>     override the agent model for this message
   --effort <e>    override the reasoning effort for this message
@@ -7521,6 +7547,16 @@ Send one unary message to a running a2a-bridge serve and print the response text
                   turn is watched: it dies with this client and has no default 2 h work cutoff
   --no-heartbeat  no heartbeat; the turn keeps the 2 h work cutoff (for scripts)
   --usage-config <path> | --usage-store <absolute-path>  select a local reporting ledger";
+
+/// The bridge-private request key that forks the named warm context into the request's new one.
+const FORK_FROM_KEY: &str = "a2a-bridge.fork_from";
+
+/// The new context a `submit --fork-from` turn ran in, which the server may have allocated.
+/// Without `--fork-from` the output is unchanged from a plain submit.
+fn forked_context_id<'a>(args: &[String], reply: &'a serde_json::Value) -> Option<&'a str> {
+    flag(args, "--fork-from")?;
+    reply["result"]["task"]["contextId"].as_str()
+}
 
 fn submit_failure_message(error: &serde_json::Value) -> &str {
     error
@@ -7579,6 +7615,9 @@ async fn submit_cmd_inner(
     if let Some(err) = v.get("error") {
         return Err(format!("submit failed: {}", submit_failure_message(err)).into());
     }
+    if let Some(context) = forked_context_id(args, &v) {
+        println!("context_id={context}");
+    }
     let out = v["result"]["artifact"]["text"]
         .as_str()
         .or_else(|| {
@@ -7614,6 +7653,7 @@ fn submit_message(
         "--input",
         "--url",
         "--context",
+        "--fork-from",
         "--agent",
         "--model",
         "--effort",
@@ -7631,6 +7671,7 @@ fn submit_message(
         md.insert("a2a-bridge.skill".into(), s.clone().into());
     }
     for (f, key) in [
+        ("--fork-from", FORK_FROM_KEY),
         ("--agent", "a2a-bridge.agent"),
         ("--model", "a2a-bridge.model"),
         ("--effort", "a2a-bridge.effort"),
@@ -11651,9 +11692,12 @@ async fn main() -> Result<(), BoxError> {
     //     it. The advertised list is account/adapter-driven and sandbox-independent, so this never spins
     //     a container.
     let probe_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let model_catalog = Arc::new(arc_swap::ArcSwap::from_pointee(
-        catalog_probe::probe_all_at_startup(&probe_entries, &probe_cwd).await,
-    ));
+    let worktrees_enabled = worktree_cfg.as_ref().is_some_and(|runtime| runtime.enabled);
+    let model_catalog = Arc::new(arc_swap::ArcSwap::from_pointee({
+        let mut catalog = catalog_probe::probe_all_at_startup(&probe_entries, &probe_cwd).await;
+        mask_fork_for_worktrees(&mut catalog, worktrees_enabled);
+        catalog
+    }));
 
     // Slice 0 warm sessions: share the live registry with the SessionManager and reap idle handles.
     // #10 slice 1: the SessionManager and the Coordinator (built below) share ONE clock.
@@ -11769,7 +11813,8 @@ async fn main() -> Result<(), BoxError> {
             };
             while hup.recv().await.is_some() {
                 tracing::info!("SIGHUP: re-probing model catalog");
-                let fresh = catalog_probe::probe_all(&sighup_entries, &sighup_cwd).await;
+                let mut fresh = catalog_probe::probe_all(&sighup_entries, &sighup_cwd).await;
+                mask_fork_for_worktrees(&mut fresh, worktrees_enabled);
                 sighup_catalog.store(Arc::new(fresh));
             }
         });
@@ -19542,6 +19587,71 @@ The command prints schemas, templates, and validates input.
         );
     }
 
+    #[test]
+    fn worktrees_mask_the_fork_capability_from_the_catalog() {
+        let caps = |fork| bridge_core::catalog::AgentCaps {
+            fork,
+            ..Default::default()
+        };
+        let mut catalog = bridge_core::catalog::ModelCatalog::from([
+            ("a".to_owned(), caps(true)),
+            ("b".to_owned(), caps(false)),
+        ]);
+        super::mask_fork_for_worktrees(&mut catalog, false);
+        assert!(catalog["a"].fork);
+        super::mask_fork_for_worktrees(&mut catalog, true);
+        assert!(catalog.values().all(|c| !c.fork));
+    }
+
+    /// `submit --fork-from` sets the bridge-private fork key, names the new context with
+    /// `--context`, and is documented in the help text; its value is never taken for the skill.
+    #[test]
+    fn submit_fork_from_sets_the_fork_key_and_is_documented() {
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let args: Vec<String> = [
+            "--input",
+            "brief.md",
+            "--fork-from",
+            "src",
+            "--context",
+            "child",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let message = super::submit_message(&args, &identity, "go".into(), false);
+        assert_eq!(message["metadata"]["a2a-bridge.fork_from"], "src");
+        assert_eq!(message["contextId"], "child");
+        assert!(
+            message["metadata"].get("a2a-bridge.skill").is_none(),
+            "{message:?}"
+        );
+
+        let plain: Vec<String> = ["--input", "brief.md"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let message = super::submit_message(&plain, &identity, "go".into(), false);
+        assert!(message["metadata"].get("a2a-bridge.fork_from").is_none());
+
+        assert!(super::SUBMIT_USAGE.contains("--fork-from <id>"));
+        assert!(super::SUBMIT_USAGE.contains("a2a-bridge.fork_from"));
+    }
+
+    /// Only a `--fork-from` submit prints the new context id; a plain submit's output is unchanged
+    /// even when the server's reply carries a context id.
+    #[test]
+    fn submit_prints_the_context_id_only_for_a_fork() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let reply = serde_json::json!({"result": {"task": {"id": "t", "contextId": "c"}}});
+        let fork = args(&["--input", "brief.md", "--fork-from", "src"]);
+        let plain = args(&["--input", "brief.md"]);
+        assert_eq!(super::forked_context_id(&fork, &reply), Some("c"));
+        assert_eq!(super::forked_context_id(&plain, &reply), None);
+        let no_context = serde_json::json!({"result": {"task": {"id": "t"}}});
+        assert_eq!(super::forked_context_id(&fork, &no_context), None);
+    }
+
     /// I3: `run-workflow` takes the heartbeat flags without its own parser refusing them.
     #[test]
     fn run_workflow_accepts_the_heartbeat_flags() {
@@ -20328,6 +20438,7 @@ The command prints schemas, templates, and validates input.
                 effort_levels: vec!["high".into()],
                 modes: vec!["code".into()],
                 current_mode: Some("code".into()),
+                fork: false,
             },
         );
         let entries = vec![("opencode".into(), acp_entry("opencode"))];

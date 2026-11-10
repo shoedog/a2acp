@@ -1,0 +1,46 @@
+#!/bin/sh
+# Offline ACP adapter for the session-fork tests; it speaks line-delimited JSON-RPC on stdio.
+#   $1  wire log: one line per effect, in arrival order (`new`, `fork`, `set_mode`, `set_model`, `prompt`, `cancel`)
+#   $2  `fork` advertises the session/fork capability
+# While `$1.block` exists a prompt is held, so a test can keep a turn in flight.
+wire="$1"
+caps='{}'
+[ "$2" = fork ] && caps='{"sessionCapabilities":{"fork":{}}}'
+mints=0
+forks=0
+models='"models":{"availableModels":[{"modelId":"good","name":"Good"},{"modelId":"other","name":"Other"}],"currentModelId":"good"}'
+modes='"modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"ask","name":"Ask"}]}'
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -E 's/^\{"jsonrpc":"2.0","id":([^,]+),"method".*/\1/')
+  sid=$(printf '%s\n' "$line" | sed -nE 's/.*"sessionId":"([^"]*)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":%s,"authMethods":[]},"id":%s}\n' "$caps" "$id" ;;
+    *'"method":"session/new"'*)
+      new="mint-$mints"; mints=$((mints + 1))
+      echo "new $new" >> "$wire"
+      printf '{"jsonrpc":"2.0","result":{"sessionId":"%s",%s,%s},"id":%s}\n' "$new" "$models" "$modes" "$id" ;;
+    *'"method":"session/fork"'*)
+      new="fork-$forks"; forks=$((forks + 1))
+      cwd=$(printf '%s\n' "$line" | sed -nE 's/.*"cwd":"([^"]*)".*/\1/p')
+      echo "fork $sid $new $cwd" >> "$wire"
+      printf '{"jsonrpc":"2.0","result":{"sessionId":"%s",%s,%s},"id":%s}\n' "$new" "$models" "$modes" "$id" ;;
+    *'"method":"session/set_mode"'*)
+      mode=$(printf '%s\n' "$line" | sed -nE 's/.*"modeId":"([^"]*)".*/\1/p')
+      echo "set_mode $sid $mode" >> "$wire"
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id" ;;
+    *'"method":"session/set_model"'*)
+      model=$(printf '%s\n' "$line" | sed -nE 's/.*"modelId":"([^"]*)".*/\1/p')
+      echo "set_model $sid $model" >> "$wire"
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id" ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id" ;;
+    *'"method":"session/cancel"'*)
+      echo "cancel $sid" >> "$wire" ;;
+    *'"method":"session/prompt"'*)
+      echo "prompt $sid" >> "$wire"
+      while [ -f "$wire.block" ]; do sleep 0.02; done
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer from %s"}}}}\n' "$sid" "$sid"
+      printf '{"jsonrpc":"2.0","result":{"stopReason":"end_turn","usage":{"totalTokens":15,"inputTokens":10,"outputTokens":5}},"id":%s}\n' "$id" ;;
+  esac
+done

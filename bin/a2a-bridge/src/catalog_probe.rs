@@ -541,7 +541,14 @@ async fn probe_acp_host_with(
     // Graceful teardown (SIGTERM→SIGKILL of the host child). If the outer timeout cancels this future
     // mid-await, dropping `backend` SIGKILLs the child (`kill_on_drop`) — so neither path leaks.
     let _ = backend.retire().await;
-    caps
+    // The probe backend is host-side, so it would advertise fork for a containerized agent whose
+    // serving backend refuses it; report what the served agent can actually do.
+    caps.map(|mut caps| {
+        if entry.sandbox.is_some() || matches!(entry.kind, AgentKind::ContainerRw) {
+            caps.fork = false;
+        }
+        caps
+    })
 }
 
 /// Probe the given entries concurrently, one bounded probe each.
