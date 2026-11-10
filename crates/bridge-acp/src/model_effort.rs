@@ -332,6 +332,7 @@ pub fn caps_from_config_options(opts: &[SessionConfigOption]) -> AgentCaps {
         effort_levels,
         modes,
         current_mode,
+        fork: false,
     }
 }
 

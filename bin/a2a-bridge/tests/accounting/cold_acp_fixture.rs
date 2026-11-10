@@ -18,6 +18,8 @@ pub struct ColdAcp {
     pub teardown: Mutex<Vec<String>>,
     pub parts: Mutex<Vec<serde_json::Value>>,
     pub gates: Mutex<Vec<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    /// `(source, forked)` agent session ids, one per `session/fork`.
+    pub forks: Mutex<Vec<(String, String)>>,
 }
 fn options(config: &EffectiveConfig) -> Vec<SessionConfigOption> {
     [("model", "model", config.model.as_deref().unwrap_or("model"), vec!["model", "good"]),
@@ -30,9 +32,19 @@ fn options(config: &EffectiveConfig) -> Vec<SessionConfigOption> {
 }
 impl ColdAcp {
     pub async fn connect() -> (Arc<Self>, Arc<AcpBackend>) {
+        Self::connect_with(false).await
+    }
+
+    /// Like [`Self::connect`], with an adapter that advertises and serves `session/fork`.
+    pub async fn connect_forkable() -> (Arc<Self>, Arc<AcpBackend>) {
+        Self::connect_with(true).await
+    }
+
+    async fn connect_with(fork: bool) -> (Arc<Self>, Arc<AcpBackend>) {
         let rec = Arc::new(Self::default());
         let (client, agent) = Channel::duplex();
-        let (new, config, mode, prompt, cancel, close) = (
+        let (new, forked, config, mode, prompt, cancel, close) = (
+            rec.clone(),
             rec.clone(),
             rec.clone(),
             rec.clone(),
@@ -42,8 +54,28 @@ impl ColdAcp {
         );
         tokio::spawn(async move {
             Agent.builder().name("cold-acp")
-                .on_receive_request(|_: InitializeRequest, r: Responder<InitializeResponse>, _| async move {
-                    r.respond(InitializeResponse::new(ProtocolVersion::V1))?; Ok(())
+                .on_receive_request(move |_: InitializeRequest, r: Responder<InitializeResponse>, _| async move {
+                    let mut caps = AgentCapabilities::new();
+                    if fork {
+                        caps = caps.session_capabilities(SessionCapabilities::new().fork(SessionForkCapabilities::new()));
+                    }
+                    r.respond(InitializeResponse::new(ProtocolVersion::V1).agent_capabilities(caps))?; Ok(())
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(move |req: ForkSessionRequest, r: Responder<ForkSessionResponse>, _| {
+                    let rec = forked.clone(); async move {
+                        let mut sessions = rec.sessions.lock().unwrap();
+                        let source = req.session_id.0.to_string();
+                        let Some(cfg) = sessions.get(&source).cloned() else {
+                            r.respond_with_internal_error("unknown source session")?; return Ok(());
+                        };
+                        let mut forks = rec.forks.lock().unwrap();
+                        let id = format!("fork-{}", forks.len());
+                        forks.push((source, id.clone()));
+                        let response: ForkSessionResponse = serde_json::from_value(json!({"sessionId":id,
+                            "configOptions":options(&cfg),"modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"ask","name":"Ask"}]}})).unwrap();
+                        sessions.insert(id, cfg);
+                        r.respond(response)?; Ok(())
+                    }
                 }, agent_client_protocol::on_receive_request!())
                 .on_receive_request(move |_: NewSessionRequest, r: Responder<NewSessionResponse>, _| {
                     let rec = new.clone(); async move {

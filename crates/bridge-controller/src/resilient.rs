@@ -430,6 +430,7 @@ mod tests {
             BridgeError::ResourceFlightUnsupported => "ResourceFlightUnsupported",
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
+            BridgeError::ForkRefused { .. } => "ForkRefused",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
             BridgeError::EmptyFinal => "EmptyFinal",
             BridgeError::HarvestAuditPersistFailed { .. } => "HarvestAuditPersistFailed",

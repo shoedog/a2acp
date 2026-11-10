@@ -41,7 +41,7 @@ use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
     SessionSpec, TaskMeta,
 };
-use bridge_core::error::{A2aDisposition, BridgeError};
+use bridge_core::error::{A2aDisposition, BridgeError, ForkRefusal};
 #[cfg(test)]
 use bridge_core::ids::OperationId;
 use bridge_core::ids::{AgentId, BatchId, ContextId, SessionId, TaskId};
@@ -419,6 +419,16 @@ impl InboundServer {
             (self.route.route(&task_meta)?, false)
         };
 
+        // A fork is a first turn of a NEW context on a single local agent. Workflows, fan-out and
+        // delegation have no session to fork; refused before anything else about the route, and before
+        // any state exists.
+        let fork_from = fork_from_params(params)?;
+        if fork_from.is_some() && !matches!(target, RouteTarget::Local(_)) {
+            return Err(BridgeError::ForkRefused {
+                reason: ForkRefusal::BackendUnsupported,
+            });
+        }
+
         if matches!(&target, RouteTarget::Workflow(_)) {
             let text = parts
                 .iter()
@@ -436,11 +446,26 @@ impl InboundServer {
                 field: "contextId is not supported for this route",
             });
         }
+        // The new context's id is the request's, else minted here and returned as usual.
+        let context_id = match (&fork_from, context_id) {
+            (Some(_), None) => Some(ContextId::parse(a2a::new_context_id())?),
+            (_, context_id) => context_id,
+        };
 
         // 3b. Parse + validate the per-request cwd (a2a-bridge.cwd).  Validation
         //     must happen BEFORE task/session ids are derived so a malformed request
         //     is rejected before any state is created.
-        let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())?;
+        let session_cwd = session_cwd_from_params(params, self.allowed_cwd_root.as_deref())
+            .map_err(|error| {
+                if fork_from.is_some() && cwd_escapes_root(params, self.allowed_cwd_root.as_deref())
+                {
+                    BridgeError::ForkRefused {
+                        reason: ForkRefusal::CwdOutsideRoot,
+                    }
+                } else {
+                    error
+                }
+            })?;
         // 3c. Per-request turn liveness (`a2a-bridge.{silence,work}_cutoff_secs`,
         //     `a2a-bridge.client_watching`): refused before any state is created when invalid.
         let liveness = RequestLivenessParams::from_a2a_metadata(
@@ -477,6 +502,8 @@ impl InboundServer {
             traceparent,
             prompt_id,
             context_id,
+            fork_from,
+            agent_explicit: task_meta.agent.is_some() || task_meta.skill.is_some(),
             session_cwd,
             liveness,
         })
@@ -523,6 +550,13 @@ struct RoutedCall {
     /// A2A contextId for warm continuation (Slice 0). Honored only on the Local route. None = legacy.
     #[allow(dead_code)]
     context_id: Option<ContextId>,
+    /// `a2a-bridge.fork_from`: the idle warm context whose agent session this request's NEW context
+    /// (`context_id`, always set with it) forks. Honored only on the Local route; never forwarded to
+    /// a peer (delegation sends no request metadata at all).
+    fork_from: Option<ContextId>,
+    /// Whether the request named its agent or skill. A fork that did not takes its source's agent
+    /// rather than the registry default.
+    agent_explicit: bool,
     /// Per-request working directory parsed from `a2a-bridge.cwd`.
     /// Distinct from `AgentOverride` so it reaches both single-agent and workflow
     /// dispatch (AgentOverride is dropped for workflows). `None` when absent.
@@ -613,6 +647,9 @@ async fn accounted_local_dispatch(
     receiver: Option<&tokio::sync::mpsc::Sender<Result<Event, BridgeError>>>,
     admitted: Option<&ServedAdmission>,
 ) -> Result<LocalDispatch, bridge_core::translator::AccountingFailureV1> {
+    // A fork that named no agent runs the source's, for dispatch and accounting alike.
+    let inherited = forked_agent(srv, agent, routed).await;
+    let agent = &inherited;
     if srv.coordinator().has_budget_policy() {
         return governed_local_dispatch(srv, agent, routed, diagnostic, owner, receiver)
             .await
@@ -647,18 +684,32 @@ async fn accounted_local_dispatch(
                     )
                     .await?
             }
-            None => {
-                srv.coordinator()
-                    .prepare_usage(
-                        owner,
-                        agent,
-                        routed.overrides.as_ref(),
-                        None,
-                        "direct",
-                        None,
-                    )
-                    .await?
-            }
+            None => match forked_selection(srv, routed).await {
+                // A fork runs the source's effective config under the request's overrides.
+                Some(config) => {
+                    srv.coordinator()
+                        .prepare_usage_selection(
+                            owner,
+                            agent.as_str().into(),
+                            Some(config),
+                            "direct",
+                            None,
+                        )
+                        .await?
+                }
+                None => {
+                    srv.coordinator()
+                        .prepare_usage(
+                            owner,
+                            agent,
+                            routed.overrides.as_ref(),
+                            None,
+                            "direct",
+                            None,
+                        )
+                        .await?
+                }
+            },
         }
     };
     let result = match warm_local_dispatch(srv, agent, routed, diagnostic.clone()).await {
@@ -681,6 +732,46 @@ async fn accounted_local_dispatch(
             .await?;
     dispatch.usage = usage;
     Ok(dispatch)
+}
+
+/// The agent a local turn runs on. A fork that named neither an agent nor a skill takes its
+/// source's agent, not the registry default; an explicit agent is kept, and a conflicting one is
+/// then refused by the fork as it is for any warm context. Every other turn keeps `agent`.
+async fn forked_agent(srv: &Arc<InboundServer>, agent: &AgentId, routed: &RoutedCall) -> AgentId {
+    if routed.agent_explicit {
+        return agent.clone();
+    }
+    match &routed.fork_from {
+        Some(source) => srv
+            .session_manager()
+            .accounting_selection(source)
+            .await
+            .map_or_else(|| agent.clone(), |(source_agent, _)| source_agent),
+        None => agent.clone(),
+    }
+}
+
+/// The effective config a forked turn will run with: the source context's recorded config with the
+/// request's per-message overrides on top. `None` for a request that is not a fork, or whose source
+/// is gone (the fork itself then refuses).
+async fn forked_selection(
+    srv: &Arc<InboundServer>,
+    routed: &RoutedCall,
+) -> Option<bridge_core::domain::EffectiveConfig> {
+    let source = routed.fork_from.as_ref()?;
+    let (_, mut config) = srv.session_manager().accounting_selection(source).await?;
+    if let Some(ov) = &routed.overrides {
+        if ov.model.is_some() {
+            config.model = ov.model.clone();
+        }
+        if ov.effort.is_some() {
+            config.effort = ov.effort;
+        }
+        if ov.mode.is_some() {
+            config.mode = ov.mode.clone();
+        }
+    }
+    Some(config)
 }
 
 /// Exact cold-route ownership. The binding's lease identifies its instance across eviction;
@@ -849,16 +940,31 @@ async fn governed_local_dispatch(
     use bridge_core::translator::AccountingFailureV1;
     let closed = || receiver.is_some_and(|tx| tx.is_closed());
     if let Some(ctx) = &routed.context_id {
-        let claim = srv
-            .session_manager()
-            .claim_turn_observed(
-                ctx,
-                agent.clone(),
-                routed.overrides.clone(),
-                routed.session_cwd.clone(),
-                diagnostic.clone(),
-            )
-            .await?;
+        let claim = match &routed.fork_from {
+            Some(source) => {
+                srv.session_manager()
+                    .claim_fork_turn_observed(
+                        source,
+                        ctx,
+                        agent.clone(),
+                        routed.overrides.clone(),
+                        routed.session_cwd.clone(),
+                        diagnostic.clone(),
+                    )
+                    .await?
+            }
+            None => {
+                srv.session_manager()
+                    .claim_turn_observed(
+                        ctx,
+                        agent.clone(),
+                        routed.overrides.clone(),
+                        routed.session_cwd.clone(),
+                        diagnostic.clone(),
+                    )
+                    .await?
+            }
+        };
         let (claim, usage) = srv.coordinator().prepare_direct_claim(claim, owner).await?;
         if closed() {
             claim.rollback().await?;
@@ -1417,16 +1523,29 @@ where
             completion = Some(guard);
             Ok(turn)
         }
-        None => {
-            sm.checkout_turn_observed(
-                &ctx,
-                agent_id.clone(),
-                routed.overrides.clone(),
-                routed.session_cwd.clone(),
-                observer,
-            )
-            .await
-        }
+        None => match &routed.fork_from {
+            Some(source) => {
+                sm.checkout_fork_turn_observed(
+                    source,
+                    &ctx,
+                    agent_id.clone(),
+                    routed.overrides.clone(),
+                    routed.session_cwd.clone(),
+                    observer,
+                )
+                .await
+            }
+            None => {
+                sm.checkout_turn_observed(
+                    &ctx,
+                    agent_id.clone(),
+                    routed.overrides.clone(),
+                    routed.session_cwd.clone(),
+                    observer,
+                )
+                .await
+            }
+        },
     };
     match turn {
         Ok(turn) => {
@@ -4649,9 +4768,13 @@ fn sse_event_stream(
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "workflow stream error");
+                    let mut frame = json!({ "kind": "error", "text": error.client_message() });
+                    if let Some(reason) = refusal_reason(&error) {
+                        frame["reason"] = json!(reason);
+                    }
                     yield Ok(SseEvent::default()
                         .event("error")
-                        .json_data(json!({ "kind": "error", "text": error.client_message() }))
+                        .json_data(frame)
                         .expect("serde_json::Value serializes"));
                 }
             }
@@ -5963,7 +6086,7 @@ async fn run_admitted_message(
         })
         .await;
     let metadata = attempt_identity_metadata(&supplied_identity, None);
-    let result = json!({
+    let mut result = json!({
         "task": {
             "id": routed.task.as_str(),
             "state": state,
@@ -5972,6 +6095,10 @@ async fn run_admitted_message(
         "artifact": { "text": artifact_text },
         "status": status_chunks,
     });
+    // A forked turn names the context it started, which the caller may not have chosen.
+    if let (Some(_), Some(ctx)) = (&routed.fork_from, &routed.context_id) {
+        result["task"]["contextId"] = json!(ctx.as_str());
+    }
     jsonrpc_ok(id, result)
 }
 
@@ -7410,6 +7537,15 @@ fn jsonrpc_err_data(id: Value, code: i32, message: &str, data: Value) -> Respons
     .into_response()
 }
 
+/// The stable machine-readable reason a refusal carries on the wire, for the unary JSON-RPC error
+/// (`error.data.reason`) and the streaming error frame (`reason`) alike. Only refused forks have one.
+fn refusal_reason(error: &BridgeError) -> Option<&'static str> {
+    match error {
+        BridgeError::ForkRefused { reason } => Some(reason.code()),
+        _ => None,
+    }
+}
+
 /// Map a `BridgeError` to a JSON-RPC error using its disposition: request-level
 /// rejections become INVALID_REQUEST; everything else (failed/suspended state)
 /// becomes INTERNAL with the error's display message.
@@ -7417,6 +7553,15 @@ fn bridge_err_to_jsonrpc(id: Value, e: &BridgeError) -> Response {
     match e.disposition() {
         // Client-caused: `client_message()` is the (safe, helpful) Display.
         A2aDisposition::RejectRequest => {
+            // A refused fork carries its stable reason where a client can branch on it.
+            if let Some(reason) = refusal_reason(e) {
+                return jsonrpc_err_data(
+                    id,
+                    JSONRPC_INVALID_REQUEST,
+                    &e.client_message(),
+                    json!({ "reason": reason }),
+                );
+            }
             jsonrpc_err(id, JSONRPC_INVALID_REQUEST, &e.client_message())
         }
         // Internal failure: the full reason (may carry infra detail) goes to logs;
@@ -7482,6 +7627,41 @@ fn context_id_from_params(params: &Value) -> Result<Option<ContextId>, BridgeErr
         Some(s) => Ok(Some(ContextId::parse(s)?)),
         None => Ok(None),
     }
+}
+
+/// `a2a-bridge.fork_from` from `message.metadata`: the context whose agent session the request's new
+/// context forks. Absent → `None`; present but not a valid context id → `InvalidRequest`.
+fn fork_from_params(params: &Value) -> Result<Option<ContextId>, BridgeError> {
+    let Some(raw) = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.fork_from"))
+    else {
+        return Ok(None);
+    };
+    raw.as_str()
+        .ok_or(BridgeError::InvalidRequest {
+            field: "a2a-bridge.fork_from",
+        })
+        .and_then(|s| {
+            ContextId::parse(s).map_err(|_| BridgeError::InvalidRequest {
+                field: "a2a-bridge.fork_from",
+            })
+        })
+        .map(Some)
+}
+
+/// Whether the request's `a2a-bridge.cwd` is a well-formed path that lies outside `allowed_root`
+/// (as opposed to being malformed): the one cwd failure a fork reports with its own reason.
+fn cwd_escapes_root(params: &Value, allowed_root: Option<&str>) -> bool {
+    let cwd = params
+        .get("message")
+        .and_then(|m| m.get("metadata"))
+        .and_then(|md| md.get("a2a-bridge.cwd"))
+        .and_then(Value::as_str)
+        .and_then(|s| SessionCwd::parse(s).ok());
+    let root = allowed_root.and_then(|root| SessionCwd::parse(root).ok());
+    matches!((cwd, root), (Some(cwd), Some(root)) if !cwd.is_under(&root))
 }
 
 /// Parse an effort-level string into the `Effort` enum, returning
@@ -12568,6 +12748,117 @@ mod tests {
         assert!(body.contains("DONE"), "delegate must complete: {body}");
     }
 
+    /// A delegation port that records every call; none is expected.
+    #[derive(Default)]
+    struct CountingDelegation(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl DelegationPort for CountingDelegation {
+        async fn delegate(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BridgeError::UpstreamA2aError)
+        }
+        async fn cancel(&self, _peer: &PeerTaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    /// `a2a-bridge.fork_from` names a local session. A route that would hand the message to a peer
+    /// (delegate, fan-out) or to a workflow is refused with a stable reason before anything is
+    /// dispatched, so the key can never be forwarded (delegation sends no request metadata at all).
+    #[tokio::test]
+    async fn fork_from_on_a_peer_route_is_refused_and_never_reaches_the_peer() {
+        // (Fan-out and workflow routes take the same gate; this harness routes only `delegate`.)
+        for skill in ["delegate"] {
+            for method in [methods::SEND_MESSAGE, methods::SEND_STREAMING_MESSAGE] {
+                let delegation = Arc::new(CountingDelegation::default());
+                let srv = build_delegate(
+                    Arc::new(PanicBackend),
+                    Arc::new(FakeStore::default()),
+                    delegation.clone(),
+                );
+                let resp = router(srv)
+                    .oneshot(post_request(
+                        method,
+                        json!({ "message": {
+                            "text": "go",
+                            "contextId": "child",
+                            "metadata": {
+                                "a2a-bridge.skill": skill,
+                                "a2a-bridge.fork_from": "source",
+                            }
+                        }}),
+                        "1.0",
+                    ))
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+                assert_eq!(
+                    body["error"]["data"]["reason"], "fork_backend_unsupported",
+                    "{skill} {method}: {body}"
+                );
+                assert_eq!(
+                    delegation.0.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{skill} {method}: the refusal precedes any delegation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fork_from_must_be_a_valid_context_id() {
+        let params =
+            |value: Value| json!({"message": {"metadata": {"a2a-bridge.fork_from": value}}});
+        assert_eq!(fork_from_params(&json!({"message": {}})).unwrap(), None);
+        assert_eq!(
+            fork_from_params(&params(json!("src"))).unwrap(),
+            Some(ContextId::parse("src").unwrap())
+        );
+        for bad in [json!(7), json!(""), json!(null)] {
+            assert!(
+                matches!(
+                    fork_from_params(&params(bad.clone())),
+                    Err(BridgeError::InvalidRequest {
+                        field: "a2a-bridge.fork_from"
+                    })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_fork_carries_its_reason_on_the_wire() {
+        use axum::body::to_bytes;
+        let response = bridge_err_to_jsonrpc(
+            json!(1),
+            &BridgeError::ForkRefused {
+                reason: ForkRefusal::SourceBusy,
+            },
+        );
+        let bytes =
+            futures::executor::block_on(to_bytes(response.into_body(), usize::MAX)).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], JSONRPC_INVALID_REQUEST);
+        assert_eq!(body["error"]["data"]["reason"], "fork_source_busy");
+        assert_eq!(body["error"]["message"], "fork refused: fork_source_busy");
+    }
+
+    #[test]
+    fn a_cwd_outside_the_root_is_distinct_from_a_malformed_one() {
+        let params = |cwd: &str| json!({"message": {"metadata": {"a2a-bridge.cwd": cwd}}});
+        assert!(cwd_escapes_root(&params("/etc"), Some("/work")));
+        assert!(!cwd_escapes_root(&params("/work/repo"), Some("/work")));
+        assert!(!cwd_escapes_root(&params("relative"), Some("/work")));
+        assert!(!cwd_escapes_root(&params("/etc"), None));
+    }
+
     #[tokio::test]
     async fn inbound_cancel_task_cancels_peer() {
         // S2b: after a delegate stream persists local->peer, CancelTask cancels the peer.
@@ -15477,6 +15768,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(context.clone()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -15520,6 +15813,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(context.clone()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -15634,6 +15929,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(ContextId::parse("ready-usage-disconnect").unwrap()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -15786,6 +16083,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-pre-cancel").unwrap()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -15859,6 +16158,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-disconnect").unwrap()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -15961,6 +16262,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(ContextId::parse("streaming-no-usage-disconnect").unwrap()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };
@@ -16091,6 +16394,8 @@ mod tests {
             traceparent: None,
             prompt_id: None,
             context_id: Some(ContextId::parse("send-err").unwrap()),
+            fork_from: None,
+            agent_explicit: false,
             session_cwd: None,
             liveness: Default::default(),
         };

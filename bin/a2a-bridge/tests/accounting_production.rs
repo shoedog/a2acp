@@ -3,6 +3,8 @@ mod common;
 mod direct;
 #[path = "accounting/direct_governance.rs"]
 mod direct_governance;
+#[path = "accounting/fork.rs"]
+mod fork;
 #[path = "accounting/path_closure.rs"]
 mod path_closure;
 #[path = "accounting/support.rs"]

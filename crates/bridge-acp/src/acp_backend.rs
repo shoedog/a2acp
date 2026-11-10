@@ -17,7 +17,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, EnvVariable, InitializeRequest, InitializeResponse,
+    CreateTerminalResponse, EnvVariable, ForkSessionRequest, InitializeRequest, InitializeResponse,
     KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio, NewSessionRequest,
     PermissionOption, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus, PromptRequest,
     PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
@@ -64,7 +64,7 @@ use bridge_core::domain::{
     EffectiveConfig, Effort, PermissionDecision, PermissionRequest, PermitDecision, SessionContext,
     SessionSpec,
 };
-use bridge_core::error::BridgeError;
+use bridge_core::error::{BridgeError, ForkRefusal};
 use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV1, Sha256HexV1};
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::mcp::McpServerSpec;
@@ -149,6 +149,7 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(50
 const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 const SESSION_NEW_METHOD: &str = "session/new";
+const SESSION_FORK_METHOD: &str = "session/fork";
 const SESSION_SET_MODEL_METHOD: &str = "session/set_model";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,6 +337,38 @@ impl JsonRpcRequest for ModelAwareNewSessionRequest {
     type Response = ModelAwareNewSessionResponse;
 }
 
+/// `session/fork`, answered with the same model-aware shape as `session/new`: the adapters return
+/// the forked session's `models` alongside the stable `modes`/`configOptions`, and the mint's
+/// configuration steps read all three.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct ModelAwareForkSessionRequest(ForkSessionRequest);
+
+impl JsonRpcMessage for ModelAwareForkSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_FORK_METHOD
+    }
+
+    fn method(&self) -> &str {
+        SESSION_FORK_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(SESSION_FORK_METHOD, &self.0)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != SESSION_FORK_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params).map(Self)
+    }
+}
+
+impl JsonRpcRequest for ModelAwareForkSessionRequest {
+    type Response = ModelAwareNewSessionResponse;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct ModelAwareNewSessionResponse {
@@ -381,7 +414,7 @@ impl JsonRpcResponse for ModelAwareNewSessionResponse {
     }
 
     fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
-        if method != SESSION_NEW_METHOD {
+        if method != SESSION_NEW_METHOD && method != SESSION_FORK_METHOD {
             return Err(AcpError::method_not_found());
         }
         agent_client_protocol::util::json_cast(&value)
@@ -2565,6 +2598,10 @@ struct AgentSession {
     /// field) so `prompt` can take an OWNED guard (`lock_owned`) and move it into
     /// the driver task that holds it for the whole streamed turn.
     turn_lock: Arc<Mutex<()>>,
+    /// Serializes the `session/fork` requests that fork THIS session, so concurrent forks of one
+    /// settled source queue behind each other instead of seeing each other's hold on `turn_lock` as
+    /// an in-flight turn. Not held by turns: it never delays the source or any fork's own turns.
+    fork_serial: Arc<Mutex<()>>,
     /// Operation-scoped accepted-work evidence for the turn that owns
     /// `turn_lock`. Routing ends as soon as the SDK result is terminal, but
     /// completion observation can still be in flight; this slot deliberately
@@ -2622,6 +2659,7 @@ impl AgentSession {
             minted_cwd: OnceCell::new(),
             active_mint_cwd: StdMutex::new(None),
             turn_lock: Arc::new(Mutex::new(())),
+            fork_serial: Arc::new(Mutex::new(())),
             turn_accepted: Arc::new(StdMutex::new(None)),
             config_surface: StdMutex::new(None),
             cancel_requested: AtomicBool::new(false),
@@ -2709,6 +2747,17 @@ impl AgentSession {
             self.agent_id.get().cloned(),
         )
     }
+}
+
+/// What a mint needs to create its agent session by `session/fork` instead of `session/new`: the
+/// agent session being forked, and that session's turn lock, held until the adapter has answered so
+/// no turn can start on the source while its history is being copied. `serial` keeps a sibling fork
+/// of the same source from running its own `session/fork` meanwhile (see
+/// [`AgentSession::fork_serial`]).
+struct ForkMint {
+    source_id: AgentSessionId,
+    source_turn: OwnedMutexGuard<()>,
+    serial: OwnedMutexGuard<()>,
 }
 
 struct ActiveMintCwdGuard(Arc<AgentSession>);
@@ -3852,12 +3901,8 @@ impl AcpBackend {
         Self::new_session_request_from_rendered(cwd, &rendered)
     }
 
-    fn new_session_request_from_rendered(
-        cwd: impl Into<PathBuf>,
-        mcp: &[McpServerSpec],
-    ) -> NewSessionRequest {
-        let servers: Vec<McpServer> = mcp
-            .iter()
+    fn mcp_servers_from_rendered(mcp: &[McpServerSpec]) -> Vec<McpServer> {
+        mcp.iter()
             .cloned()
             .map(|server| {
                 McpServer::Stdio(
@@ -3874,8 +3919,41 @@ impl AcpBackend {
                         ),
                 )
             })
-            .collect();
-        NewSessionRequest::new(cwd).mcp_servers(servers)
+            .collect()
+    }
+
+    fn new_session_request_from_rendered(
+        cwd: impl Into<PathBuf>,
+        mcp: &[McpServerSpec],
+    ) -> NewSessionRequest {
+        NewSessionRequest::new(cwd).mcp_servers(Self::mcp_servers_from_rendered(mcp))
+    }
+
+    /// The `session/fork` request for forking agent session `source` into a session whose cwd and
+    /// MCP servers are the ones a first mint of the target would have offered: unbound specs are
+    /// rendered for the target cwd exactly as `session/new` renders them (so `{cwd}` is substituted
+    /// and the loopback depth marker is delivered); already-bound specs are sent as they are.
+    fn fork_session_request(
+        source: AgentSessionId,
+        cwd: impl Into<PathBuf>,
+        mcp: &[McpServerSpec],
+        mcp_is_bound: bool,
+    ) -> ModelAwareForkSessionRequest {
+        let cwd = cwd.into();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let rendered: Vec<McpServerSpec>;
+        let mcp = if mcp_is_bound {
+            mcp
+        } else {
+            rendered = mcp
+                .iter()
+                .map(|spec| spec.substituted_for_managed_agent(&cwd_str))
+                .collect();
+            &rendered
+        };
+        ModelAwareForkSessionRequest(
+            ForkSessionRequest::new(source, cwd).mcp_servers(Self::mcp_servers_from_rendered(mcp)),
+        )
     }
 
     fn model_aware_new_session_request(
@@ -5989,6 +6067,29 @@ impl AcpBackend {
         observer: Arc<dyn DiagnosticObserver>,
         snapshot: SessionConfigSnapshot,
     ) -> Result<AgentSessionId, BridgeError> {
+        self.mint_session_observed(key, entry, observer, snapshot, None)
+            .await
+    }
+
+    /// The mint behind [`Self::ensure_session_observed_with_snapshot`]. With `fork` the agent
+    /// session is created by `session/fork` of the source session instead of `session/new`; every
+    /// other step (mode/model/effort configuration, rename, publication, cancel-latch drain) is the
+    /// same, so a forked session is configured and published exactly like a freshly minted one. A
+    /// fork is only ever a first mint: a target that already has an agent session is refused.
+    async fn mint_session_observed(
+        &self,
+        key: &SessionId,
+        entry: &Arc<AgentSession>,
+        observer: Arc<dyn DiagnosticObserver>,
+        snapshot: SessionConfigSnapshot,
+        fork: Option<ForkMint>,
+    ) -> Result<AgentSessionId, BridgeError> {
+        let target_in_use = BridgeError::ForkRefused {
+            reason: ForkRefusal::TargetInUse,
+        };
+        if fork.is_some() && entry.agent_id.get().is_some() {
+            return Err(target_in_use);
+        }
         let stderr = self
             .stderr_ring
             .as_ref()
@@ -6048,6 +6149,9 @@ impl AcpBackend {
                 // started now could only be closed in turn.
                 return Err(BridgeError::InvalidStateTransition);
             }
+            if fork.is_some() && entry.agent_id.get().is_some() {
+                return Err(target_in_use);
+            }
             if let Some(id) = entry.agent_id.get() {
                 drop(init_guard);
                 (id.clone(), false)
@@ -6088,7 +6192,8 @@ impl AcpBackend {
                     let _active_mint_cwd = active_mint_cwd;
                     let mut process_evidence = MintProcessEvidenceGuard::new(stderr_ring_for_init);
                     let outcome = async {
-                        // (1) session/new — mint the agent session id.
+                        // (1) session/new — mint the agent session id (or session/fork, which
+                        // returns the same shape).
                         lifecycle
                             .record(
                                 DiagnosticPhase::SessionCreate,
@@ -6098,24 +6203,43 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        let req = if mcp_is_bound {
-                            Self::model_aware_new_session_request_from_rendered(
-                                PathBuf::from(&cwd_for_mint),
-                                &mcp_for_mint,
-                            )
-                        } else {
-                            Self::model_aware_new_session_request(
-                                PathBuf::from(&cwd_for_mint),
-                                &mcp_for_mint,
-                            )
-                        };
                         // From request installation until durable minted-cwd
                         // publication, the process may have consumed a
                         // cwd-expanded credential that a later bounded policy
                         // cannot safely enumerate. Any error/abort in this
                         // interval makes process stderr metadata-only.
                         process_evidence.arm();
-                        let resp = match cx.send_request(req).block_task().await {
+                        let sent = match fork {
+                            Some(fork) => {
+                                let req = Self::fork_session_request(
+                                    fork.source_id,
+                                    PathBuf::from(&cwd_for_mint),
+                                    &mcp_for_mint,
+                                    mcp_is_bound,
+                                );
+                                let sent = cx.send_request(req).block_task().await;
+                                // The source's history is copied once the adapter answers; its
+                                // next turn, or a sibling fork, may start from here.
+                                drop(fork.source_turn);
+                                drop(fork.serial);
+                                sent
+                            }
+                            None => {
+                                let req = if mcp_is_bound {
+                                    Self::model_aware_new_session_request_from_rendered(
+                                        PathBuf::from(&cwd_for_mint),
+                                        &mcp_for_mint,
+                                    )
+                                } else {
+                                    Self::model_aware_new_session_request(
+                                        PathBuf::from(&cwd_for_mint),
+                                        &mcp_for_mint,
+                                    )
+                                };
+                                cx.send_request(req).block_task().await
+                            }
+                        };
+                        let resp = match sent {
                             Ok(resp) => resp,
                             Err(error) => {
                                 AcpTraceEvent::SessionCreateFailed.emit();
@@ -6752,6 +6876,7 @@ impl AcpBackend {
         };
         Self::merge_session_models(&mut caps, resp.models);
         Self::merge_session_modes(&mut caps, resp.modes);
+        caps.fork = self.fork_support().is_ok();
         Ok(caps)
     }
 
@@ -8897,6 +9022,77 @@ impl AgentBackend for AcpBackend {
                 Ok(ReconcileOutcome::Rejected)
             }
         }
+    }
+
+    fn fork_support(&self) -> Result<(), ForkRefusal> {
+        // A containerized reader's sessions are not forkable for now: the fork would have to be
+        // proven against the container's mounted cwd and credentials, not just the host path.
+        if self.container_reap.is_some()
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|config| config.container.is_some())
+        {
+            return Err(ForkRefusal::BackendUnsupported);
+        }
+        match self.agent_capabilities() {
+            Some(c) if c.session_capabilities.fork.is_some() => Ok(()),
+            _ => Err(ForkRefusal::AdapterUnsupported),
+        }
+    }
+
+    /// Fork `source` into `target` with one `session/fork` of the source's agent session. Every
+    /// refusal returns before the request is sent and leaves the source untouched.
+    async fn fork_session(
+        &self,
+        source: &SessionId,
+        target: &SessionId,
+    ) -> Result<(), BridgeError> {
+        let refuse = |reason| BridgeError::ForkRefused { reason };
+        self.fork_support().map_err(refuse)?;
+        let source_entry = self
+            .sessions
+            .lock()
+            .await
+            .get(source)
+            .cloned()
+            // The backend only knows sessions that have taken a turn since they were configured: the
+            // session manager owns "unknown context", so a source it handed over that the backend has
+            // no entry for has simply not started (a context just compacted or reset, for one).
+            .ok_or(refuse(ForkRefusal::SourceNotStarted))?;
+        if source_entry.is_released() {
+            return Err(refuse(ForkRefusal::SourceExpired));
+        }
+        let source_id = source_entry
+            .agent_id
+            .get()
+            .cloned()
+            .ok_or(refuse(ForkRefusal::SourceNotStarted))?;
+        // Sibling forks of one source go one `session/fork` at a time; their turns then run freely.
+        let serial = Arc::clone(&source_entry.fork_serial).lock_owned().await;
+        if source_entry.is_released() {
+            return Err(refuse(ForkRefusal::SourceExpired));
+        }
+        // Only a settled source forks. The lock is then held until the adapter has answered, so a
+        // turn that starts meanwhile queues behind the copy instead of changing what is copied.
+        let source_turn = Arc::clone(&source_entry.turn_lock)
+            .try_lock_owned()
+            .map_err(|_| refuse(ForkRefusal::SourceBusy))?;
+        let target_entry = self.session_entry(target).await?;
+        let snapshot = self.session_config_snapshot(target)?;
+        self.mint_session_observed(
+            target,
+            &target_entry,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            snapshot,
+            Some(ForkMint {
+                source_id,
+                source_turn,
+                serial,
+            }),
+        )
+        .await
+        .map(|_| ())
     }
 
     fn capabilities(&self) -> AgentSessionCaps {
@@ -24161,6 +24357,7 @@ mod tests {
             minted_cwd,
             active_mint_cwd,
             turn_lock,
+            fork_serial,
             turn_accepted,
             config_surface,
             cancel_requested,
@@ -24173,6 +24370,7 @@ mod tests {
                 .expect("no turn may hold the session"),
         );
         assert!(init_lock.try_lock().is_ok(), "no mint may be in flight");
+        assert!(fork_serial.try_lock().is_ok(), "no fork may be in flight");
         assert_eq!(published.get().map(|id| id.0.as_ref()), Some(agent_id));
         assert!(minted_cwd.get().is_some());
         assert!(config_surface.lock().unwrap().is_some());
@@ -24663,5 +24861,48 @@ mod tests {
             .await
             .err()
             .expect("no turn starts on a fenced connection");
+    }
+
+    /// A fork renders unbound MCP specs exactly as `session/new` does, and sends already-bound
+    /// (rendered) specs untouched, so a bound delivery is neither re-templated nor re-stamped.
+    #[test]
+    fn fork_request_renders_unbound_mcp_and_respects_bound_input() {
+        use bridge_core::mcp::McpEnvValueSourceV1;
+        let spec = McpServerSpec {
+            name: "nav".into(),
+            command: "/opt/nav".into(),
+            args: vec!["{cwd}".into()],
+            env: vec![(
+                "K".into(),
+                McpEnvValueSourceV1::PublicLiteral("{cwd}".into()),
+            )],
+        };
+        let wire = |bound: bool, spec: &McpServerSpec| {
+            let request = AcpBackend::fork_session_request(
+                AgentSessionId::from("src"),
+                "/w",
+                std::slice::from_ref(spec),
+                bound,
+            );
+            serde_json::to_value(&request.0).unwrap()
+        };
+        let unbound = wire(false, &spec);
+        assert_eq!(unbound["sessionId"], "src");
+        assert_eq!(unbound["mcpServers"][0]["args"][0], "/w");
+        let names: Vec<_> = unbound["mcpServers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["K", "A2A_BRIDGE_MCP_CALL_DEPTH"]);
+        // Bound specs were rendered (and stamped) at binding time: sent exactly as given.
+        let rendered = spec.substituted_for_managed_agent("/w");
+        let bound = wire(true, &rendered);
+        assert_eq!(bound["mcpServers"][0]["args"][0], "/w");
+        let bound_names = bound["mcpServers"][0]["env"].as_array().unwrap().len();
+        assert_eq!(bound_names, 2, "no second depth marker: {bound}");
+        let literal = wire(true, &spec);
+        assert_eq!(literal["mcpServers"][0]["args"][0], "{cwd}");
     }
 }
