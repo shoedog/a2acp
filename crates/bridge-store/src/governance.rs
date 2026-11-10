@@ -479,7 +479,8 @@ mod tests {
             vec![],
         )
         .unwrap();
-        conn.commit_hook(Some(|| true)); // SQLite rejects the actual COMMIT, after all writes succeed.
+        conn.commit_hook(Some(|| true)) // SQLite rejects the actual COMMIT, after all writes succeed.
+            .unwrap();
         assert!(matches!(
             admit(
                 &mut conn,
@@ -496,7 +497,7 @@ mod tests {
         let rows: Vec<UsageAttemptV1> =
             records(&conn, "SELECT record_json FROM usage_attempts_v1", []).unwrap();
         assert!(!rows[0].dispatched);
-        conn.commit_hook(None::<fn() -> bool>);
+        conn.commit_hook(None::<fn() -> bool>).unwrap();
         assert!(matches!(
             admit(
                 &mut conn,
