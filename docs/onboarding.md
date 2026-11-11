@@ -383,7 +383,7 @@ a2a-bridge submit --input claim-2.md --fork-from packet                    # the
 - `[worktrees]` agents and containerized agents do not fork; their catalog entries carry no `fork` key.
 - **Discover support first.** `a2a-bridge models --json` (and the Agent Card's `agent-models` extension) carries
   `"fork": true` for a host agent whose adapter advertised `session/fork`; the key is absent otherwise.
-  claude-agent-acp 0.97.0 and codex-acp 2.3.0 advertise it.
+  claude-agent-acp 0.106.0, codex-acp 2.6.0 and OpenCode 1.19.5 advertise it.
 - The key names a local session, so it is never forwarded: delegation sends no request metadata to a peer, and a
   request that would route to a peer is refused (`fork_backend_unsupported`) before anything is sent.
 - Not covered: forking from the MCP surface (a follow-up), forking inside a workflow node, and lineage across a

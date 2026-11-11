@@ -13,34 +13,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # claude-agent-acp pulls @anthropic-ai/claude-agent-sdk, whose optional dep is the platform `claude`
 # binary — the LINUX build resolves here, not the host's macOS one.
 RUN npm install -g \
-      @agentclientprotocol/claude-agent-acp@0.97.0 \
-      @agentclientprotocol/codex-acp@2.3.0 \
-      opencode-ai@1.18.27 \
+      @agentclientprotocol/claude-agent-acp@0.106.0 \
+      @agentclientprotocol/codex-acp@2.6.0 \
+      opencode-ai@1.19.5 \
     && npm install \
       --prefix /usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp \
       --omit=dev --no-save --package-lock=false \
-      @anthropic-ai/claude-agent-sdk@0.3.310 \
+      @anthropic-ai/claude-agent-sdk@0.3.322 \
     && npm install \
       --prefix /usr/local/lib/node_modules/@agentclientprotocol/codex-acp \
       --omit=dev --no-save --package-lock=false \
-      @openai/codex@0.164.0
+      @openai/codex@0.167.1
 
 # R3b: a pinned compatibility canary must bind the package identities inside the immutable image,
 # not guess from the host. Fail the build if npm resolved different transitive agent packages, then
 # publish only these non-secret exact identities as image metadata for bounded `image inspect`.
-RUN test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "2.3.0" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")" = "0.164.0" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")" = "0.97.0" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")" = "0.3.310" \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.310" \
-    && test "$(opencode --version)" = "1.18.27"
+RUN test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "2.6.0" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")" = "0.167.1" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")" = "0.106.0" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")" = "0.3.322" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').claudeCodeVersion")" = "2.1.322" \
+    && test "$(opencode --version)" = "1.19.5"
 
-LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.3.0" \
-      io.a2a-bridge.provenance.codex.agent-cli="@openai/codex=0.164.0" \
-      io.a2a-bridge.provenance.claude.adapter="@agentclientprotocol/claude-agent-acp=0.97.0" \
-      io.a2a-bridge.provenance.claude.agent-cli="@anthropic-ai/claude-agent-sdk=0.3.310" \
-      io.a2a-bridge.provenance.opencode.agent-cli="opencode-ai=1.18.27" \
-      io.a2a-bridge.provenance.kiro.agent-cli="kiro-cli=2.24.1"
+LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.6.0" \
+      io.a2a-bridge.provenance.codex.agent-cli="@openai/codex=0.167.1" \
+      io.a2a-bridge.provenance.claude.adapter="@agentclientprotocol/claude-agent-acp=0.106.0" \
+      io.a2a-bridge.provenance.claude.agent-cli="@anthropic-ai/claude-agent-sdk=0.3.322" \
+      io.a2a-bridge.provenance.opencode.agent-cli="opencode-ai=1.19.5" \
+      io.a2a-bridge.provenance.kiro.agent-cli="kiro-cli=3.2.0"
 
 # kiro-cli: install the LINUX build (the host's macOS binary can't run in this Linux image). Official
 # zip method (https://kiro.dev/docs/cli/installation/#with-a-zip-file); arch-aware so it works whether
@@ -50,9 +50,9 @@ LABEL io.a2a-bridge.provenance.codex.adapter="@agentclientprotocol/codex-acp=2.3
 # statically linked (no glibc dep) and runs on the bookworm base. install.sh drops the binary under
 # ~/.local/bin (root -> /root/.local/bin). The version and per-architecture digests come from Kiro's
 # official stable manifest; do not replace the versioned URL with the mutable `latest` channel.
-ARG KIRO_CLI_VERSION=2.24.1
-ARG KIRO_CLI_AMD64_SHA256=0187d8f613b4ad6b63f7fe069a187c33c79664ee9874ec5848faa7dc8c001ef9
-ARG KIRO_CLI_ARM64_SHA256=95e149b0b5e2be3c6f56d4e5ed1bc5313d2596ef39255529a553027fd87abff5
+ARG KIRO_CLI_VERSION=3.2.0
+ARG KIRO_CLI_AMD64_SHA256=a2ca2a6cbdc0229906b7c03a0e8bd0439ff67a99df5dce4235cbb9f25a3a5bca
+ARG KIRO_CLI_ARM64_SHA256=b94461d35b7dc934db4a39b59abc58cd87f3529e55367b9e4f3272058e5544af
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
       amd64) archive="kirocli-x86_64-linux-musl.zip"; sha256="${KIRO_CLI_AMD64_SHA256}" ;; \
@@ -63,7 +63,7 @@ RUN set -eux; \
     curl --proto '=https' --tlsv1.2 -sSf "$url" -o /tmp/kirocli.zip; \
     echo "${sha256}  /tmp/kirocli.zip" | sha256sum -c -; \
     unzip -q /tmp/kirocli.zip -d /tmp; \
-    /tmp/kirocli/install.sh --force --no-confirm; \
+    /tmp/kirocli/install.sh --no-modify-path; \
     test "$(/root/.local/bin/kiro-cli --version)" = "kiro-cli ${KIRO_CLI_VERSION}"; \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
 ENV PATH="/root/.local/bin:${PATH}"

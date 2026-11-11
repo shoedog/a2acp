@@ -2,22 +2,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const REQUIRED_READER_PINS: &[&str] = &[
-    "@agentclientprotocol/codex-acp@2.3.0",
-    "@openai/codex@0.164.0",
-    "@agentclientprotocol/claude-agent-acp@0.97.0",
-    "@anthropic-ai/claude-agent-sdk@0.3.310",
-    "opencode-ai@1.18.27",
-    "test \"$(opencode --version)\" = \"1.18.27\"",
-    "claudeCodeVersion\")\" = \"2.1.310\"",
-    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.3.0\"",
-    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.164.0\"",
-    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.97.0\"",
-    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.310\"",
-    "io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.18.27\"",
-    "io.a2a-bridge.provenance.kiro.agent-cli=\"kiro-cli=2.24.1\"",
-    "ARG KIRO_CLI_VERSION=2.24.1",
-    "ARG KIRO_CLI_AMD64_SHA256=0187d8f613b4ad6b63f7fe069a187c33c79664ee9874ec5848faa7dc8c001ef9",
-    "ARG KIRO_CLI_ARM64_SHA256=95e149b0b5e2be3c6f56d4e5ed1bc5313d2596ef39255529a553027fd87abff5",
+    "@agentclientprotocol/codex-acp@2.6.0",
+    "@openai/codex@0.167.1",
+    "@agentclientprotocol/claude-agent-acp@0.106.0",
+    "@anthropic-ai/claude-agent-sdk@0.3.322",
+    "opencode-ai@1.19.5",
+    "test \"$(opencode --version)\" = \"1.19.5\"",
+    "claudeCodeVersion\")\" = \"2.1.322\"",
+    "io.a2a-bridge.provenance.codex.adapter=\"@agentclientprotocol/codex-acp=2.6.0\"",
+    "io.a2a-bridge.provenance.codex.agent-cli=\"@openai/codex=0.167.1\"",
+    "io.a2a-bridge.provenance.claude.adapter=\"@agentclientprotocol/claude-agent-acp=0.106.0\"",
+    "io.a2a-bridge.provenance.claude.agent-cli=\"@anthropic-ai/claude-agent-sdk=0.3.322\"",
+    "io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.19.5\"",
+    "io.a2a-bridge.provenance.kiro.agent-cli=\"kiro-cli=3.2.0\"",
+    "ARG KIRO_CLI_VERSION=3.2.0",
+    "ARG KIRO_CLI_AMD64_SHA256=a2ca2a6cbdc0229906b7c03a0e8bd0439ff67a99df5dce4235cbb9f25a3a5bca",
+    "ARG KIRO_CLI_ARM64_SHA256=b94461d35b7dc934db4a39b59abc58cd87f3529e55367b9e4f3272058e5544af",
 ];
 
 const FORBIDDEN_READER_SELECTORS: &[(&str, &str)] =
@@ -101,8 +101,8 @@ fn validate_reader_pins(containerfile: &str) -> Result<(), Vec<&'static str>> {
         .map(|token| token.trim_matches(|c: char| matches!(c, '\\' | ',' | '"' | '\'')))
         .filter(|token| *token == "opencode-ai" || token.starts_with("opencode-ai@"))
         .collect::<Vec<_>>();
-    if opencode_selectors != ["opencode-ai@1.18.27"] {
-        problems.push("every OpenCode npm selector must use opencode-ai@1.18.27");
+    if opencode_selectors != ["opencode-ai@1.19.5"] {
+        problems.push("every OpenCode npm selector must use opencode-ai@1.19.5");
     }
     if problems.is_empty() {
         Ok(())
@@ -128,13 +128,13 @@ fn reader_pin_guard_rejects_floating_or_mismatched_nested_versions() {
     let valid = REQUIRED_READER_PINS.join("\n");
     assert!(validate_reader_pins(&valid).is_ok());
 
-    let floating_codex = valid.replace("@openai/codex@0.164.0", "@openai/codex@latest");
+    let floating_codex = valid.replace("@openai/codex@0.167.1", "@openai/codex@latest");
     assert!(validate_reader_pins(&floating_codex).is_err());
 
-    let mismatched_claude = valid.replace("2.1.310", "2.1.313");
+    let mismatched_claude = valid.replace("2.1.322", "2.1.325");
     assert!(validate_reader_pins(&mismatched_claude).is_err());
 
-    let floating_opencode = valid.replace("opencode-ai@1.18.27", "opencode-ai@latest");
+    let floating_opencode = valid.replace("opencode-ai@1.19.5", "opencode-ai@latest");
     assert!(validate_reader_pins(&floating_opencode).is_err());
 
     let mutable_kiro = format!("{valid}\nhttps://example.invalid/latest/kirocli.zip");
