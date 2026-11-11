@@ -106,7 +106,7 @@ fn filter_allows(filter: &Path, host: &str) -> bool {
     child.wait().unwrap().success()
 }
 
-// OpenCode v1.18.27 reads auth.json as provider-keyed records. The Go provider needs `opencode-go`, while
+// OpenCode v1.19.5 reads auth.json as provider-keyed records. The Go provider needs `opencode-go`, while
 // `opencode` preserves the concurrent OpenCode Zen credential path.
 fn pinned_go_auth_key(store: &str, provider: &str) -> Option<String> {
     let store: serde_json::Value = serde_json::from_str(store).ok()?;
@@ -245,9 +245,9 @@ fn reader_image_and_proxy_pin_the_evidenced_opencode_contract() {
     let reader = fs::read_to_string(root.join("deploy/containers/reader.Containerfile")).unwrap();
     let toolchain =
         fs::read_to_string(root.join("deploy/containers/toolchain.Containerfile")).unwrap();
-    assert!(reader.contains("opencode-ai@1.18.27"));
-    assert!(reader.contains("test \"$(opencode --version)\" = \"1.18.27\""));
-    assert!(reader.contains("io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.18.27\""));
+    assert!(reader.contains("opencode-ai@1.19.5"));
+    assert!(reader.contains("test \"$(opencode --version)\" = \"1.19.5\""));
+    assert!(reader.contains("io.a2a-bridge.provenance.opencode.agent-cli=\"opencode-ai=1.19.5\""));
     assert_eq!(
         reader.matches("opencode-ai@").count(),
         1,

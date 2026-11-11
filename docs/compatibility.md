@@ -69,6 +69,45 @@ fake adapter. With the option on, one served fixed-`PONG` turn passed on codex-a
 serve; one `prism-mcp` instead of two, freed about 60 s after release), and the codex host lane of the
 2026-10-13 provider refresh below passed on codex-acp 2.2.2 with the option on.
 
+## Provider refresh — 2026-11-10 (claude-agent-acp 0.106.0, codex-acp 2.6.0, OpenCode 1.19.5, Kiro CLI 3.2.0)
+
+Motive: bring every adapter and agent CLI to its latest release before the session-fork release. claude-agent-acp
+0.106.0 pins Agent SDK 0.3.322 (bundled Claude Code 2.1.322). codex-acp 2.6.0 declares Codex `^0.166.0`; the image
+and host pin it to Codex 0.167.1. OpenCode moves 1.18.27 → 1.19.5 and Kiro CLI 2.24.1 (image) / 2.37.0 (host) → 3.2.0.
+Candidates were staged in a separate npm prefix (Kiro from its official macOS archive, SHA-256 matching the stable
+manifest) behind an absolute-path candidate config and verified before promotion.
+
+Binary: operator release `a2a-bridge` 0.3.1 built from `main` `83a5e5fe`, SHA-256
+`8aca3515c648ccae14b9f73c218160032ea29b9ed7dc34f75b908df343af82ee`. Images (linux/arm64): reader
+`sha256:8e3462e083cf1df47652931872a8e745d23a1432b38659a2076243d46bef4d2a`, and toolchain
+`sha256:ec7ce611ce708433b5b43b4dd8aff3f310bd67afb2dfbdd6bc242975f8c32b75` built `FROM` that reader.
+
+**Install changes.**
+- **Kiro CLI 3.x installer:** `install.sh` now accepts only `--global` and `--no-modify-path`; the old
+  `--force --no-confirm` fails with `Unknown argument`. The image uses `--no-modify-path`, which installs to
+  `/root/.local/bin` as before.
+- **OpenCode postinstall:** npm 11.19+/12 no longer runs install scripts by default, so `opencode-ai`'s postinstall
+  (which only copies the platform binary from its optional dependency) must be allowed or run once by hand on host
+  installs; without it `opencode --version` fails.
+
+**Catalogs.** Codex, Claude and Kiro catalogs are unchanged from the live versions (Claude aliases
+`opus`/`sonnet`/`haiku`; `sonnet` still resolves to `claude-sonnet-5-5` per the container transcript). Kiro advertises
+no model option (`model_configurable: false`, as on 2.37.0), so a Kiro smoke must not pass `--model`. Host Claude,
+Codex and OpenCode report `"fork": true`; Kiro does not advertise fork.
+
+Every lane ran one fixed `PONG` prompt (`--acknowledge-billable`). Each artifact records `success: true`, terminal state
+`completed`, one prompt call, `exact_pong: true` and stop reason `end_turn`:
+
+| Lane | Model / effort | Status | Evidence |
+|---|---|---|---|
+| Claude host (ACP 0.106.0) | `haiku` / `low` | **PASS** | `attempt-2777c5ee…`; USD 0.0076 |
+| Codex host (ACP 2.6.0, read-only) | `gpt-6.1-terra` / `low` | **PASS** | `attempt-0683d3cc…` |
+| OpenCode host (1.19.5) | `opencode-go/gpt-5.6-luna` / `low` | **PASS** | `attempt-21d81fc6…` |
+| Kiro host (3.2.0) | default | **PASS** | `attempt-b6a34b84…`. A first attempt with `--model auto` was refused at configuration (`acp.config.model_rejected`, no model option advertised) before any prompt was sent. |
+| Claude reader (reader `8e3462e0…`, `:ro`) | `haiku` / `low` | **PASS** | `attempt-04a702bb…`; USD 0.0039 |
+| Codex reader (reader `8e3462e0…`, `:ro`) | `gpt-6-luna` / `low` | **PASS** | `attempt-e9c179fd…` |
+| Claude container implementor (`container_rw`, toolchain `ec7ce611…`, `acceptEdits`) | `sonnet` / `low` | **PASS** | `attempt-df816281…`; USD 0.073; transcript `claude-sonnet-5-5`; session cwd a throwaway clone |
+
 ## Provider refresh — 2026-10-26 (codex-acp 2.3.0, claude-agent-acp 0.97.0, `gpt-6.1-terra`)
 
 Motive: routine adapter refresh, and adopting `gpt-6.1-terra` as the Terra implementation model. codex-acp 2.3.0

@@ -25,7 +25,7 @@ docker run --rm a2a-agent-reader:latest sh -c \
   'command -v claude-agent-acp && command -v codex-acp && command -v kiro-cli'
 ```
 The image is `node:24-slim` + `claude-agent-acp` + `codex-acp` (npm) + `kiro-cli` (Linux build via the
-official zip; installed with `--force --no-confirm` since it runs as root unattended). As of 2026-07-27,
+official zip; installed with `--no-modify-path` since it runs as root unattended). As of 2026-07-27,
 the exact Node trees are Codex ACP 1.1.7 / Codex 0.145.0 and Claude ACP 0.63.0 / Agent SDK 0.3.220 /
 bundled Claude Code 2.1.220. Those versions passed provider-free host ACP and bridge catalog probes plus
 one fixed-PONG host and immutable-reader bridge smoke per provider. The exact reader image was subsequently
